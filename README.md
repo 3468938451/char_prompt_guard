@@ -1,6 +1,6 @@
 # char_prompt_guard — 角色提示词守卫
 
-> 文档版本：1.0.1 · 作者：思源（siyuan）· 许可：MIT
+> 文档版本：1.0.4 · 作者：思源（siyuan）· 许可：MIT
 > 同时适配 **nai_artist** 与 **image_generator_plugin-neo** 两个生图插件。
 > 本插件由 **AI 辅助编写**（作者审阅与整合）：缺陷、遗漏或无意残留的第三方内容请见
 > [AI_USAGE.md](./AI_USAGE.md)（无担保 / 责任限制 / 第三方内容通知即处理 / 反馈渠道）。
@@ -13,9 +13,17 @@
 
 | 生图插件 | 兼容状态 | 接管动作 | 提示词参数 | 追加模式 | 补入内容 |
 | --- | --- | --- | --- | --- | --- |
-| [nai_artist](https://github.com/bingyv92/nai_artist) | ✅ 已适配 | `share_visual` | `content`（中文自然语言） | `natural` | `（画面角色：“爱莉希雅”，出自游戏《崩坏三 (Honkai Impact 3rd)》）`，由 nai_artist 的翻译模型转成 `elysia \(honkai impact 3rd\)` |
+| [nai_artist](https://github.com/bingyv92/nai_artist) **1.3.6+** | ✅ 已适配 | `share_photo`（自拍）、`share_drawing`（画作） | `content`（中文自然语言） | `natural` | `（画面角色：“爱莉希雅”，出自游戏《崩坏三 (Honkai Impact 3rd)》）`，由 nai_artist 的翻译模型转成 `elysia \(honkai impact 3rd\)` |
+| [nai_artist](https://github.com/bingyv92/nai_artist) **1.2.x 及更早** | ✅ 已适配 | `share_visual`（单动作 + `mode` 参数） | `content`（中文自然语言） | `natural` | 同上；该版本用 `apply_modes` 区分 `drawing` / `photo` |
 | [image_generator_plugin-neo](https://github.com/tt-P607/image_generator_plugin-neo) | ✅ 已适配 | `draw_image` | `content_description`（**本身就是 NAI 标签**） | `tags` | 单人：直接追加标准角色标签，如 `elysia \(honkai impact 3rd\)`；**多人：写入 `characters` 独立角色槽位**（含分散坐标） |
 
+> **nai_artist 1.3.6 起把原来的单个 `share_visual` 拆成了 `share_photo` / `share_drawing`**，
+> 两个动作都没有 `mode` 参数。本插件的内置目标表**同时包含新旧动作名**（`share_photo`、
+> `share_drawing`、`share_visual`），所以不论你装的是哪个版本的 nai_artist 都能直接生效，
+> 无需改配置。注意 `apply_modes` 只对旧版 `share_visual` 的 `mode` 参数有效；新版两个动作
+> 靠动作名区分，若你不想让自拍（`share_photo`）补角色，在 `[targets] list` 里只写
+> `share_drawing` 那一段即可（填写会覆盖内置默认，neo 那段也要一并写上）。
+>
 > 两者的提示词语义完全相反：nai_artist 的参数是**中文自然语言**，由它自己再翻译成语言标签；image_generator_plugin-neo 的参数**已经是最终 NAI 标签串**，没有翻译步骤。因此插件按目标 Action 区分追加格式（`natural` / `tags`），不能一刀切。
 >
 > 其它生图插件未内置适配，但可通过 `[targets]` 配置自行接入，见下文「目标 Action 表」。
@@ -25,7 +33,7 @@
 插件注册了一个 `BaseEventHandler`，订阅内置事件 `before_action_call`：
 
 1. 按配置的「目标 Action 表」判断当前调用是否要接管（默认内置上表两个动作，可用配置覆盖/扩展）；
-2. `nai_artist:share_visual` 还要通过 `apply_modes` 过滤（默认仅 `drawing` 手绘画作模式；`photo` 自拍模式 nai_artist 本身会吸收角色人设，默认不动）；
+2. `nai_artist` 旧版（1.2.x 及更早）的 `share_visual` 还要通过 `apply_modes` 过滤（默认仅 `drawing` 手绘画作模式；`photo` 自拍模式 nai_artist 本身会吸收角色人设，默认不动）。**1.3.6+ 已拆分动作**，`share_photo` / `share_drawing` 由动作名区分、无 `mode` 参数，不受 `apply_modes` 影响；不想让自拍补角色就只在 `[targets] list` 里写 `share_drawing`；
 3. 检测提示词是否已命中角色表（角色名/别名）；**标签模式**下还会比对标准角色标签，并顺带检查 neo 的 `characters` 多人物参数——命中即放行；
 4. 未命中时按两步从「上文」中找角色：
    - **角色表快速匹配**（零成本、确定性）：扫描最近 `history_hours` 小时内的消息，取最近一次提及的角色；
@@ -33,10 +41,22 @@
 5. 找到角色后按目标模式补全提示词（自然语言说明 / 标准标签）；对 `args` 的修改会被 ActionManager 回写，在翻译与生图之前生效；
 6. 任何情况下都返回 `SUCCESS`，绝不拦截生图；标签模式下若角色表未提供标签，**宁可跳过注入也不污染提示词**。
 
+### 「以上文还是以画面为准」的优先级（1.0.4 起）
+
+| 情形 | 行为 |
+| --- | --- |
+| 画面描述里已有**角色表内**角色 | 直接放行（不调 LLM，零成本） |
+| 画面描述里没有角色表内角色 | 交给 LLM 结合「画面描述 + 最近上文」判定，**LLM 的结论优先**（`general.description_first`，默认开） |
+| LLM 失败/超时/没给出角色 | 回退到「角色表在上文里的命中」 |
+
+这条优先级是实测逼出来的：曾经出现"画面描述里要的是花火、而上文最旧的一条却在说『不加爱莉的提示词』"，
+旧的实现只看上文命中就把爱莉补了进去。现在只要描述里没有角色表内角色，就以描述为准。
+LLM 只给了角色名时，还会从角色表借用**游戏名与标准标签**，避免补出"（画面角色：“某某”）"这种没有游戏名的半成品。
+
 ## 安装
 
 1. 安装至少一个受支持的生图插件（nai_artist 或 image_generator_plugin-neo）；
-2. 将本插件目录（或 `char_prompt_guard-1.0.1.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
+2. 将本插件目录（或 `char_prompt_guard-1.0.4.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
 3. 重启 bot，插件会自动生成默认配置：`config/plugins/char_prompt_guard/config.toml`。
 
 ## 配置说明
@@ -118,7 +138,13 @@ notify_bot = true         # 注入 system reminder 告知主模型标记用法
 
 ### 目标 Action 表（`[targets] list`）
 
-留空使用内置默认。需要接管其它动作（例如 neo 的 `edit_image` / `inpaint_image`）时按此格式填写，**填写后覆盖内置默认**：
+留空使用内置默认（**新旧 nai_artist 动作名都在内**）：
+
+```
+nai_artist:action:share_photo | content | natural ; nai_artist:action:share_drawing | content | natural ; nai_artist:action:share_visual | content | natural | mode ; image_generator_plugin-neo:action:draw_image | content_description | tags | | characters | characters
+```
+
+需要接管其它动作（例如 neo 的 `edit_image` / `inpaint_image`）时按此格式填写，**填写后覆盖内置默认**（所以要保留的动作必须一并写上）：
 
 ```
 插件名:action:动作名 | 提示词参数名 | 追加模式 | 模式参数 | 额外检测参数 | 角色槽位参数
@@ -133,11 +159,14 @@ notify_bot = true         # 注入 system reminder 告知主模型标记用法
 | 5 | 额外参与"是否已含角色"检测的参数名，逗号分隔，如 neo 的 `characters` |
 | 6 | 独立角色槽位参数名（多人同框时写入），如 neo 的 `characters`；留空则不用槽位 |
 
-示例（在保留 nai_artist 的同时，额外接管 neo 的图生图）：
+示例（只接管手绘画作 + neo 图生图，即"不让自拍补角色"的写法）：
 
 ```
-nai_artist:action:share_visual | content | natural | mode ; image_generator_plugin-neo:action:draw_image | content_description | tags | | characters | characters ; image_generator_plugin-neo:action:edit_image | content_description | tags
+nai_artist:action:share_drawing | content | natural ; image_generator_plugin-neo:action:draw_image | content_description | tags | | characters | characters ; image_generator_plugin-neo:action:edit_image | content_description | tags
 ```
+
+> 提示：命中目标但配置的参数名不存在时（例如把 neo 的 `content_description` 填给了 nai_artist），
+> 插件会打一条 WARNING 并放行，不会把未知参数塞给动作（避免动作报错）。
 
 ### 多角色同框（`[multi]`）
 
@@ -264,7 +293,7 @@ python tests\check_privacy.py
 也就是说：在 agent 聊天器下插件收不到任何通知，表现是「装上去毫无反应、日志里连一条记录都没有」。
 **这不是插件坏了，是钩子没来。** 解决办法是打框架补丁：
 
-> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.1.mfp` / 插件目录只含插件自身；
+> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.4.mfp` / 插件目录只含插件自身；
 > 补丁属于框架侧改动，随**交付包**的 `framework-patch/` 目录单独提供，请先把它拷到本机（例如
 > 放到框架根旁边的任意位置），再执行下面命令；路径按你实际存放位置替换。
 
@@ -291,10 +320,17 @@ git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch
 
    ```
    正在按顺序向 N 个处理器发布事件 'EventType.BEFORE_ACTION_CALL'
-   char_prompt_guard | INFO | 已补入角色（share_visual / natural）: …
+   char_prompt_guard | INFO | 已补入角色（share_drawing / natural）: …
    ```
 
    只有第 1 条自检、触发生图后**没有任何** `已补入角色` 记录 → 补丁没生效或没打上。
+   若日志里出现 `未命中任何目标动作，放行`（DEBUG），说明事件收到了但动作名不在目标表里
+   —— 对照你装的生图插件的实际动作名（`share_photo` / `share_drawing` / `share_visual` /
+   `draw_image`）检查 `[targets]` 配置。
+   若出现 `事件里没有会话 ID`（WARNING），说明发布方既没带 `stream_id` 也没有可用的
+   `message`：读不到上文时模型必然提不出角色，请更新到**补丁二版**（会随事件带上
+   `stream_id`）。1.0.3 起还会打出 `上文收集: stream_id=… 消息数=…` 与
+   `调用 LLM 提取角色: 上文 N 字符 / M 条消息`，一眼就能看出上文是否为空。
 
 3. 也可以用自检脚本直接判定补丁是否已打：
 
@@ -306,7 +342,9 @@ git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch
 ### 插件侧已经做的兼容
 
 - **同时订阅 `before_action_call` 与 `before_tool_call`**，并兼容 agent 侧传来的
-  工具名格式（`action-share_visual` 这种带前缀的写法）；
+  工具名格式（`action-share_photo` 这种带前缀的写法）；
+- **内置目标表同时覆盖 nai_artist 新旧动作名**（1.3.6+ 的 `share_photo` / `share_drawing`
+  与更早版本的 `share_visual`），升级 nai_artist 后无需改配置；
 - **动作名为空时按提示词参数名兜底匹配**：某些发布方只写旧的 `action_name` 属性，
   而组件是用新版 `name` 声明的（image_generator_plugin-neo 的 `draw_image` 就是这种），
   此时签名会退化成 `插件名:action:`。插件会退一步用「谁的提示词参数真的出现在 args 里」

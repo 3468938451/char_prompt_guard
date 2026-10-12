@@ -51,6 +51,25 @@ class CharPromptGuardConfig(BaseConfig):
                 "开启后能识别角色表之外的角色，但每次补全会多一次小模型调用"
             ),
         )
+        description_first: bool = Field(
+            default=True,
+            description=(
+                "以画面描述为准：当画面描述里没有角色表内的角色时，即使上文能扫到角色表内角色，"
+                "也交给 LLM 结合描述判定一次。可避免把几句之前提到的**另一个**角色补进去"
+                "（实测：描述里要的是花火、上文最旧那条却在说“不加爱莉”，结果补错了人）。"
+                "关闭后回到旧行为：角色表在上文命中就不再问 LLM（更省 token）"
+            ),
+        )
+        tag_completion: bool = Field(
+            default=True,
+            description=(
+                "标签补全：画面描述里已出现角色表内的角色（名字/别名命中）、但没有该角色的"
+                "标准标签时，把角色表第 4 列的标签补进提示词。"
+                "实测下游翻译模型会把「花火」翻成 hanabi (firefly) (honkai: star rail)"
+                "（括号未转义还串了别的角色），补上转义正确的标准标签可让 NAI 稳定锁定角色。"
+                "只在角色表提供了第 4 列标签时生效"
+            ),
+        )
         translate_model: str = Field(
             default="",
             description=(
@@ -111,7 +130,9 @@ class CharPromptGuardConfig(BaseConfig):
                 "后三项可省略。追加模式 natural=追加中文说明（生图插件会再翻译成标签，适配 nai_artist）；"
                 "tags=直接追加 NAI 角色标签（提示词本身就是标签，适配 image_generator_plugin-neo）。"
                 "留空使用内置默认："
-                "nai_artist:action:share_visual | content | natural | mode ; "
+                "nai_artist:action:share_photo | content | natural ; "
+                "nai_artist:action:share_drawing | content | natural ; "
+                "nai_artist:action:share_visual | content | natural | mode（nai_artist 1.2.x 及更早的旧动作名）; "
                 "image_generator_plugin-neo:action:draw_image | content_description | tags"
             ),
         )

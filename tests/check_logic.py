@@ -166,14 +166,18 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check("C1 natural 补角色", False, f"{type(e).__name__}: {e}")
 
-    # ── C2 natural：已含角色 → 放行 ────────────────────────────────
+    # ── C2 natural：已含角色 → 不再追加中文说明（1.0.6 起可补标准标签）──
     try:
         raw = "爱莉希雅站在月光下，手持长枪"
         out = await fire(make_config(), natural_params(raw))
         c = out["args"]["content"]
-        check("C2 已含角色放行（不重复追加）", c == raw, f"content = {c!r}")
+        check(
+            "C2 已含角色时不再追加中文说明",
+            c.startswith(raw) and "画面角色" not in c and c.count("爱莉希雅") == 1,
+            f"content = {c!r}",
+        )
     except Exception as e:  # noqa: BLE001
-        check("C2 已含角色放行（不重复追加）", False, f"{type(e).__name__}: {e}")
+        check("C2 已含角色时不再追加中文说明", False, f"{type(e).__name__}: {e}")
 
     # ── C3 photo 模式 → 不接管 ─────────────────────────────────────
     try:
@@ -450,7 +454,9 @@ async def run_cases() -> int:
             f"{type(e).__name__}: {e}",
         )
 
-    # ── C19 兜底匹配有歧义时宁可不处理 ─────────────────────────────
+    # ── C19 兜底匹配：多个同参数名目标但注入语义相同 → 取靠前的 ─────
+    # （1.0.2 起的行为：语义等价就不再"宁可不处理"，否则 nai_artist 新版
+    #   两个动作共用 content 参数时，兜底路径会直接静默失效）
     try:
         cfg = make_config(
             targets=(
@@ -466,9 +472,322 @@ async def run_cases() -> int:
             "message": FakeMessage("我们来聊爱莉希雅吧"),
         }
         out = await fire(cfg, params)
-        check("C19 兜底匹配有歧义时不处理", out["args"]["content_description"] == raw)
+        c = out["args"]["content_description"]
+        check(
+            "C19 兜底匹配语义等价时取靠前目标",
+            "elysia" in c.lower() and c.startswith(raw),
+            f"content_description = {c!r}",
+        )
     except Exception as e:  # noqa: BLE001
-        check("C19 兜底匹配有歧义时不处理", False, f"{type(e).__name__}: {e}")
+        check("C19 兜底匹配语义等价时取靠前目标", False, f"{type(e).__name__}: {e}")
+
+    # ── C25 兜底匹配：注入语义冲突（tags vs natural）→ 宁可不处理 ──
+    try:
+        cfg = make_config(
+            targets=(
+                "nai_artist:action:share_photo | content | natural"
+                " ; some_plugin:action:other | content | tags"
+            )
+        )
+        raw = "帮我画一张她战斗的样子"
+        params = {
+            "signature": ":action:",
+            "action_name": "",
+            "args": {"content": raw},
+            "message": FakeMessage("我们来聊爱莉希雅吧"),
+        }
+        out = await fire(cfg, params)
+        check("C25 兜底匹配语义冲突时不处理", out["args"]["content"] == raw)
+    except Exception as e:  # noqa: BLE001
+        check("C25 兜底匹配语义冲突时不处理", False, f"{type(e).__name__}: {e}")
+
+    # ── C20 内置目标表同时覆盖 nai_artist 新旧动作名 ────────────────
+    try:
+        from ..handler import parse_targets
+
+        builtin = [spec.action for spec in parse_targets("")]
+        ok = (
+            "share_photo" in builtin
+            and "share_drawing" in builtin
+            and "share_visual" in builtin
+            and "draw_image" in builtin
+        )
+        check("C20 内置目标含 nai_artist 新旧动作名", ok, f"内置 = {builtin}")
+    except Exception as e:  # noqa: BLE001
+        check("C20 内置目标含 nai_artist 新旧动作名", False, f"{type(e).__name__}: {e}")
+
+    # ── C21 nai_artist 1.3.6+ 的 share_photo 被接管 ────────────────
+    try:
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "action_description": "拍一张照片",
+            "args": {"content": "帮我拍一张她战斗的样子"},
+            "message": FakeMessage("我们来聊爱莉希雅吧"),
+        }
+        out = await fire(make_config(), params)
+        c = out["args"]["content"]
+        check(
+            "C21 share_photo 补角色（无 mode 参数也不受影响）",
+            "爱莉希雅" in c and c.startswith("帮我拍一张她战斗的样子"),
+            f"content = {c!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C21 share_photo 补角色（无 mode 参数也不受影响）", False, f"{type(e).__name__}: {e}")
+
+    # ── C22 nai_artist 1.3.6+ 的 share_drawing 被接管 ──────────────
+    try:
+        params = {
+            "signature": "nai_artist:action:share_drawing",
+            "action_name": "share_drawing",
+            "action_description": "画一张画",
+            "args": {"content": "帮我画一张她战斗的样子"},
+            "message": FakeMessage("我们来聊爱莉希雅吧"),
+        }
+        out = await fire(make_config(), params)
+        c = out["args"]["content"]
+        check(
+            "C22 share_drawing 补角色",
+            "爱莉希雅" in c and "崩坏三" in c,
+            f"content = {c!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C22 share_drawing 补角色", False, f"{type(e).__name__}: {e}")
+
+    # ── C23 目标命中但参数名不存在 → 告警放行，不塞未知参数 ────────
+    try:
+        params = {
+            "signature": "nai_artist:action:share_drawing",
+            "action_name": "share_drawing",
+            "args": {"prompt": "帮我画一张她战斗的样子"},  # 故意不叫 content
+            "message": FakeMessage("我们来聊爱莉希雅吧"),
+        }
+        out = await fire(make_config(), params)
+        ok = out["args"] == {"prompt": "帮我画一张她战斗的样子"}
+        check("C23 参数名不匹配时放行且不新增参数", ok, f"args = {out['args']!r}")
+    except Exception as e:  # noqa: BLE001
+        check("C23 参数名不匹配时放行且不新增参数", False, f"{type(e).__name__}: {e}")
+
+    # ── C24 未知动作名 → 放行（不改 args）──────────────────────────
+    try:
+        params = {
+            "signature": "some_other_plugin:action:make_picture",
+            "action_name": "make_picture",
+            "args": {"content": "帮我画一张她战斗的样子"},
+            "message": FakeMessage("我们来聊爱莉希雅吧"),
+        }
+        out = await fire(make_config(), params)
+        check(
+            "C24 不在目标表里的动作不改参数",
+            out["args"]["content"] == "帮我画一张她战斗的样子",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C24 不在目标表里的动作不改参数", False, f"{type(e).__name__}: {e}")
+
+    # ── C26 stream_id 解析：params 优先、message 兜底、都没有则为空 ──
+    try:
+        from ..handler import resolve_stream_id
+
+        class _Msg:
+            def __init__(self, sid: str) -> None:
+                self.stream_id = sid
+
+        cases = [
+            ({"stream_id": "s-params", "message": _Msg("s-msg")}, "s-params"),
+            ({"message": _Msg("s-msg")}, "s-msg"),
+            ({}, ""),
+            ({"message": None}, ""),
+            ({"stream_id": "", "message": _Msg("")}, ""),
+        ]
+        bad = [(p, want, resolve_stream_id(p)) for p, want in cases if resolve_stream_id(p) != want]
+        check(
+            "C26 stream_id 多级解析",
+            not bad,
+            "" if not bad else f"不符: {bad}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C26 stream_id 多级解析", False, f"{type(e).__name__}: {e}")
+
+    # ── C27 LLM 结果缺字段时用角色表补全（游戏名/标签）────────────
+    try:
+        from ..character import CharacterEntry
+        from ..handler import _enrich_from_roster
+
+        roster = [
+            CharacterEntry(
+                name="爱莉希雅",
+                game="崩坏三 (Honkai Impact 3rd)",
+                aliases=["elysia", "爱莉"],
+                tag=r"elysia \(honkai impact 3rd\)",
+            )
+        ]
+        bare = CharacterEntry(name="爱莉希雅")
+        filled = _enrich_from_roster(bare, roster)
+        ok = (
+            filled.game == "崩坏三 (Honkai Impact 3rd)"
+            and filled.tag == r"elysia \(honkai impact 3rd\)"
+        )
+        check(
+            "C27 从角色表补全游戏名与标签",
+            ok,
+            f"game={filled.game!r} tag={filled.tag!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C27 从角色表补全游戏名与标签", False, f"{type(e).__name__}: {e}")
+
+    # ── C28 描述里的角色优先于上文里的旧角色（用假提取器验证优先级）──
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS_ONE, use_llm=True)  # 角色表里只有爱莉希雅
+
+        async def fake_extract(**kwargs):
+            # 模拟"LLM 读了画面描述与上文后给出的结论"：这次要画的是花火
+            return CharacterExtraction(
+                characters=[CharacterEntry(name="花火", game="崩坏：星穹铁道")],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            params = {
+                "signature": "nai_artist:action:share_photo",
+                "action_name": "share_photo",
+                "args": {"content": "台上站着一个人，手里拿着面具"},
+                "message": FakeMessage("我们来聊爱莉希雅吧"),
+                "stream_id": "s-test",
+            }
+            out = await fire(cfg, params)
+            c = out["args"]["content"]
+            ok = "花火" in c and "爱莉希雅" not in c
+            check("C28 描述结论优先于上文里的旧角色", ok, f"content = {c!r}")
+        finally:
+            handler_module.extract_characters_via_llm = original
+    except Exception as e:  # noqa: BLE001
+        check("C28 描述结论优先于上文里的旧角色", False, f"{type(e).__name__}: {e}")
+
+    # ── C29 LLM 说"角色已在提示词里"时不得回退到上文旧角色 ─────────
+    # 实测原样复现：描述写着 Hanabi，LLM 也答"花火"，但"花火"已在描述里被过滤，
+    # 旧代码于是回退到上文命中，把爱莉希雅补了进去。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS_ONE, use_llm=True)
+
+        async def fake_extract(**kwargs):
+            return CharacterExtraction(
+                characters=[CharacterEntry(name="花火", game="崩坏：星穹铁道")],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            raw = "Hanabi (Honkai: Star Rail). 只拍花火本尊一人"
+            params = {
+                "signature": "nai_artist:action:share_photo",
+                "action_name": "share_photo",
+                "args": {"content": raw},
+                "message": FakeMessage("我们来聊爱莉希雅吧"),
+                "stream_id": "s-test",
+            }
+            out = await fire(cfg, params)
+            c = out["args"]["content"]
+            check(
+                "C29 描述已含该角色时不回退上文旧角色",
+                c == raw,
+                f"content = {c!r}",
+            )
+        finally:
+            handler_module.extract_characters_via_llm = original
+    except Exception as e:  # noqa: BLE001
+        check("C29 描述已含该角色时不回退上文旧角色", False, f"{type(e).__name__}: {e}")
+
+    # ── C30 标签补全：描述里有角色名但缺标准标签 → 补标签 ──────────
+    try:
+        cfg = make_config(roster=RS_ONE)  # 第 4 列是 elysia \(honkai impact 3rd\)
+        raw = "Elysia 站在灯下，半侧身对着镜头"
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("随便聊聊"),
+            "stream_id": "s-test",
+        }
+        out = await fire(cfg, params)
+        c = out["args"]["content"]
+        check(
+            "C30 描述含角色名但缺标准标签时补标签",
+            c.startswith(raw) and r"elysia \(honkai impact 3rd\)" in c,
+            f"content = {c!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C30 描述含角色名但缺标准标签时补标签", False, f"{type(e).__name__}: {e}")
+
+    # ── C31 标签已在描述里 → 不重复补 ─────────────────────────────
+    try:
+        cfg = make_config(roster=RS_ONE)
+        raw = r"Elysia 站在灯下, elysia \(honkai impact 3rd\)"
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("随便聊聊"),
+            "stream_id": "s-test",
+        }
+        out = await fire(cfg, params)
+        c = out["args"]["content"]
+        check(
+            "C31 标签已存在时不重复补",
+            c == raw,
+            f"content = {c!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C31 标签已存在时不重复补", False, f"{type(e).__name__}: {e}")
+
+    # ── C32 描述已点名 A、上文提到 B+C（多人）→ 不得补 B/C ──────────
+    # 实测：用户要爱莉，描述里已有"爱莉"，但上文写过花火与流萤，
+    # multi_only 进多人路径后把花火+流萤补了进去。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        roster3 = (
+            r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)" "\n"
+            r"花火 | 崩坏：星穹铁道 (Honkai: Star Rail) | hanabi,花火 | hanabi \(honkai: star rail\)" "\n"
+            r"流萤 | 崩坏：星穹铁道 (Honkai: Star Rail) | firefly,流萤 | firefly \(honkai: star rail\)"
+        )
+        cfg = make_config(roster=roster3, use_llm=True)
+
+        async def fake_extract(**kwargs):
+            # LLM 读了描述：这次只有爱莉希雅
+            return CharacterExtraction(
+                characters=[CharacterEntry(name="爱莉希雅", game="崩坏三 (Honkai Impact 3rd)")],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            raw = "爱莉希雅穿着礼服站在灯下"
+            params = {
+                "signature": "nai_artist:action:share_photo",
+                "action_name": "share_photo",
+                "args": {"content": raw},
+                "message": FakeMessage("聊聊花火和流萤吧"),
+                "stream_id": "s-test",
+            }
+            out = await fire(cfg, params)
+            c = out["args"]["content"]
+            ok = "花火" not in c and "流萤" not in c and r"elysia \(honkai impact 3rd\)" in c
+            check("C32 多人上文不得覆盖已点名的角色", ok, f"content = {c!r}")
+        finally:
+            handler_module.extract_characters_via_llm = original
+    except Exception as e:  # noqa: BLE001
+        check("C32 多人上文不得覆盖已点名的角色", False, f"{type(e).__name__}: {e}")
 
     # ── C14/C15 需要真调小模型 ─────────────────────────────────────
     if RUN_LLM:
