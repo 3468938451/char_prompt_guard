@@ -741,15 +741,19 @@ class CharacterGuardHandler(BaseEventHandler):
                 )
                 llm_multi = extraction.multi
                 llm_answered = bool(extraction.characters)
+                # 注意：这里**不能**复用上文史命中的 seen 集合。实测踩过：
+                # 角色在上文里被提到过 → 已在 seen 里 → LLM 的结果被去重掉 →
+                # 列表变空 → 被误判成"角色已在提示词里"，于是什么都不补。
+                seen_llm: set[str] = set()
                 for entry in extraction.characters:
                     if character_in_texts(entry, texts):
                         # 提示词里已经写了的，LLM 偶尔仍会列出来
                         continue
                     entry = _enrich_from_roster(entry, roster)
                     key = entry_key(entry)
-                    if key in seen:
+                    if key in seen_llm:
                         continue
-                    seen.add(key)
+                    seen_llm.add(key)
                     llm_candidates.append(entry)
 
         # ④ LLM 读过画面描述，它的结论优先；角色表的历史命中只作兜底。
@@ -759,9 +763,9 @@ class CharacterGuardHandler(BaseEventHandler):
             # LLM 给出了需要补的角色
             candidates = llm_candidates
         elif llm_answered:
-            # LLM 答了，只是它给的角色已经在提示词里 → 画面没问题，本次不补，
+            # LLM 答了，只是它给的角色都已经在提示词里 → 画面没问题，本次不补，
             # 绝不回退到上文里的旧角色
-            logger.debug("LLM 判定的角色已在提示词中，无需补入（不回退上文命中）")
+            logger.debug("LLM 给出的角色都已在提示词中，无需补入（不回退上文命中）")
             candidates = []
         else:
             # LLM 没给出结论（超时/失败/空结果）→ 才用角色表在上文里的命中兜底
@@ -954,7 +958,18 @@ class CharacterGuardHandler(BaseEventHandler):
         clauses = [clause for clause in clauses if clause]
         if not clauses:
             return None
-        return f"{content.strip()}\n{''.join(clauses)}"
+        merged = f"{content.strip()}\n{''.join(clauses)}"
+        # 角色表提供了标准标签时，顺带把转义标签也写上：实测下游翻译模型会把中文名
+        # 翻坏（把「花火」翻成 hanabi (firefly) (honkai: star rail)），有标签才保险。
+        if config.general.tag_completion:
+            tags = [
+                entry.resolved_tag()
+                for entry in entries
+                if entry.resolved_tag() and not content_contains_tag(merged, entry.resolved_tag())
+            ]
+            if tags:
+                merged = f"{merged.rstrip().rstrip(',')}, {', '.join(tags)}"
+        return merged
 
     @staticmethod
     def _append_tags(content: str, characters: list[CharacterEntry]) -> str | None:
