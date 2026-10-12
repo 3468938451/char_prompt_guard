@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+.git/
+# 运行期产物：不要打进包（config/ 可能含真实密钥与私人网关地址）
+data/
+config/
+logs/
+*.log
+*.local.*
+*.local.toml

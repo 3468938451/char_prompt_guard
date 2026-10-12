@@ -1,0 +1,38 @@
+{
+    "name": "char_prompt_guard",
+    "display_name": "角色提示词守卫",
+    "version": "1.0.0",
+    "description": "角色提示词守卫：bot 生图前检测提示词中是否已含角色；已含则放行，未含则根据上文对话中的角色自动补入角色名+游戏名（或 NAI 角色标签），支持多角色同框自动补齐。兼容 nai_artist 与 image_generator_plugin-neo。",
+    "author": "思源",
+    "dependencies": {
+        "plugins": [],
+        "components": []
+    },
+    "include": [
+        {
+            "component_type": "event_handler",
+            "component_name": "char_prompt_guard",
+            "dependencies": [],
+            "enabled": true
+        }
+    ],
+    "entry_point": "plugin.py",
+    "api_version": {
+        "llm_api": "1.0.0",
+        "log_api": "1.0.0",
+        "message_api": "1.0.0",
+        "prompt_api": "1.0.0"
+    },
+    "min_core_version": "1.0.0",
+    "categories": [
+        "tool"
+    ],
+    "tags": [
+        "nai_artist",
+        "prompt",
+        "character",
+        "text-to-image-generation"
+    ],
+    "python_dependencies": [],
+    "dependencies_required": false
+}
