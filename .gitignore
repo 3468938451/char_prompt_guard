@@ -24,6 +24,7 @@ wheels/
 venv/
 ENV/
 env/
+.venv/
 
 # IDEs
 .vscode/
@@ -44,3 +45,14 @@ htmlcov/
 # MoFox-Bot specific
 config/local_*.toml
 *.log
+
+# 运行期 / 凭据产物：插件目录内不应出现（MPDT 打包器不读 ignore 文件，会把它们打进 .mfp）
+config/
+data/
+logs/
+*.local.*
+*.local.toml
+
+# 工具缓存
+.ruff_cache/
+.mypy_cache/
