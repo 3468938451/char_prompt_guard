@@ -1,0 +1,84 @@
+From 6b322b7f6adcbb6b966c5d175667732c038fdd52 Mon Sep 17 00:00:00 2001
+From: Aemeath <178019418+xianshu-virtuous@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 15:19:46 +0800
+Subject: [PATCH] =?UTF-8?q?fix(events):=20LLM=20=E5=B7=A5=E5=85=B7?=
+ =?UTF-8?q?=E8=B0=83=E7=94=A8=E8=B7=AF=E5=BE=84=E8=A1=A5=E5=8F=91=20before?=
+ =?UTF-8?q?=5Faction=5Fcall=20/=20before=5Ftool=5Fcall?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+agent 模式的聊天器（default_chatter / neo_default_chatter）执行 Action / Tool 时走 run_tool_call -> create_llm_usable_execution，直接对组件实例调 _wrap_execute：既不经过 ActionManager.execute_action（那里发 before_action_call），也不经过 ToolManager.execute_tool（那里发 before_tool_call）。
+
+结果是依赖这两个事件做「执行前改写参数」的插件在真实对话里永远收不到通知（实测：一个在生图前补角色提示词的事件处理器，日志里连事件都不曾发布）。
+
+本补丁在 create_llm_usable_execution 的 _wrap_execute 之前补发对应事件（Action -> before_action_call；Tool -> before_tool_call），字段与既有发布点保持一致；发布失败静默降级，不阻断组件执行。
+---
+ src/core/utils/llm_tool_call.py | 51 +++++++++++++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+
+diff --git a/src/core/utils/llm_tool_call.py b/src/core/utils/llm_tool_call.py
+index 15a99ae..96b1788 100644
+--- a/src/core/utils/llm_tool_call.py
++++ b/src/core/utils/llm_tool_call.py
+@@ -167,6 +167,57 @@ async def create_llm_usable_execution(
+     if should_strip_auto_reason_argument(instance.execute, call_kwargs):
+         call_kwargs.pop("reason", None)
+ 
++    # ──────────────────────────────────────────────────────────────────
++    # [本地补丁 2026-10-12] LLM 工具调用路径也发布「执行前事件」。
++    #
++    # 背景：agent 模式的聊天器（default_chatter / neo_default_chatter）走
++    # ``run_tool_call`` → 本函数直接 ``_wrap_execute``，既不经过
++    # ActionManager.execute_action（before_action_call），也不经过
++    # ToolManager.execute_tool（before_tool_call）。于是「在生图前改写参数」
++    # 这类插件（如 char_prompt_guard）在真实对话里永远收不到通知。
++    # 这里补发两条事件，参数结构与原发布点保持一致，插件侧无需改动。
++    # ──────────────────────────────────────────────────────────────────
++    try:
++        from src.core.components.types import EventType
++        from src.kernel.event import get_event_bus
++
++        _bus = get_event_bus()
++        if issubclass(usable_cls, BaseAction):
++            _event_type: Any = EventType.BEFORE_ACTION_CALL
++            _event_params: dict[str, Any] = {
++                "signature": (
++                    f"{getattr(plugin, 'plugin_name', '')}:action:"
++                    f"{getattr(instance, 'action_name', '')}"
++                ),
++                "action_name": getattr(instance, "action_name", ""),
++                "action_description": getattr(instance, "action_description", ""),
++                "args": dict(call_kwargs),
++                "message": message,
++            }
++        elif issubclass(usable_cls, BaseTool):
++            _event_type = EventType.BEFORE_TOOL_CALL
++            _event_params = {
++                "signature": (
++                    f"{getattr(plugin, 'plugin_name', '')}:tool:"
++                    f"{getattr(instance, 'name', '')}"
++                ),
++                "tool_name": getattr(instance, "name", ""),
++                "tool_description": getattr(instance, "description", ""),
++                "args": dict(call_kwargs),
++                "message": message,
++            }
++        else:
++            _event_type = None
++
++        if _event_type is not None and _bus.get_subscribers(_event_type):
++            _, _modified = await _bus.publish(_event_type, _event_params)
++            _new_args = _modified.get("args")
++            if isinstance(_new_args, dict):
++                call_kwargs = _new_args
++    except Exception:
++        # 与框架其它发布点一致：事件失败不阻断组件执行，静默降级
++        pass
++
+     execution = instance._wrap_execute(**call_kwargs)
+     if task_observer is not None:
+         execution.add_task_observer(task_observer)
+-- 
+2.46.0.windows.1
+
