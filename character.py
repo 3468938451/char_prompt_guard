@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -226,6 +227,417 @@ def find_characters_in_history(
     ordered = sorted(last_index.items(), key=lambda item: item[1], reverse=True)
     result = [by_key[key] for key, _ in ordered]
     return result[:limit] if limit > 0 else result
+
+
+# ── 「这次该补谁」的确定性判定（用户点名 / 主角粘性）──────────────────
+
+#: 「追加」语义词：本条之外还要再加上「上一条点名消息」里的角色。
+#: 用户原话例如「画爱莉希雅」→「还有伊甸」「一起画」「加上她」「and eden」。
+ADDITIVE_WORDS: tuple[str, ...] = (
+    "还有",
+    "一起",
+    "俩",
+    "都",
+    "加上",
+    "和她",
+    "and",
+    "both",
+)
+
+#: 「改口」语义词：只取本条点名的角色，上一条点名的作废。
+#: 用户原话例如「算了」「还是画伊甸吧」「不是她」「换成伊甸」。
+CORRECTIVE_WORDS: tuple[str, ...] = (
+    "算了",
+    "还是",
+    "不是",
+    "换",
+    "改成",
+)
+
+#: 判定依据文案（会原样出现在 DEBUG 日志里，便于用户核对）
+BASIS_USER_NAMED = "用户点名"
+BASIS_LATEST_MENTION = "最近提及"
+BASIS_NONE = "无"
+
+#: 消息被明确标成 bot/助手时的角色取值（框架自带的 history 字典里**没有**
+#: ``is_bot`` / ``role`` 字段，只有 ``sender_id`` / ``sender_name``；真实的
+#: bot 判定要靠 ``adapter_api.get_bot_info_by_platform`` 拿 bot_id 比对，
+#: 见 ``handler._resolve_bot_sender_ids``。识别不到时一律按「用户消息」处理，
+#: 宁可多扫一条，也不要让整条判定链路静默失效）
+_BOT_ROLE_VALUES = frozenset({"bot", "assistant", "model", "system", "ai"})
+
+#: 明确标成用户/成员时的角色取值
+_USER_ROLE_VALUES = frozenset({"user", "human", "member", "customer", "friend"})
+
+
+def message_text(message: dict[str, Any]) -> str:
+    """取出消息的可读正文（与框架 ``_rows_to_message_dicts`` 的字段一致）。"""
+    return str(message.get("processed_plain_text") or message.get("content") or "")
+
+
+def message_time(message: dict[str, Any]) -> float | None:
+    """取出消息时间戳；取不到或是非法值时返回 ``None``。"""
+    try:
+        value = float(message.get("time"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def is_known_bot_message(
+    message: dict[str, Any], bot_ids: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """判断消息是否**可以确定**来自 bot 自己。
+
+    bot 的复述（「好的，画爱莉希雅～」）不能算用户点名，否则用户上一句刚改口、
+    bot 复述一句旧角色，点名信号就被顶掉了。判定依据依次是：
+
+    1. ``is_bot is True``；
+    2. ``role`` / ``sender_role`` / ``message_role`` 是 bot / assistant 之类；
+    3. ``sender_id`` 命中 ``bot_ids``（由 ``adapter_api`` 解析出的本机 bot id）。
+    """
+    if message.get("is_bot") is True:
+        return True
+    for key in ("role", "sender_role", "message_role"):
+        if str(message.get(key) or "").strip().lower() in _BOT_ROLE_VALUES:
+            return True
+    sender_id = str(message.get("sender_id") or "").strip()
+    return bool(sender_id and bot_ids and sender_id in bot_ids)
+
+
+def is_attributed_user_message(
+    message: dict[str, Any], bot_ids: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """判断消息是否**可以确定**来自用户。
+
+    只用于区分日志里的「判定依据=用户点名」与「判定依据=最近提及」：
+    能确定发送者身份时叫用户点名，只能确认「不是 bot」时退一步叫最近提及。
+    """
+    if message.get("is_bot") is False:
+        return True
+    for key in ("role", "sender_role", "message_role"):
+        if str(message.get(key) or "").strip().lower() in _USER_ROLE_VALUES:
+            return True
+    sender_id = str(message.get("sender_id") or "").strip()
+    return bool(sender_id and bot_ids and sender_id not in bot_ids)
+
+
+def order_messages_newest_first(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把消息窗口整理成「从新到旧」。
+
+    框架侧的顺序是确定的：``get_recent_messages(limit_mode="latest")`` 先按
+    ``-time`` 取最近 N 条，再在 ``_query_messages`` 里把结果重新按 ``time``
+    升序排序，所以窗口是「旧 → 新」，**最后一条最新**（``handler._collect_context``
+    也是把触发消息 append 在末尾）。
+
+    即便如此这里还是做一次显式校验：只有确认时间戳单调不减时才直接倒序；
+    时间戳乱序时按时间排序兜底，避免把最旧的消息当成「最近」。
+    """
+    if not messages:
+        return []
+    stamps = [message_time(item) for item in messages]
+    known = [stamp for stamp in stamps if stamp is not None]
+    if len(known) == len(stamps) and len(known) >= 2:
+        ascending = all(
+            stamps[index] <= stamps[index + 1]  # type: ignore[operator]
+            for index in range(len(stamps) - 1)
+        )
+        if ascending:
+            return list(reversed(messages))
+        indexed = sorted(enumerate(messages), key=lambda item: stamps[item[0]] or 0.0)
+        return [message for _, message in reversed(indexed)]
+    if len(known) >= 2:
+        # 部分消息没有时间戳：按「有时间戳的排后面（更新）」的稳定顺序兜底
+        indexed = sorted(
+            enumerate(messages),
+            key=lambda item: (
+                stamps[item[0]] is not None,
+                stamps[item[0]] or 0.0,
+                item[0],
+            ),
+        )
+        return [message for _, message in reversed(indexed)]
+    # 完全没有可用时间戳：按框架约定（升序）倒序
+    return list(reversed(messages))
+
+
+def contains_any_word(text: str, words: tuple[str, ...]) -> bool:
+    """判断文本里是否出现给定词表中的任意一个词。
+
+    纯 ASCII 词（``and`` / ``both``）用单词边界匹配，避免 ``and`` 命中
+    ``candy``；中文词直接子串匹配。
+    """
+    return any(_keyword_hits(text, word) for word in words)
+
+
+def merge_entries(*groups: list[CharacterEntry]) -> list[CharacterEntry]:
+    """按给定顺序合并多组角色并去重（保留先出现的那个）。"""
+    seen: set[str] = set()
+    merged: list[CharacterEntry] = []
+    for group in groups:
+        for entry in group:
+            key = entry_key(entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+    return merged
+
+
+@dataclass
+class NamingDecision:
+    """「这次该补谁」的确定性判定结果。
+
+    Attributes:
+        kind: ``single`` / ``multi`` / ``uncertain`` / ``none``
+        characters: 判定出的角色（``uncertain`` 时是「宁少勿多」的保守结果）
+        basis: 判定依据，见 :data:`BASIS_USER_NAMED` 等
+        stamp: 依据那条消息的时间戳（用于日志里打印时刻）
+        note: 追加说明（会进 DEBUG 日志）
+        stale: 是否因为「超出粘性时效」而判成无信号（此时不得回退到旧的角色集合）
+    """
+
+    kind: str = "none"
+    characters: list[CharacterEntry] = field(default_factory=list)
+    basis: str = BASIS_NONE
+    stamp: float | None = None
+    note: str = ""
+    stale: bool = False
+
+    @property
+    def multi(self) -> bool:
+        """本次判定是否属于「多人同框」。"""
+        return self.kind == "multi"
+
+    def names(self) -> str:
+        """角色名的可读列表。"""
+        return "、".join(entry.name or entry.tag or "?" for entry in self.characters)
+
+    def label(self) -> str:
+        """生成 DEBUG 日志用的判定依据文案。"""
+        if self.kind == "none" or not self.characters:
+            return f"判定依据=无(不补){f'（{self.note}）' if self.note else ''}"
+        clock = (
+            time.strftime("%H:%M:%S", time.localtime(self.stamp))
+            if self.stamp
+            else "未知时刻"
+        )
+        if self.basis == BASIS_USER_NAMED:
+            head = f"判定依据=用户点名({clock}):{self.names()}"
+        else:
+            head = f"判定依据=最近提及:{self.names()}"
+        if self.kind == "uncertain":
+            head += "（换人/追加不确定）"
+        return f"{head}{f'（{self.note}）' if self.note else ''}"
+
+
+def resolve_naming_decision(
+    messages: list[dict[str, Any]],
+    roster: list[CharacterEntry],
+    *,
+    now: float | None = None,
+    stickiness_hours: float = 6.0,
+    multi_window_minutes: float = 5.0,
+    bot_ids: frozenset[str] | set[str] = frozenset(),
+) -> NamingDecision:
+    """按「用户点名优先 + 主角粘性」判定本次该补哪些角色。
+
+    判定优先级（与 README「判定优先级」一节一致）：**描述点名 > 用户点名(粘性)
+    > LLM 仲裁 > 不补**，本函数负责其中的「用户点名/粘性」这一层。
+
+    规则：
+
+    1. 只看**不是 bot 自己**的消息（bot 的复述不算点名）；
+    2. 最近一条带角色表内角色的消息若已超出 ``stickiness_hours``，视为无信号
+       （``kind="none"`` 且 ``stale=True``），不得回退到那个旧角色；
+    3. 最近一条点名消息含 ≥2 个角色 → 多人（这些人，按角色表顺序）；
+    4. 含 1 个角色且文本里有追加词（还有/一起/俩/都/加上/和她/and/both）
+       → 多人（本条 + 上一条点名的角色，本条在前）；
+    5. 含 1 个角色且文本里有改口词（算了/还是/不是/换/改成）→ 只取本条那一个；
+    6. 都不含：与上一条点名消息间隔 < ``multi_window_minutes`` → ``uncertain``
+       （交给 LLM 仲裁，本函数给出「只补最近那一个」的保守结果）；
+       间隔 ≥ 或没有上一条点名消息 → 只取本条那一个；
+    7. 角色表为空、窗口里没有可用的点名信号 → ``kind="none"``，由调用方走
+       LLM 兜底。
+
+    Args:
+        messages: 消息窗口（顺序不限，内部会整理成从新到旧）
+        roster: 角色表
+        now: 当前时间戳（测试可注入）
+        stickiness_hours: 主角粘性时效（小时）；``<=0`` 表示不限时效
+        multi_window_minutes: 连点两人的判定窗口（分钟）
+        bot_ids: 本机 bot 的 ``sender_id`` 集合（解析不到时给空集合即可）
+
+    Returns:
+        :class:`NamingDecision`
+    """
+    if not messages or not roster:
+        return NamingDecision(kind="none", note="无上文或无角色表")
+    current_time = time.time() if now is None else float(now)
+    ordered = order_messages_newest_first(messages)
+
+    # 用户点名候选：从新到旧，逐条看「不是 bot」的消息里命中的角色表内角色
+    named: list[tuple[float | None, list[CharacterEntry], str, bool]] = []
+    for message in ordered:
+        if is_known_bot_message(message, bot_ids):
+            continue
+        text = message_text(message)
+        hits = find_characters_in_text(text, roster)
+        if not hits:
+            continue
+        named.append(
+            (
+                message_time(message),
+                hits,
+                text,
+                is_attributed_user_message(message, bot_ids),
+            )
+        )
+    if not named:
+        return NamingDecision(
+            kind="none",
+            note="窗口内没有可用的点名信号（角色表内角色只出现在 bot 消息里，或根本没有）",
+        )
+
+    current_stamp, current_hits, current_text, current_attributed = named[0]
+    basis = BASIS_USER_NAMED if current_attributed else BASIS_LATEST_MENTION
+
+    # 主角粘性时效：最近一次点名太旧 → 视为无信号（不补，交给 LLM 兜底）
+    if (
+        stickiness_hours > 0
+        and current_stamp is not None
+        and (current_time - current_stamp) > stickiness_hours * 3600
+    ):
+        age = (current_time - current_stamp) / 3600
+        return NamingDecision(
+            kind="none",
+            stale=True,
+            stamp=current_stamp,
+            note=(
+                f"最近一次点名已超出粘性时效（{age:.1f}h > {stickiness_hours:g}h），"
+                "视为无信号"
+            ),
+        )
+
+    # 3.1 最近一条点名消息里就有多个角色 → 多人
+    if len(current_hits) >= 2:
+        return NamingDecision(
+            kind="multi",
+            characters=list(current_hits),
+            basis=basis,
+            stamp=current_stamp,
+            note=f"最近一条点名消息含 {len(current_hits)} 个角色",
+        )
+
+    # 3.2 追加词 → 本条 + 上一条点名的角色
+    if contains_any_word(current_text, ADDITIVE_WORDS):
+        previous = named[1][1] if len(named) > 1 else []
+        merged = merge_entries(current_hits, previous)
+        if len(merged) >= 2:
+            return NamingDecision(
+                kind="multi",
+                characters=merged,
+                basis=basis,
+                stamp=current_stamp,
+                note=f"追加语义（本条 + 上一条点名，共 {len(merged)} 人）",
+            )
+        return NamingDecision(
+            kind="single",
+            characters=list(current_hits),
+            basis=basis,
+            stamp=current_stamp,
+            note="追加语义，但上一条没有点名别的角色",
+        )
+
+    # 3.3 改口词 → 只取本条那一个
+    if contains_any_word(current_text, CORRECTIVE_WORDS):
+        return NamingDecision(
+            kind="single",
+            characters=list(current_hits[:1]),
+            basis=basis,
+            stamp=current_stamp,
+            note="改口语义（放弃上一条点名的角色）",
+        )
+
+    # 3.4 都不含 → 看与上一条点名消息的时间差
+    if len(named) > 1:
+        previous_stamp = named[1][0]
+        if (
+            current_stamp is not None
+            and previous_stamp is not None
+            and multi_window_minutes > 0
+        ):
+            gap_minutes = abs(current_stamp - previous_stamp) / 60.0
+            if gap_minutes < multi_window_minutes:
+                return NamingDecision(
+                    kind="uncertain",
+                    characters=list(current_hits[:1]),
+                    basis=basis,
+                    stamp=current_stamp,
+                    note=(
+                        f"与上一条点名相差 {gap_minutes:.1f} 分钟"
+                        f"（< {multi_window_minutes:g} 分钟）：换人还是追加不确定，"
+                        "交 LLM 仲裁；无结论时宁少勿多只补最近那一个"
+                    ),
+                )
+    return NamingDecision(
+        kind="single",
+        characters=list(current_hits[:1]),
+        basis=basis,
+        stamp=current_stamp,
+    )
+
+
+def _replace_literal(text: str, needle: str, replacement: str) -> tuple[str, int]:
+    """替换文本里的字面量；返回 (新文本, 替换处数)。"""
+    needle = (needle or "").strip()
+    if not text or not needle:
+        return text, 0
+    if needle.isascii():
+        pattern = re.compile(
+            rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", re.IGNORECASE
+        )
+    else:
+        pattern = re.compile(re.escape(needle))
+    new_text, hits = pattern.subn(replacement, text)
+    return new_text, hits
+
+
+def replace_character_reference(
+    text: str, wrong: CharacterEntry, right: CharacterEntry
+) -> tuple[str, int]:
+    """把文本里对 ``wrong`` 的引用替换成 ``right``。
+
+    **只替换角色表里已知的字符串**（``wrong`` 的名字 / 别名 / 标准标签），
+    不做任何猜测性改写；``right`` 既没有名字也没有标签时原样返回，替换处数为 0，
+    由调用方退回 warn 行为。
+
+    Returns:
+        (新文本, 替换处数)
+    """
+    if not text or wrong is None or right is None:
+        return text, 0
+    if entry_key(wrong) == entry_key(right):
+        return text, 0
+    replacement = right.name.strip() or right.tag.strip()
+    if not replacement:
+        return text, 0
+
+    result = text
+    count = 0
+    wrong_tag = wrong.resolved_tag()
+    if wrong_tag:
+        result, hits = _replace_literal(
+            result, wrong_tag, right.resolved_tag() or replacement
+        )
+        count += hits
+    # 名字与别名按长度倒序替换，避免短别名先下手把长名字切碎
+    for keyword in sorted(wrong.keywords(), key=len, reverse=True):
+        result, hits = _replace_literal(result, keyword, replacement)
+        count += hits
+    return result, count
 
 
 def _format_roster_for_prompt(roster: list[CharacterEntry]) -> str:

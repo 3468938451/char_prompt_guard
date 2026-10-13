@@ -3,7 +3,13 @@ r"""char_prompt_guard 逻辑自检。
 在框架环境里真实加载插件、构造 ``before_action_call`` 事件，验证
 「检测 → 候选提取 → 注入 → 回写 args」的完整行为，覆盖自然语言模式
 （nai_artist）、标签模式（image_generator_plugin-neo）、多角色同框、
-运行时标记、自定义目标表等场景。
+运行时标记、自定义目标表、主角粘性/用户点名（换人 vs 追加、时效）、
+二次一致性检测（warn/fix）等场景。
+
+判定优先级（1.0.10 起）：**描述点名 > 用户最近点名(粘性) > LLM 仲裁 > 不补**。
+C28/C29/C32 这三条守住的是"上文里**非用户点名**的旧角色不得覆盖描述/用户结论"，
+因此它们的旧角色提及由 **bot 复述** 提供（``is_bot=True``）—— 真实环境里这个
+身份来自 ``adapter_api.get_bot_info_by_platform`` 的 bot_id 比对。
 
 用法（用实例自带 venv）：
 
@@ -19,9 +25,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Self
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
@@ -51,12 +60,22 @@ from ..handler import CharacterGuardHandler
 
 #: 示例角色表（第 4 列是 NAI 标准标签，tags 模式要用）
 RS = (
-    r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)" "\n"
+    r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)"
+    "\n"
     r"伊甸 | 崩坏三 (Honkai Impact 3rd) | eden | eden \(honkai impact 3rd\)"
 )
 RS_ONE = r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)"
+#: 三角色表（爱莉希雅 / 花火 / 流萤）：一致性检测、多人场景用例用
+RS3 = (
+    r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)"
+    "\n"
+    r"花火 | 崩坏：星穹铁道 (Honkai: Star Rail) | hanabi,花火 | hanabi \(honkai: star rail\)"
+    "\n"
+    r"流萤 | 崩坏：星穹铁道 (Honkai: Star Rail) | firefly,流萤 | firefly \(honkai: star rail\)"
+)
 TAG_ELYSIA = r"elysia \(honkai impact 3rd\)"
 TAG_EDEN = r"eden \(honkai impact 3rd\)"
+TAG_HANABI = r"hanabi \(honkai: star rail\)"
 
 _results: list[tuple[str, bool, str]] = []
 RUN_LLM = "--llm" in sys.argv
@@ -108,6 +127,116 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         + (f"\n        {detail}" if detail else "")
     )
     _results.append((name, ok, detail))
+
+
+def history_message(
+    text: str,
+    minutes_ago: float,
+    *,
+    is_bot: bool = False,
+    sender_id: str = "u-1",
+) -> dict:
+    """构造一条框架形状的历史消息（字段对齐 message_api._rows_to_message_dicts）。
+
+    ``get_recent_messages(limit_mode="latest")`` 先按 ``-time`` 取最近 N 条，
+    再把结果按 ``time`` **升序**返回，所以历史窗口是「旧 → 新」。
+    真实环境里「这条是不是 bot 自己说的」要靠
+    ``adapter_api.get_bot_info_by_platform`` 拿 bot_id 比对；stub 环境没有
+    adapter_api，所以这里用 ``is_bot`` 显式标注（插件对两者的处理一致）。
+    """
+    return {
+        "time": time.time() - minutes_ago * 60.0,
+        "stream_id": "s-stub",
+        "person_id": "bot-1" if is_bot else sender_id,
+        "sender_id": "bot-1" if is_bot else sender_id,
+        "sender_name": "bot" if is_bot else "用户",
+        "is_bot": is_bot,
+        "processed_plain_text": text,
+        "content": text,
+        "platform": "stub",
+    }
+
+
+class FakeHistory:
+    """上下文管理器：替换 handler 读取上文的 ``get_recent_messages``。
+
+    只在 with 块内生效，退出时恢复原函数。配合 ``history_cache_ttl = 0``
+    使用，避免进程内缓存把上一个用例的历史带进来。
+    """
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.messages = messages
+        self._original = None
+
+    def __enter__(self) -> Self:
+        from .. import handler as handler_module
+
+        self._original = handler_module.get_recent_messages
+
+        async def fake_get_recent_messages(stream_id, hours=24.0, limit=100, **kwargs):
+            return [dict(item) for item in self.messages]
+
+        handler_module.get_recent_messages = fake_get_recent_messages
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        from .. import handler as handler_module
+
+        if self._original is not None:
+            handler_module.get_recent_messages = self._original
+        return False
+
+
+class _ListHandler(logging.Handler):
+    """把日志记录收进列表。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+class LogCapture:
+    """上下文管理器：抓取 ``char_prompt_guard`` 的日志（含 DEBUG）。
+
+    判定依据是 DEBUG 级别的诊断日志，用户核对时就是看这些行，所以用例里
+    真的把它抓下来断言，而不是只看最终内容。
+    """
+
+    def __init__(self, name: str = "char_prompt_guard") -> None:
+        self.logger = logging.getLogger(name)
+        self.handler = _ListHandler()
+        self._old_level: int | None = None
+
+    def __enter__(self) -> Self:
+        self._old_level = self.logger.level
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.handler)
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.logger.removeHandler(self.handler)
+        if self._old_level is not None:
+            self.logger.setLevel(self._old_level)
+        return False
+
+    def debugs(self) -> str:
+        """DEBUG 级记录（判定依据、一致性检查结果）。"""
+        return "\n".join(
+            record.getMessage()
+            for record in self.handler.records
+            if record.levelno == logging.DEBUG
+        )
+
+    def warnings(self) -> str:
+        """WARNING 及以上记录。"""
+        return "\n".join(
+            record.getMessage()
+            for record in self.handler.records
+            if record.levelno >= logging.WARNING
+        )
 
 
 async def fire(cfg: CharPromptGuardConfig, params: dict) -> dict:
@@ -533,7 +662,11 @@ async def run_cases() -> int:
             f"content = {c!r}",
         )
     except Exception as e:  # noqa: BLE001
-        check("C21 share_photo 补角色（无 mode 参数也不受影响）", False, f"{type(e).__name__}: {e}")
+        check(
+            "C21 share_photo 补角色（无 mode 参数也不受影响）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
 
     # ── C22 nai_artist 1.3.6+ 的 share_drawing 被接管 ──────────────
     try:
@@ -599,7 +732,11 @@ async def run_cases() -> int:
             ({"message": None}, ""),
             ({"stream_id": "", "message": _Msg("")}, ""),
         ]
-        bad = [(p, want, resolve_stream_id(p)) for p, want in cases if resolve_stream_id(p) != want]
+        bad = [
+            (p, want, resolve_stream_id(p))
+            for p, want in cases
+            if resolve_stream_id(p) != want
+        ]
         check(
             "C26 stream_id 多级解析",
             not bad,
@@ -636,11 +773,16 @@ async def run_cases() -> int:
         check("C27 从角色表补全游戏名与标签", False, f"{type(e).__name__}: {e}")
 
     # ── C28 描述里的角色优先于上文里的旧角色（用假提取器验证优先级）──
+    # 1.0.10 起「用户点名」压过 LLM，所以这条用例把「旧角色（爱莉希雅）」的提及
+    # 放到 **bot 的复述**里：bot 说「我们来聊爱莉希雅吧」不算用户点名，此时没有
+    # 用户点名信号，LLM 读描述得出的结论（花火）说了算 —— 用例原本要守的意图
+    # （不要被上文里非用户点名的旧角色覆盖）不变。
     try:
         from .. import handler as handler_module
         from ..character import CharacterEntry, CharacterExtraction
 
         cfg = make_config(roster=RS_ONE, use_llm=True)  # 角色表里只有爱莉希雅
+        cfg.general.history_cache_ttl = 0.0
 
         async def fake_extract(**kwargs):
             # 模拟"LLM 读了画面描述与上文后给出的结论"：这次要画的是花火
@@ -652,30 +794,42 @@ async def run_cases() -> int:
         original = handler_module.extract_characters_via_llm
         handler_module.extract_characters_via_llm = fake_extract
         try:
-            params = {
-                "signature": "nai_artist:action:share_photo",
-                "action_name": "share_photo",
-                "args": {"content": "台上站着一个人，手里拿着面具"},
-                "message": FakeMessage("我们来聊爱莉希雅吧"),
-                "stream_id": "s-test",
-            }
-            out = await fire(cfg, params)
+            history = [history_message("我们来聊爱莉希雅吧", 2.0, is_bot=True)]
+            with FakeHistory(history):
+                params = {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": "台上站着一个人，手里拿着面具"},
+                    "message": FakeMessage("画一张舞台照"),
+                    "stream_id": "s-c28",
+                }
+                out = await fire(cfg, params)
             c = out["args"]["content"]
             ok = "花火" in c and "爱莉希雅" not in c
-            check("C28 描述结论优先于上文里的旧角色", ok, f"content = {c!r}")
+            check(
+                "C28 描述结论优先于上文旧角色（bot 复述不算点名）",
+                ok,
+                f"content = {c!r}",
+            )
         finally:
             handler_module.extract_characters_via_llm = original
     except Exception as e:  # noqa: BLE001
-        check("C28 描述结论优先于上文里的旧角色", False, f"{type(e).__name__}: {e}")
+        check(
+            "C28 描述结论优先于上文旧角色（bot 复述不算点名）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
 
     # ── C29 LLM 说"角色已在提示词里"时不得回退到上文旧角色 ─────────
     # 实测原样复现：描述写着 Hanabi，LLM 也答"花火"，但"花火"已在描述里被过滤，
     # 旧代码于是回退到上文命中，把爱莉希雅补了进去。
+    # 同 C28：旧角色的提及改由 **bot 复述** 提供，避免与「用户点名优先」冲突。
     try:
         from .. import handler as handler_module
         from ..character import CharacterEntry, CharacterExtraction
 
         cfg = make_config(roster=RS_ONE, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
 
         async def fake_extract(**kwargs):
             return CharacterExtraction(
@@ -687,14 +841,16 @@ async def run_cases() -> int:
         handler_module.extract_characters_via_llm = fake_extract
         try:
             raw = "Hanabi (Honkai: Star Rail). 只拍花火本尊一人"
-            params = {
-                "signature": "nai_artist:action:share_photo",
-                "action_name": "share_photo",
-                "args": {"content": raw},
-                "message": FakeMessage("我们来聊爱莉希雅吧"),
-                "stream_id": "s-test",
-            }
-            out = await fire(cfg, params)
+            history = [history_message("我们来聊爱莉希雅吧", 2.0, is_bot=True)]
+            with FakeHistory(history):
+                params = {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("画一张舞台照"),
+                    "stream_id": "s-c29",
+                }
+                out = await fire(cfg, params)
             c = out["args"]["content"]
             check(
                 "C29 描述已含该角色时不回退上文旧角色",
@@ -751,21 +907,21 @@ async def run_cases() -> int:
     # ── C32 描述已点名 A、上文提到 B+C（多人）→ 不得补 B/C ──────────
     # 实测：用户要爱莉，描述里已有"爱莉"，但上文写过花火与流萤，
     # multi_only 进多人路径后把花火+流萤补了进去。
+    # 1.0.10 起这两条提及改由 **bot 复述** 提供（不是用户点名），断言语义不变：
+    # 窗口里的旧角色不得覆盖描述点名。
     try:
         from .. import handler as handler_module
         from ..character import CharacterEntry, CharacterExtraction
 
-        roster3 = (
-            r"爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \(honkai impact 3rd\)" "\n"
-            r"花火 | 崩坏：星穹铁道 (Honkai: Star Rail) | hanabi,花火 | hanabi \(honkai: star rail\)" "\n"
-            r"流萤 | 崩坏：星穹铁道 (Honkai: Star Rail) | firefly,流萤 | firefly \(honkai: star rail\)"
-        )
-        cfg = make_config(roster=roster3, use_llm=True)
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
 
         async def fake_extract(**kwargs):
             # LLM 读了描述：这次只有爱莉希雅
             return CharacterExtraction(
-                characters=[CharacterEntry(name="爱莉希雅", game="崩坏三 (Honkai Impact 3rd)")],
+                characters=[
+                    CharacterEntry(name="爱莉希雅", game="崩坏三 (Honkai Impact 3rd)")
+                ],
                 multi=False,
             )
 
@@ -773,21 +929,298 @@ async def run_cases() -> int:
         handler_module.extract_characters_via_llm = fake_extract
         try:
             raw = "爱莉希雅穿着礼服站在灯下"
-            params = {
-                "signature": "nai_artist:action:share_photo",
-                "action_name": "share_photo",
-                "args": {"content": raw},
-                "message": FakeMessage("聊聊花火和流萤吧"),
-                "stream_id": "s-test",
-            }
-            out = await fire(cfg, params)
+            history = [history_message("聊聊花火和流萤吧", 2.0, is_bot=True)]
+            with FakeHistory(history):
+                params = {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("画一张舞台照"),
+                    "stream_id": "s-c32",
+                }
+                out = await fire(cfg, params)
             c = out["args"]["content"]
-            ok = "花火" not in c and "流萤" not in c and r"elysia \(honkai impact 3rd\)" in c
+            ok = "花火" not in c and "流萤" not in c and TAG_ELYSIA in c
             check("C32 多人上文不得覆盖已点名的角色", ok, f"content = {c!r}")
         finally:
             handler_module.extract_characters_via_llm = original
     except Exception as e:  # noqa: BLE001
         check("C32 多人上文不得覆盖已点名的角色", False, f"{type(e).__name__}: {e}")
+
+    # ── C33 主角粘性：描述没点名，窗口里 A(较早)+B(最近) → 补 B 且不补 A ──
+    try:
+        cfg = make_config()  # 角色表 RS：爱莉希雅 / 伊甸
+        cfg.general.history_cache_ttl = 0.0
+        history = [
+            history_message("我们来聊爱莉希雅吧", 30.0),  # A：30 分钟前
+            history_message("画一张伊甸的图", 1.0),  # B：1 分钟前（最近）
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": "画一张战斗场景"},
+                    "message": FakeMessage("画一张战斗场景"),
+                    "stream_id": "s-c33",
+                },
+            )
+        c = out["args"]["content"]
+        ok = (
+            "伊甸" in c
+            and "爱莉希雅" not in c
+            and "判定依据=" in logs.debugs()
+            and "伊甸" in logs.debugs()
+        )
+        check(
+            "C33 粘性：取最近一次点名（B），不补更早的 A",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C33 粘性：取最近一次点名（B），不补更早的 A",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C34 最近一条消息点了两名 → 多人补齐两人 ────────────────────
+    try:
+        cfg = make_config()
+        cfg.general.history_cache_ttl = 0.0
+        with LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": "画一张战斗场景"},
+                    "message": FakeMessage("把爱莉希雅和伊甸画在同一个画面里"),
+                    "stream_id": "s-c34",
+                },
+            )
+        c = out["args"]["content"]
+        ok = "爱莉希雅" in c and "伊甸" in c
+        check(
+            "C34 同一条消息点两名 → 补两人",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C34 同一条消息点两名 → 补两人", False, f"{type(e).__name__}: {e}")
+
+    # ── C35 追加语义（还有/一起）→ 本条 + 上一条点名的角色 ──────────
+    try:
+        cfg = make_config()
+        cfg.general.history_cache_ttl = 0.0
+        history = [history_message("画爱莉希雅", 1.0)]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": "画一张战斗场景"},
+                    "message": FakeMessage("还有伊甸，一起画"),
+                    "stream_id": "s-c35",
+                },
+            )
+        c = out["args"]["content"]
+        ok = "伊甸" in c and "爱莉希雅" in c
+        check(
+            "C35 追加语义 → 本条 + 上一条点名都补",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C35 追加语义 → 本条 + 上一条点名都补", False, f"{type(e).__name__}: {e}")
+
+    # ── C36 改口语义（算了/还是）→ 只补最新那名 ────────────────────
+    try:
+        cfg = make_config()
+        cfg.general.history_cache_ttl = 0.0
+        history = [history_message("画爱莉希雅", 1.0)]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": "画一张战斗场景"},
+                    "message": FakeMessage("算了，还是画伊甸吧"),
+                    "stream_id": "s-c36",
+                },
+            )
+        c = out["args"]["content"]
+        ok = "伊甸" in c and "爱莉希雅" not in c
+        check(
+            "C36 改口语义 → 只补最新那名（换人）",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C36 改口语义 → 只补最新那名（换人）", False, f"{type(e).__name__}: {e}")
+
+    # ── C37 超出 multi.stickiness_hours → 视为无信号，不补 ──────────
+    try:
+        cfg = make_config()
+        cfg.general.history_cache_ttl = 0.0
+        cfg.multi.stickiness_hours = 6.0
+        raw = "画一张战斗场景"
+        history = [
+            history_message("画爱莉希雅", 8 * 60.0),  # 8 小时前
+            history_message("画伊甸", 7 * 60.0),  # 7 小时前（也超 6h）
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": raw},
+                    "message": FakeMessage(raw),
+                    "stream_id": "s-c37",
+                },
+            )
+        c = out["args"]["content"]
+        ok = c == raw and "判定依据=无(不补)" in logs.debugs()
+        check(
+            "C37 超出粘性时效 → 不补",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C37 超出粘性时效 → 不补", False, f"{type(e).__name__}: {e}")
+
+    # ── C38 一致性检测 warn：冲突只告警、内容不改 ──────────────────
+    # 描述里写着爱莉希雅，用户这次点名的却是花火 —— 典型的「画面里是另一个
+    # 角色」冲突。warn 模式只打 WARNING，不动内容。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        cfg.general.tag_completion = False  # 隔离标签补全，只看一致性检测
+        raw = "爱莉希雅站在月光下"
+        with LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("画花火一个人"),
+                    "stream_id": "s-c38",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        ok = (
+            c == raw
+            and "一致性检查=冲突" in warns
+            and "爱莉希雅" in warns
+            and "花火" in warns
+        )
+        check(
+            "C38 consistency_check=warn：告警但不改内容",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C38 consistency_check=warn：告警但不改内容",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C39 一致性检测 fix：把画面里的错误角色替换成正确角色 ────────
+    # 同一场景换成 fix：画面里的「爱莉希雅」被替换成用户点名的「花火」，
+    # 连角色表里的标准标签一起换（elysia … → hanabi …）。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        raw = "爱莉希雅站在月光下"
+        with LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("画花火一个人"),
+                    "stream_id": "s-c39",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        ok = (
+            c.startswith("花火站在月光下")
+            and "爱莉希雅" not in c
+            and "elysia" not in c.lower()
+            and TAG_HANABI in c
+            and "一致性检查=冲突已修正" in warns
+        )
+        check(
+            "C39 consistency_check=fix：错误角色被替换",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C39 consistency_check=fix：错误角色被替换",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C40 用户点名压过 LLM 的猜测（本次要修的核心问题）────────────
+    # 实测场景：用户 21:52 点名「流萤」，01:03 只说「想看看你」，
+    # LLM 却结合描述猜成了爱莉希雅。1.0.10 起用户点名优先于 LLM 仲裁，
+    # 而且粘性时效内的点名不会被"描述优先"翻掉。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+
+        async def fake_extract(**kwargs):
+            # 模拟 LLM 被描述带偏：它猜的是爱莉希雅
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(name="爱莉希雅", game="崩坏三 (Honkai Impact 3rd)")
+                ],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            history = [history_message("画一张流萤的图", 191.0)]  # 3 小时 11 分钟前
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_drawing",
+                        "action_name": "share_drawing",
+                        "args": {"content": "画一张战斗场景"},
+                        "message": FakeMessage("想看看你"),
+                        "stream_id": "s-c40",
+                    },
+                )
+            c = out["args"]["content"]
+            ok = "流萤" in c and "爱莉希雅" not in c
+            check(
+                "C40 用户点名压过 LLM 猜测（粘性时效内）",
+                ok,
+                f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+            )
+        finally:
+            handler_module.extract_characters_via_llm = original
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C40 用户点名压过 LLM 猜测（粘性时效内）", False, f"{type(e).__name__}: {e}"
+        )
 
     # ── C14/C15 需要真调小模型 ─────────────────────────────────────
     if RUN_LLM:

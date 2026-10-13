@@ -41,7 +41,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.9"
+    plugin_version: str = "1.0.10"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

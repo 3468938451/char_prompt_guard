@@ -147,16 +147,20 @@ coord_plan = "spread"    # spread | llm | none
 - **`multi.enabled = false`** 时回到单角色行为（命中任一角色即放行、只补最近讨论的那一个），
   可逐字节回归验证；
 - 默认值是 `true`（按需求确认结果），出问题只需把开关关回或把 `scope` 改成配置项之外的值；
-- 版本：**1.0.3**（在 1.0.2 基础上的修订：`stream_id` 多级解析 + 上文收集与
-  提取结果的诊断日志。根因是 agent 编排器发起工具调用时事件里没有会话 ID，
-  导致读不到上文、模型自然提不出角色）。
+- 版本：**1.0.10**（在 1.0.9 基础上的修订：主角粘性 + 用户点名优先
+  （`multi.stickiness_hours` / `multi.multi_window_minutes` / `multi.decide`）、
+  二次一致性检测（`general.consistency_check` = off/warn/fix）与判定依据诊断日志。
+  判定优先级固定为「描述点名 > 用户最近点名(粘性) > LLM 仲裁 > 不补」。
+  此前 1.0.3 的修订是 `stream_id` 多级解析 + 上文收集与提取结果的诊断日志，
+  根因是 agent 编排器发起工具调用时事件里没有会话 ID，导致读不到上文、
+  模型自然提不出角色）。
 
 ## 6. 验证方式（已从"测试计划"落实为脚本）
 
 | 脚本 | 覆盖 |
 | --- | --- |
 | `tests/check_import.py` | 真实导入、manifest 字段、api_version 模块存在性、组件声明一致、配置默认值 |
-| `tests/check_logic.py` | 19 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底 |
+| `tests/check_logic.py` | 40 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底、主角粘性/用户点名（换人 vs 追加、时效、压过 LLM）、二次一致性检测 warn/fix |
 | `tests/check_patch.py` | 框架补丁状态（未打 / 原版 / 修正版）判定 |
 
 ## 6. 测试计划

@@ -93,6 +93,19 @@ class CharPromptGuardConfig(BaseConfig):
             default="（画面角色：“{name}”）",
             description="游戏名为空时使用的模板",
         )
+        consistency_check: str = Field(
+            default="warn",
+            description=(
+                "二次一致性检测：注入/放行之前，把「最终提示词里出现的角色表内角色」与"
+                "「本次判定出的角色集合」对账。"
+                "off=不检查；"
+                "warn（默认）=发现提示词里有判定集合之外的角色表内角色时打一条 WARNING，内容不改；"
+                "fix=仅当冲突是「用户点名的角色 vs 画面里另一个角色」且双方都能唯一定位时，"
+                "把画面里那个错误角色的名字/别名/标签替换成正确角色的（替换范围仅限角色表里"
+                "已知的字符串），替换后按需补正确角色的标准标签；出现歧义或多角色无法定位时"
+                "自动退回 warn 行为并打 WARNING"
+            ),
+        )
 
     @config_section("roster")
     class RosterSection(SectionBase):
@@ -173,8 +186,19 @@ class CharPromptGuardConfig(BaseConfig):
         decision: str = Field(
             default="bot",
             description=(
-                "多人判定方式：bot=由主模型标记与 LLM 判定自动切换（推荐）；"
-                "always=总是按多人处理；off=总是按单人处理"
+                "多人判定方式（旧字段，保留兼容）：bot=由主模型标记与 LLM 判定自动切换（推荐）；"
+                "always=总是按多人处理；off=总是按单人处理。"
+                "新部署请优先用 decide"
+            ),
+        )
+        decide: str = Field(
+            default="bot",
+            description=(
+                "多人判定方式（新）：bot=按「用户点名」规则自动判定（最近一条点名含 ≥2 个角色、"
+                "或含“还有/一起/俩/都/加上/和她/and/both”等追加词时补多人；含“算了/还是/不是/换/改成”"
+                "等改口词时只补最新那一个；两者都不含且与上一条点名消息的间隔小于 "
+                "multi_window_minutes 时视为不确定，交 LLM 仲裁，LLM 不可用时宁少勿多只补最近那一个）；"
+                "latest=总是只补最近点名的那个角色；always_multi=总是按多人处理"
             ),
         )
         llm_mode: str = Field(
@@ -191,6 +215,24 @@ class CharPromptGuardConfig(BaseConfig):
         recent_messages: int = Field(
             default=6,
             description="recent_only 的消息窗口大小",
+        )
+        stickiness_hours: float = Field(
+            default=6.0,
+            description=(
+                "主角粘性时效（小时，默认 6.0）：画面描述里没有角色表内角色时，"
+                "采用「最近一次被提及的角色表内角色」（按时间从新到旧找第一个命中）。"
+                "这条提及若比该时效还旧，就视为没有信号（不补、交给 LLM 兜底），"
+                "避免把几小时前聊过的角色补进现在的画面。设 0 表示不限时效"
+            ),
+        )
+        multi_window_minutes: float = Field(
+            default=5.0,
+            description=(
+                "短时间连点两人的判定窗口（分钟，默认 5.0）：最近一条用户消息只点名了 1 个角色、"
+                "且既没有追加词也没有改口词时，若它与「上一条点名消息」的间隔小于该值，"
+                "就认为用户可能在换人（也可能在追加），判定为不确定并交 LLM 仲裁；"
+                "LLM 不可用时宁少勿多，只补最近那一个。间隔大于等于该值则只取本条那一个"
+            ),
         )
         strategy_neo: str = Field(
             default="characters",

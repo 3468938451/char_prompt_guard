@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import time
@@ -41,14 +42,18 @@ from src.kernel.event import EventDecision
 
 from .character import (
     CharacterEntry,
+    NamingDecision,
     character_in_texts,
     content_contains_tag,
     entry_key,
     extract_characters_via_llm,
     find_characters_in_history,
     iter_config_entries,
+    merge_entries,
     normalize_prompt_text,
     parse_roster,
+    replace_character_reference,
+    resolve_naming_decision,
 )
 from .config import CharPromptGuardConfig
 
@@ -135,6 +140,28 @@ class BotControl:
     force_strategy: str = ""
     nochar: bool = False
     markers_found: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CandidateResult:
+    """一次判定（「这次该补谁」）的完整结果。
+
+    Attributes:
+        candidates: 待补入的候选角色（已过滤掉提示词里已有的）
+        decided: **判定集合** —— 本次判定认为画面里应该有的角色（不过滤、不截断），
+            供二次一致性检测对账
+        llm_multi: LLM 判定的「是否需要多人同框」
+        mentioned: 上文中被提及的角色表内角色数（过滤前，供 multi_only 判断）
+        naming: 确定性的「用户点名/粘性」判定结果
+        basis: 判定依据的可读文案（进日志与 WARNING）
+    """
+
+    candidates: list[CharacterEntry] = field(default_factory=list)
+    decided: list[CharacterEntry] = field(default_factory=list)
+    llm_multi: bool = False
+    mentioned: int = 0
+    naming: NamingDecision = field(default_factory=NamingDecision)
+    basis: str = ""
 
 
 _BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
@@ -310,9 +337,7 @@ def _enrich_from_roster(
         if not same and name:
             # 角色表里的别名与 LLM 给的名字对上（如 elysia ↔ 爱莉希雅）
             same = any(
-                normalize_prompt_text(alias) == name
-                for alias in known.aliases
-                if alias
+                normalize_prompt_text(alias) == name for alias in known.aliases if alias
             )
         if not same and tag and known.name:
             same = tag == known_name
@@ -442,6 +467,13 @@ _roster_cache: dict[str, list[CharacterEntry]] = {}
 _HISTORY_CACHE_LIMIT = 32
 _history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
+# bot 自己的 sender_id 缓存：platform → (写入时间, bot_id 或 None)。
+# 用来把「bot 的复述」和「用户的点名」分开：bot 说「好的，画爱莉希雅」不该
+# 覆盖用户上一句刚改口的角色。解析不到时返回空集合，判定会退化成
+# 「最近提及优先」（见 character.is_known_bot_message 的说明）。
+_BOT_ID_CACHE_TTL = 60.0
+_bot_id_cache: dict[str, tuple[float, str | None]] = {}
+
 
 def _cached_parse(key_text: str, cache: dict[str, Any], factory: Any) -> Any:
     """按配置文本缓存解析结果。"""
@@ -530,10 +562,9 @@ class CharacterGuardHandler(BaseEventHandler):
             entry_key(entry) for entry in roster if character_in_texts(entry, texts)
         }
 
-        # 候选角色：先角色表扫描，必要时 LLM 兜底/补全
-        candidates, llm_multi, mentioned = await self._collect_candidates(
-            params, config, roster, content, texts
-        )
+        # 候选角色：用户点名/粘性 → LLM 仲裁（必要时）
+        result = await self._collect_candidates(params, config, roster, content, texts)
+        candidates = result.candidates
 
         # 标签补全：描述里已经点名了角色表内的角色、但缺少该角色的标准标签时补标签。
         # 与"要不要新补一个角色"无关，所以放在最前面独立处理。
@@ -542,14 +573,35 @@ class CharacterGuardHandler(BaseEventHandler):
         # 补上转义正确的标准标签后，NAI 才能稳定锁定角色。
         completion_tags = self._completion_tags(content, roster, config)
 
-        multi = self._resolve_multi(config, control, candidates, llm_multi, mentioned)
+        multi = self._resolve_multi(
+            config,
+            control,
+            candidates,
+            result.llm_multi,
+            result.mentioned,
+            result.naming.multi,
+        )
         if not multi:
             # 单角色路径：沿用"命中任一角色即整体放行"
             if present_keys:
-                if completion_tags:
-                    return self._apply_completion(params, args, spec, content, completion_tags)
-                logger.debug("提示词已包含角色，放行")
-                return EventDecision.SUCCESS, params
+                final_content = (
+                    self._complete(spec, content, completion_tags)
+                    if completion_tags
+                    else content
+                )
+                if not completion_tags:
+                    logger.debug("提示词已包含角色，放行")
+                return self._finalize(
+                    params=params,
+                    args=args,
+                    spec=spec,
+                    original=raw_content,
+                    final_content=final_content,
+                    decided=result.decided,
+                    roster=roster,
+                    config=config,
+                    basis=result.basis,
+                )
             target_characters = candidates[:1]
         else:
             target_characters = [
@@ -557,10 +609,24 @@ class CharacterGuardHandler(BaseEventHandler):
             ][: max(1, int(config.multi.max_characters))]
 
         if not target_characters:
-            if completion_tags:
-                return self._apply_completion(params, args, spec, content, completion_tags)
-            logger.debug("未识别到需要补入的角色，放行")
-            return EventDecision.SUCCESS, params
+            final_content = (
+                self._complete(spec, content, completion_tags)
+                if completion_tags
+                else content
+            )
+            if not completion_tags:
+                logger.debug("未识别到需要补入的角色，放行")
+            return self._finalize(
+                params=params,
+                args=args,
+                spec=spec,
+                original=raw_content,
+                final_content=final_content,
+                decided=result.decided,
+                roster=roster,
+                config=config,
+                basis=result.basis,
+            )
 
         new_content = self._apply(
             args=args,
@@ -571,10 +637,18 @@ class CharacterGuardHandler(BaseEventHandler):
             control=control,
         )
         if new_content is None:
-            return EventDecision.SUCCESS, params
+            return self._finalize(
+                params=params,
+                args=args,
+                spec=spec,
+                original=raw_content,
+                final_content=content,
+                decided=result.decided,
+                roster=roster,
+                config=config,
+                basis=result.basis,
+            )
 
-        args[spec.prompt_arg] = new_content
-        params["args"] = args
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
         # 把"追加了什么"直接写进日志：用户最容易困惑的就是"到底补了谁、有没有游戏名"
         appended = new_content[len(content) :].strip()
@@ -583,7 +657,17 @@ class CharacterGuardHandler(BaseEventHandler):
             f"{' / 多人' if multi else ''}）: {names}"
             f"{f' → 追加 {appended!r}' if appended else ''}"
         )
-        return EventDecision.SUCCESS, params
+        return self._finalize(
+            params=params,
+            args=args,
+            spec=spec,
+            original=raw_content,
+            final_content=new_content,
+            decided=result.decided,
+            roster=roster,
+            config=config,
+            basis=result.basis,
+        )
 
     # ── 配置与检测辅助 ────────────────────────────────────────────
 
@@ -652,12 +736,21 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         content: str,
         texts: list[str],
-    ) -> tuple[list[CharacterEntry], bool, int]:
-        """收集候选角色（角色表扫描 → LLM 兜底/补全）。
+    ) -> CandidateResult:
+        """收集候选角色。
+
+        判定优先级（1.0.10 起）：**描述点名 > 用户点名(粘性) > LLM 仲裁 > 不补**。
+
+        - 描述点名：画面描述里已经写了角色表内角色 —— 由调用方直接放行/补标签，
+          本函数只负责算出「判定集合」，供二次一致性检测对账；
+        - 用户点名(粘性)：``character.resolve_naming_decision`` 的确定性结论
+          （带 ``multi.stickiness_hours`` 时效、换人/追加规则）。**它压过 LLM 的
+          猜测** —— 「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
+        - LLM 仲裁：没有确定结论（无信号 / 换人还是追加不确定）时才问；
+        - 都不成立 → 不补（宁少勿多）。
 
         Returns:
-            (待补入的角色, LLM 判定的 multi, 上文提到的角色总数)
-            第三项是**过滤前**的候选数量，供 multi_only 判断"上文是不是多人场景"。
+            :class:`CandidateResult`
         """
         messages = await self._collect_context(params, config)
         recent_window = (
@@ -665,7 +758,7 @@ class CharacterGuardHandler(BaseEventHandler):
         )
         window = messages[-recent_window:] if recent_window > 0 else messages
 
-        # ① 角色表在上文里的命中（确定性、零成本）：作为兜底候选
+        # ① 上文中被提及的角色表内角色：只用于 multi_only 的「是不是多人场景」判断
         history_candidates: list[CharacterEntry] = []
         seen: set[str] = set()
         if roster:
@@ -675,34 +768,47 @@ class CharacterGuardHandler(BaseEventHandler):
                     continue
                 seen.add(key)
                 history_candidates.append(entry)
-
-        # 「上文中被提及的角色数」在过滤前先记下来：multi_only 判断的是
-        # "上文是不是多人场景"，而不是"这次还缺几个角色"。
         mentioned = len(history_candidates)
 
         # ② 画面描述里已经点名的「角色表内」角色
-        present_keys = {entry_key(entry) for entry in roster if character_in_texts(entry, texts)}
+        present_keys = {
+            entry_key(entry) for entry in roster if character_in_texts(entry, texts)
+        }
 
-        # ③ 决定要不要问 LLM。
-        # 关键：光看"上文里有没有角色表内的角色"是不够的 —— 上文里提到的可能是
-        # 几句之前的**另一个**角色（实测：描述里要的是花火，上文最旧那条却在说
-        # "不加爱莉的提示词"，于是补错了人）。所以只要**画面描述里没有角色表内
-        # 角色**，就让 LLM 结合描述判定一次（它能看到这次到底要画谁）。
-        #
-        # 另有一种必须问 LLM 的情况：上文里出现了 ≥2 个角色表内角色（multi_only
-        # 会据此进多人路径）。此时若描述其实已经点名了某个角色，贸然把上文那两个
-        # 都补进去就会出错（实测：用户要爱莉，却被补成花火 + 流萤）。多人场景交给
-        # LLM 仲裁，它读过描述，知道这次到底要几个人。
+        # ③ 用户点名 / 主角粘性（确定性、零成本）：本次判定的主依据。
+        # bot 自己的复述不算点名，所以先尽力解析本机 bot 的 sender_id（解析不到
+        # 就退化成「最近提及优先」，见 character.is_known_bot_message）。
+        bot_ids = await self._resolve_bot_sender_ids(window)
+        naming = resolve_naming_decision(
+            window,
+            roster,
+            stickiness_hours=float(config.multi.stickiness_hours),
+            multi_window_minutes=float(config.multi.multi_window_minutes),
+            bot_ids=bot_ids,
+        )
+        logger.debug(naming.label())
+
+        # ④ 决定要不要问 LLM（沿用 1.0.6 起的既有条件，另加「不确定」这一条）：
+        #   - llm_mode="always"：显式要求每次都问，可识别角色表**外**的角色；
+        #   - 没有任何上文命中：保持原有 LLM 兜底行为；
+        #   - description_first 且描述里没有角色表内角色：让读过描述的 LLM 参与；
+        #   - 上文出现 ≥2 个角色表内角色：多人场景需要 LLM 仲裁一次；
+        #   - 换人还是追加不确定（uncertain）：按规则交 LLM 仲裁。
+        # 注意：**问不问 LLM** 与 **听不听 LLM** 是两件事 —— 用户点名有确定结论时，
+        # LLM 的表内结论一律让位（见 ⑤），这里问一次只是为了 llm_mode="always" 下
+        # 还能认出角色表外的角色、以及保留 description_first 的既有排查能力。
+        llm_mode = str(config.multi.llm_mode).lower()
         multi_candidates = (
             config.multi.enabled
             and str(config.multi.scope).lower() == SCOPE_MULTI_ONLY
             and mentioned >= 2
         )
         need_llm = config.general.use_llm and (
-            str(config.multi.llm_mode).lower() == "always"
+            llm_mode == "always"
             or not history_candidates
             or (config.general.description_first and not present_keys)
             or multi_candidates
+            or naming.kind == "uncertain"
         )
 
         llm_candidates: list[CharacterEntry] = []
@@ -732,15 +838,15 @@ class CharacterGuardHandler(BaseEventHandler):
                 timeout=float(config.general.llm_timeout),
             )
             if extraction is None:
-                logger.debug("LLM 提取无结果（超时或失败），回退角色表命中")
+                logger.debug("LLM 提取无结果（超时或失败），按用户点名/粘性判定兜底")
             else:
+                llm_multi = extraction.multi
+                llm_answered = bool(extraction.characters)
                 logger.debug(
                     "LLM 提取结果: "
                     f"characters={[entry.name or entry.tag for entry in extraction.characters]} "
                     f"multi={extraction.multi}"
                 )
-                llm_multi = extraction.multi
-                llm_answered = bool(extraction.characters)
                 # 注意：这里**不能**复用上文史命中的 seen 集合。实测踩过：
                 # 角色在上文里被提到过 → 已在 seen 里 → LLM 的结果被去重掉 →
                 # 列表变空 → 被误判成"角色已在提示词里"，于是什么都不补。
@@ -756,25 +862,233 @@ class CharacterGuardHandler(BaseEventHandler):
                     seen_llm.add(key)
                     llm_candidates.append(entry)
 
-        # ④ LLM 读过画面描述，它的结论优先；角色表的历史命中只作兜底。
-        # 注意三种情况要分清（实测踩过坑：描述里写着"花火"、LLM 也答"花火"，
-        # 但那条"已在提示词里"被过滤掉后错误地回退，把上文里的爱莉补了进去）：
-        if llm_candidates:
-            # LLM 给出了需要补的角色
-            candidates = llm_candidates
+        # ⑤ 汇总。用户点名/粘性有确定结论时以它为准 —— LLM 的表内猜测一律让位
+        # （这就是本次要修的核心问题：用户点名流萤，LLM 却猜成爱莉希雅）；
+        # 只有 llm_mode="always" 这种显式开启的场景，才额外保留 LLM 认出来的
+        # **角色表外**角色（宁少勿多，不让模型的猜测混进画面）。
+        if naming.kind in {"single", "multi"}:
+            candidates = [
+                entry
+                for entry in naming.characters
+                if not character_in_texts(entry, texts)
+            ]
+            decided = list(naming.characters)
+            basis = naming.label()
+            outside = (
+                [
+                    entry
+                    for entry in llm_candidates
+                    if not any(entry_key(entry) == entry_key(known) for known in roster)
+                ]
+                if llm_mode == "always"
+                else []
+            )
+            if outside:
+                logger.debug(
+                    "LLM 额外识别出角色表外的角色 "
+                    f"{[entry.name or entry.tag for entry in outside]}，一并补入"
+                )
+                candidates = merge_entries(candidates, outside)
+        elif llm_candidates:
+            candidates = list(llm_candidates)
+            decided = list(llm_candidates)
+            basis = (
+                f"判定依据=LLM 仲裁:"
+                f"{[entry.name or entry.tag or '?' for entry in llm_candidates]}"
+                f" multi={str(llm_multi).lower()}"
+            )
+            logger.debug(basis)
         elif llm_answered:
             # LLM 答了，只是它给的角色都已经在提示词里 → 画面没问题，本次不补，
             # 绝不回退到上文里的旧角色
             logger.debug("LLM 给出的角色都已在提示词中，无需补入（不回退上文命中）")
             candidates = []
-        else:
-            # LLM 没给出结论（超时/失败/空结果）→ 才用角色表在上文里的命中兜底
+            decided = []
+            basis = "判定依据=LLM 仲裁:[]（LLM 认为无需补入）"
+            logger.debug(basis)
+        elif naming.kind == "uncertain":
+            # 不确定且 LLM 无结论/不可用 → 宁少勿多，只补最近那一个
             candidates = [
-                entry for entry in history_candidates if not character_in_texts(entry, texts)
+                entry
+                for entry in naming.characters
+                if not character_in_texts(entry, texts)
             ]
+            decided = list(naming.characters)
+            basis = f"{naming.label()}；LLM 无结论，宁少勿多只补最近那一个"
+        else:
+            # 无信号（没有点名、或点名已超出粘性时效）
+            candidates = []
+            decided = []
+            basis = naming.label()
 
         max_candidates = max(1, int(config.multi.max_characters))
-        return candidates[:max_candidates], llm_multi, mentioned
+        return CandidateResult(
+            candidates=candidates[:max_candidates],
+            decided=decided,
+            llm_multi=llm_multi,
+            mentioned=mentioned,
+            naming=naming,
+            basis=basis,
+        )
+
+    async def _resolve_bot_sender_ids(self, messages: list[dict[str, Any]]) -> set[str]:
+        """尽力解析「本机 bot 自己的 sender_id」集合。
+
+        框架自带的 history 字典（``message_api._rows_to_message_dicts``）只有
+        ``sender_id`` / ``sender_name``，没有 ``is_bot`` / ``role`` 字段；框架
+        自己是靠 ``adapter_api.get_bot_info_by_platform(platform)["bot_id"]``
+        比对的，这里沿用同一口径。
+
+        取不到时返回空集合：判定会退化成「最近提及优先」（把 bot 的复述也当
+        点名），但绝不会因为认不出字段而让整条链路静默失效。用
+        ``importlib`` 动态导入是为了不把 ``adapter_api`` 变成插件的硬依赖
+        （manifest 的 ``api_version`` 里没有它，静态导入会被校验器挑出来）。
+        """
+        platforms = {str(message.get("platform") or "") for message in messages} - {""}
+        if not platforms:
+            return set()
+        try:
+            module = importlib.import_module("src.app.plugin_system.api.adapter_api")
+        except Exception as e:  # noqa: BLE001 —— 拿不到 adapter 信息就退化成最近提及
+            logger.debug(f"adapter_api 不可用，无法区分 bot 消息与用户消息: {e}")
+            return set()
+        get_bot_info = getattr(module, "get_bot_info_by_platform", None)
+        if get_bot_info is None:
+            return set()
+
+        bot_ids: set[str] = set()
+        now = time.time()
+        for platform in platforms:
+            cached = _bot_id_cache.get(platform)
+            if cached is not None and (now - cached[0]) < _BOT_ID_CACHE_TTL:
+                bot_id = cached[1]
+            else:
+                try:
+                    info = await get_bot_info(platform)
+                except Exception as e:  # noqa: BLE001 —— 单个平台失败不影响其它平台
+                    logger.debug(f"解析平台 {platform} 的 bot 信息失败: {e}")
+                    info = None
+                bot_id = str((info or {}).get("bot_id") or "").strip() or None
+                _bot_id_cache[platform] = (now, bot_id)
+            if bot_id:
+                bot_ids.add(bot_id)
+        return bot_ids
+
+    # ── 收尾：二次一致性检测 → 按需写回 ────────────────────────────
+
+    def _finalize(
+        self,
+        *,
+        params: dict[str, Any],
+        args: dict[str, Any],
+        spec: TargetSpec,
+        original: str,
+        final_content: str,
+        decided: list[CharacterEntry],
+        roster: list[CharacterEntry],
+        config: CharPromptGuardConfig,
+        basis: str,
+    ) -> tuple[EventDecision, dict[str, Any]]:
+        """统一的收尾：跑二次一致性检测，内容有变化才回写 args。"""
+        checked = self._apply_consistency_check(
+            content=final_content,
+            spec=spec,
+            args=args,
+            roster=roster,
+            decided=decided,
+            config=config,
+            basis=basis,
+        )
+        if checked != original:
+            args[spec.prompt_arg] = checked
+            params["args"] = args
+        return EventDecision.SUCCESS, params
+
+    def _apply_consistency_check(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        roster: list[CharacterEntry],
+        decided: list[CharacterEntry],
+        config: CharPromptGuardConfig,
+        basis: str,
+    ) -> str:
+        """二次一致性检测：对账「最终提示词里的角色表内角色」vs「判定集合」。
+
+        - ``off``：不检查；
+        - ``warn``（默认）：提示词里出现判定集合之外的**角色表内**角色时打一条
+          WARNING（含两个角色名与判定依据），内容不改；
+        - ``fix``：仅当冲突是「用户点名的角色 vs 画面里另一个角色」且双方都能
+          唯一定位（判定集合恰好 1 人、冲突角色恰好 1 个）时，把画面里那个错误
+          角色的名字/别名/标签替换成正确角色的（**替换范围仅限角色表里已知的
+          字符串**），替换后按需补正确角色的标准标签；出现歧义或多角色无法定位
+          → 自动退回 warn 行为并记 WARNING。
+
+        本次没有判定出任何角色（判定集合为空）时直接跳过：那种情况下提示词里的
+        角色是描述自己写的，没有依据可对账，也不该报警。
+        """
+        mode = str(config.general.consistency_check or "").strip().lower()
+        if mode == "off" or not roster:
+            return content
+        if mode not in {"warn", "fix"}:
+            logger.warning(
+                f"general.consistency_check={mode!r} 不是合法取值（off/warn/fix），按 warn 处理"
+            )
+            mode = "warn"
+        if not decided:
+            return content
+
+        texts = self._detection_texts(content, spec, args)
+        decided_keys = {entry_key(entry) for entry in decided}
+        extras = [
+            entry
+            for entry in roster
+            if entry_key(entry) not in decided_keys and character_in_texts(entry, texts)
+        ]
+        decided_names = "、".join(entry.name or entry.tag or "?" for entry in decided)
+        if not extras:
+            logger.debug(
+                f"一致性检查=正常（提示词里的角色表内角色都在判定集合内：{decided_names}）"
+            )
+            return content
+
+        extra_names = "、".join(entry.name or entry.tag or "?" for entry in extras)
+        if mode != "fix":
+            logger.warning(
+                "一致性检查=冲突（warn 不改内容）：提示词里出现了判定集合之外的角色表内角色"
+                f"「{extra_names}」，判定集合=「{decided_names}」，依据={basis}"
+            )
+            return content
+
+        if len(decided) != 1 or len(extras) != 1:
+            logger.warning(
+                "一致性检查=冲突但无法唯一定位"
+                f"（判定集合 {len(decided)} 个 / 冲突角色 {len(extras)} 个），"
+                f"退回 warn 行为、不改内容：冲突「{extra_names}」vs 判定「{decided_names}」，依据={basis}"
+            )
+            return content
+
+        wrong, right = extras[0], decided[0]
+        replaced, hits = replace_character_reference(content, wrong, right)
+        if hits <= 0:
+            logger.warning(
+                f"一致性检查=冲突但未能定位可替换文本（角色表里没有「{wrong.name}」的字面写法），"
+                f"退回 warn 行为、不改内容：判定「{right.name}」，依据={basis}"
+            )
+            return content
+
+        logger.warning(
+            "一致性检查=冲突已修正（fix）：把画面里的"
+            f"「{wrong.name or wrong.tag}」替换为「{right.name or right.tag}」"
+            f"（替换 {hits} 处），依据={basis}"
+        )
+        # 替换后按需补正确角色的标准标签（沿用 tag_completion 逻辑）
+        tags = self._completion_tags(replaced, [right], config)
+        if tags:
+            replaced = self._complete(spec, replaced, tags)
+        return replaced
 
     @staticmethod
     def _resolve_multi(
@@ -783,20 +1097,37 @@ class CharacterGuardHandler(BaseEventHandler):
         candidates: list[CharacterEntry],
         llm_multi: bool,
         mentioned: int = 0,
+        naming_multi: bool = False,
     ) -> bool:
-        """决定本次是否按"多人同框"处理。"""
+        """决定本次是否按"多人同框"处理。
+
+        优先级：主模型标记 > ``multi.decide``（bot/latest/always_multi） >
+        ``multi.decision``（旧字段 off/always/bot）> 用户点名的多人语义 /
+        LLM 判定 / 上文人数兜底。
+        """
         if not config.multi.enabled:
             return False
         if control.force_multi is not None:
             return control.force_multi
 
+        # 新字段 decide：latest=总是只补最近点名的那个；always_multi=总是多人
+        decide = str(getattr(config.multi, "decide", "") or "").lower()
+        if decide == "latest":
+            return False
+        if decide == "always_multi":
+            return True
+
+        # 旧字段 decision：保留兼容
         decision = str(config.multi.decision).lower()
         if decision == "off":
             return False
         if decision == "always":
             return True
 
-        # decision == "bot"：由 LLM 判定 + 候选数量兜底
+        # "bot"：用户点名的多人语义 / LLM 判定 / 候选数量兜底
+        if naming_multi:
+            # 用户在同一条消息里点了 ≥2 个角色，或用了「还有/一起」这类追加词
+            return True
         if llm_multi:
             return True
         if str(config.multi.scope).lower() == SCOPE_MULTI_ONLY:
@@ -882,6 +1213,10 @@ class CharacterGuardHandler(BaseEventHandler):
                 {
                     "time": time.time(),
                     "sender_name": "用户",
+                    # 触发消息一定是「进来的人话」，显式标成用户消息：判定依据才会
+                    # 记成「用户点名」而不是退一步的「最近提及」
+                    "is_bot": False,
+                    "role": "user",
                     "processed_plain_text": trigger_text,
                 }
             )
@@ -918,20 +1253,12 @@ class CharacterGuardHandler(BaseEventHandler):
         return tags
 
     @staticmethod
-    def _apply_completion(
-        params: dict[str, Any],
-        args: dict[str, Any],
-        spec: TargetSpec,
-        content: str,
-        tags: list[str],
-    ) -> tuple[EventDecision, dict[str, Any]]:
-        """把标准标签补到提示词末尾（保留原有描述）。"""
+    def _complete(spec: TargetSpec, content: str, tags: list[str]) -> str:
+        """把标准标签补到提示词末尾（保留原有描述），返回新内容。"""
         appended = ", ".join(tags)
         stripped = content.rstrip().rstrip(",").rstrip()
-        args[spec.prompt_arg] = f"{stripped}, {appended}" if stripped else appended
-        params["args"] = args
         logger.info(f"已补标准标签（{spec.action}）: {appended}")
-        return EventDecision.SUCCESS, params
+        return f"{stripped}, {appended}" if stripped else appended
 
     def _apply(
         self,
@@ -975,7 +1302,8 @@ class CharacterGuardHandler(BaseEventHandler):
             tags = [
                 entry.resolved_tag()
                 for entry in entries
-                if entry.resolved_tag() and not content_contains_tag(merged, entry.resolved_tag())
+                if entry.resolved_tag()
+                and not content_contains_tag(merged, entry.resolved_tag())
             ]
             if tags:
                 merged = f"{merged.rstrip().rstrip(',')}, {', '.join(tags)}"
