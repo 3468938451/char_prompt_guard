@@ -1,62 +1,112 @@
-# 框架补丁：让 agent 聊天器路径也发布执行前事件
+# 框架补丁：让 agent 聊天器路径也发布「执行前事件」
 
-## 为什么需要它
+> 本目录是 `char_prompt_guard` 的**框架侧依赖**。不打补丁，插件在 agent 聊天器
+> （`default_chatter` / `neo_default_chatter`）下收不到任何通知，表现是「装上毫无反应」。
 
-`char_prompt_guard` 靠订阅 `before_action_call` 事件，在生图 Action 执行前改写提示词。
-但上游框架在 **agent 聊天器路径**下不发布这个事件：
+## 为什么必须打（已在本地上游源码核实）
+
+`src/core/utils/llm_tool_call.py` 的 `create_llm_usable_execution()`，在
+`should_strip_auto_reason_argument` 之后**直接**执行组件，中间没有任何事件发布：
+
+```python
+# 上游原始代码（本机核对位置：src/core/utils/llm_tool_call.py:170）
+execution = instance._wrap_execute(**call_kwargs)
+```
+
+三条路径的对照：
+
+| 执行路径 | 发出的事件 |
+| --- | --- |
+| `ActionManager.execute_action` | ✅ `before_action_call` |
+| `ToolManager.execute_tool` | ✅ `before_tool_call` |
+| **agent 聊天器**：`run_tool_call` → `create_llm_usable_execution` → `_wrap_execute` | ❌ **什么都不发** |
+
+`plugins/default_chatter/plugin.py` 确实走 `run_tool_call`（本机核实在
+`plugins/default_chatter/plugin.py:218`），所以在最常见的用法下，靠「执行前改写参数」
+的插件永远不会被触发。
+
+## 文件说明
+
+| 文件 | 说明 |
+| --- | --- |
+| `llm_tool_call-pre-events.patch` | **推荐使用**：修正版，动作名以新版 `name` 解析（见下节） |
+| `llm_tool_call-pre-events.orig.patch` | 原交付补丁，保留用于对照；**对 image_generator_plugin-neo 无效** |
+
+两者都只改一个文件 `src/core/utils/llm_tool_call.py`：
+
+- `BaseAction` → 补发 `before_action_call`（字段：`signature` / `action_name` / `action_description` / `args` / `message`）
+- `BaseTool` → 补发 `before_tool_call`（字段：`signature` / `tool_name` / `tool_description` / `args` / `message`）
+
+设计上与既有发布点一致：先 `get_subscribers()` 判断（没订阅者直接跳过，零开销）、
+发布异常静默降级不阻断执行、插件对 `args` 的改写会回写到真实执行参数。
+
+## 修正版改了什么（原补丁的缺口）
+
+原补丁用 `getattr(instance, "action_name", "")` 取动作名。但 `action_name` 是**旧属性**：
+
+- nai_artist 的 `ShareVisualAction` 用旧属性声明（`action_name = "share_visual"`）→ 有值，原补丁可用；
+- **image_generator_plugin-neo 的 `DrawAction` 用新版 `name = "draw_image"` 声明** →
+  `action_name` 是空串 → 事件里签名退化成 `image_generator_plugin-neo:action:`、
+  `action_name` 也是空 → **插件认不出这个动作，neo 全程静默失效**。
+
+修正版改成以新版属性优先：
+
+```python
+_action_name = str(
+    getattr(instance, "name", "") or getattr(instance, "action_name", "")
+)
+"signature": f"{getattr(plugin, 'plugin_name', '')}:action:{_action_name}",
+"action_name": _action_name,
+```
+
+`BaseTool` 分支同样处理（`name` → `tool_name`），描述字段也做了
+`description` → 旧属性 的回退。
+
+### 实测对照（同一事件形态，只换插件版本）
 
 ```
-default_chatter / neo_default_chatter
-  → run_tool_call
-    → llm_tool_call.create_llm_usable_execution
-      → instance._wrap_execute(**kwargs)      ← 直接执行，不发任何事件
+场景：旧补丁形态（动作名为空）
+  修订版插件(D盘交付) : 未接管（静默失效）
+  本工作区插件(+兜底) : 补入成功
+场景：修正补丁形态（动作名写全）
+  两者均补入成功
 ```
 
-对照：`ActionManager.execute_action`（发 `before_action_call`）和
-`ToolManager.execute_tool`（发 `before_tool_call`）才是既有发布点，但 agent 聊天器
-不经过它们。结果就是插件装上后**毫无反应**，日志里连一条记录都没有。
-
-## 它做什么
-
-只改一个文件 `src/core/utils/llm_tool_call.py`（+51 行）：
-
-在 `create_llm_usable_execution` 调用 `_wrap_execute` 之前，按组件类型补发执行前事件：
-
-| 组件类型 | 事件 | 字段 |
-| --- | --- | --- |
-| `BaseAction` | `before_action_call` | `signature` / `action_name` / `action_description` / `args` / `message` |
-| `BaseTool` | `before_tool_call` | `signature` / `tool_name` / `tool_description` / `args` / `message` |
-
-设计上与既有发布点保持一致：
-
-- 先 `get_subscribers()` 判断，没有订阅者直接跳过（对没装相关插件的部署零开销）；
-- 事件发布异常静默降级，不阻断组件执行；
-- 插件对 `args` 的改写回写到实际执行参数。
+> 插件侧另外做了「动作名为空时按提示词参数名兜底匹配」的自保逻辑
+> （有歧义时不处理），所以**即使你只打了原补丁**，neo 也不会静默失效了；
+> 但修正补丁才是根因修复，两个一起用最稳。
 
 ## 怎么打
 
 ```bash
 cd <你的 Neo-MoFox 框架根>
+
+# 推荐：修正版
 git apply framework-patch/llm_tool_call-pre-events.patch
-```
 
-失败时可以：
-
-```bash
+# 若 git apply 失败，可加 --3way；仍失败就照 patch 内容手工改同名文件的同名位置
 git apply --3way framework-patch/llm_tool_call-pre-events.patch
-# 或者直接看 patch 内容，手工改 src/core/utils/llm_tool_call.py 同名位置
 ```
 
 打完重启 bot，日志里应能看到：
 
 ```
 正在按顺序向 N 个处理器发布事件 'EventType.BEFORE_ACTION_CALL'
+char_prompt_guard | INFO | 已补入角色（share_visual / natural）: ...
 ```
 
 ## 上游状态
 
-已提 PR：MoFox-Studio/Neo-MoFox **#171**
-https://github.com/MoFox-Studio/Neo-MoFox/pull/171
+原交付方已提 PR：MoFox-Studio/Neo-MoFox **#171**
+（https://github.com/MoFox-Studio/Neo-MoFox/pull/171）
 
-> 截至交付时上游对外部 PR 响应很慢（同期外部 PR 已挂数周至两个多月，只有 AI 机器人
-> 自动评论）。建议自己留着这份 patch，别等。
+> 上游对外部 PR 响应较慢，别把它当可依赖的时间表；先自己留一份补丁。
+
+## 本机验证记录
+
+| 项 | 结果 |
+| --- | --- |
+| 原补丁 `git apply --check`（上游 master 副本） | ✅ 可应用 |
+| 修正版 `git apply --check` | ✅ 可应用 |
+| 修正版补丁应用后 `py_compile` | ✅ 通过 |
+| 补丁文件编码 | 无 BOM，UTF-8 |
