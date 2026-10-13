@@ -320,9 +320,9 @@ def _enrich_from_roster(
             continue
         return CharacterEntry(
             name=entry.name or known.name,
-            game=entry.game or known.game,
+            game=known.game or entry.game,
             aliases=entry.aliases or known.aliases,
-            tag=entry.tag or known.tag,
+            tag=known.tag or entry.tag,
         )
     return entry
 
@@ -855,10 +855,20 @@ class CharacterGuardHandler(BaseEventHandler):
                 messages = list(cached[1])
             else:
                 try:
+                    # 取回窗口放宽到至少 24h / 200 条：history_limit 配得过小时，
+                    # "几小时前明确点名的角色"会被整段截掉，导致判定只能靠猜
+                    # （实测：history_limit=10 时把 3 小时前的"流萤"截没了）。
+                    # 真正参与判定的条数仍由 multi.recent_messages 控制。
+                    _wide_hours = max(float(config.general.history_hours), 24.0)
+                    _wide_limit = max(int(config.general.history_limit), 200)
                     messages = await get_recent_messages(
                         stream_id,
-                        hours=float(config.general.history_hours),
-                        limit=int(config.general.history_limit),
+                        hours=_wide_hours,
+                        limit=_wide_limit,
+                    )
+                    logger.debug(
+                        f"上文取回 {len(messages)} 条"
+                        f"（窗口 {_wide_hours:g}h / 上限 {_wide_limit} 条）"
                     )
                 except Exception as e:  # noqa: BLE001 —— 读不到历史就当没有上文，不影响生图
                     logger.debug(f"读取上文消息失败: {e}")
