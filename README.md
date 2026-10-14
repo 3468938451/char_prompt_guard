@@ -24,7 +24,7 @@
 
 > 补丁做两件事：① 在 agent 聊天器的工具调用路径上**补发执行前事件**；② 事件里带上 `stream_id`、并按新版 `name` 解析动作名。框架升级（`git pull`）会覆盖它，需要**重新打一次**。
 
-> 文档版本：1.0.14 · 作者：思源（siyuan）· 许可：MIT
+> 文档版本：1.0.15 · 作者：思源（siyuan）· 许可：MIT
 > 同时适配 **nai_artist** 与 **image_generator_plugin-neo** 两个生图插件。
 > 本插件由 **AI 辅助编写**（作者审阅与整合）：缺陷、遗漏或无意残留的第三方内容请见
 > [AI_USAGE.md](./AI_USAGE.md)（无担保 / 责任限制 / 第三方内容通知即处理 / 反馈渠道）。
@@ -299,7 +299,7 @@ true_self = "花火"   # 留空则自动读框架人格配置的 personality.nic
 ## 安装
 
 1. 安装至少一个受支持的生图插件（nai_artist 或 image_generator_plugin-neo）；
-2. 将本插件目录（或 `char_prompt_guard-1.0.14.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
+2. 将本插件目录（或 `char_prompt_guard-1.0.15.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
 3. 重启 bot，插件会自动生成默认配置：`config/plugins/char_prompt_guard/config.toml`。
 
 ## 配置说明
@@ -568,7 +568,7 @@ python tests\check_privacy.py
 也就是说：在 agent 聊天器下插件收不到任何通知，表现是「装上去毫无反应、日志里连一条记录都没有」。
 **这不是插件坏了，是钩子没来。** 解决办法是打框架补丁：
 
-> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.14.mfp` / 插件目录只含插件自身；
+> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.15.mfp` / 插件目录只含插件自身；
 > 补丁属于框架侧改动，随**交付包**的 `framework-patch/` 目录单独提供，请先把它拷到本机（例如
 > 放到框架根旁边的任意位置），再执行下面命令；路径按你实际存放位置替换。
 
