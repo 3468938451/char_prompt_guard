@@ -11,6 +11,21 @@ C28/C29/C32 这三条守住的是"上文里**非用户点名**的旧角色不得
 因此它们的旧角色提及由 **bot 复述** 提供（``is_bot=True``）—— 真实环境里这个
 身份来自 ``adapter_api.get_bot_info_by_platform`` 的 bot_id 比对。
 
+1.0.12 起另有三条收紧，对应 C42~C45：
+
+1. system reminder 增加「生图参数最前面先写角色标准标签」的硬规则
+   （``general.notify_tag_rule``，默认开）；
+2. 改口词「还是」改为**判语境**（选择疑问句「是 A 还是你？」不算改口），
+   并在点名识别前剥掉 ``[回复…]`` / ``[图片(…)]`` 这类中括号块（C42/C43）；
+3. 自我指代（``本尊`` / ``你本人`` / ``你自己`` …）判定为**不补**，检查范围是
+   「画面描述 + 触发消息 + 触发之前最近 N 条用户消息」（C44/C45）。
+
+1.0.13 起自我指代不再一律不补（C46~C48）：先按 ``general.true_self`` →
+框架人格配置 ``personality.nickname`` → ``alias_names`` 取「本尊身份」，
+再在角色表里按「名字 → 别名 → 标签」定位 —— **命中就正常注入该角色**，
+没命中或完全取不到身份名才不补（日志会写明原因）。C47/C48 通过 monkeypatch
+替换 ``handler._read_personality_identity`` 来模拟人格配置（不必真的起框架运行时）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -840,7 +855,11 @@ async def run_cases() -> int:
         original = handler_module.extract_characters_via_llm
         handler_module.extract_characters_via_llm = fake_extract
         try:
-            raw = "Hanabi (Honkai: Star Rail). 只拍花火本尊一人"
+            # 描述里用英文 Hanabi 指代花火。原文是「只拍花火本尊一人」，但
+            # 1.0.12 起描述里出现「本尊」会直接走「自我指代 → 不补」分支，
+            # 那样本用例就不再检验它要守的「LLM 答了就不回退上文旧角色」，
+            # 所以这里去掉「本尊」二字（自我指代路径由 C44/C45 专门覆盖）。
+            raw = "Hanabi (Honkai: Star Rail). 只拍花火一人"
             history = [history_message("我们来聊爱莉希雅吧", 2.0, is_bot=True)]
             with FakeHistory(history):
                 params = {
@@ -1274,6 +1293,316 @@ async def run_cases() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("C41 框架 bot 标记的复述不算用户点名", False, f"{type(e).__name__}: {e}")
+
+    # ── C42 选择疑问句里的「还是」不算改口（1.0.12 修的事故核心）──────
+    # 实测事故：用户消息「是爱莉还是你？」里的「还是」被当成改口词，于是「用户点名
+    # 爱莉希雅」压过了 LLM 的结论，把 LLM 正确认出的「花火」顶掉。
+    # 1.0.12 起「还是」必须处于改口语境才算改口；选择疑问句不算，判定退回
+    # 「换人还是追加不确定 → 交 LLM 仲裁」，LLM 说花火就是花火。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+
+        async def fake_extract(**kwargs):
+            # 模拟"LLM 读了画面描述与上文后给出的结论"：这次要画的是花火
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)")
+                ],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            # 1 分钟前点过「爱莉希雅」：与触发消息间隔 < multi_window_minutes，
+            # 所以判定是 uncertain，而不是"用户点名"直接拍板
+            history = [history_message("画爱莉希雅", 1.0)]
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_drawing",
+                        "action_name": "share_drawing",
+                        "args": {"content": "画一张战斗场景"},
+                        "message": FakeMessage("是爱莉还是你？"),
+                        "stream_id": "s-c42",
+                    },
+                )
+            c = out["args"]["content"]
+            debugs = logs.debugs()
+            ok = "花火" in c and "爱莉希雅" not in c and "LLM 仲裁" in debugs
+            check(
+                "C42 疑问句「是 A 还是你？」不算改口（LLM 结论生效）",
+                ok,
+                f"content = {c!r}\n        日志 = {debugs!r}",
+            )
+        finally:
+            handler_module.extract_characters_via_llm = original
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C42 疑问句「是 A 还是你？」不算改口（LLM 结论生效）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C43 引用块/媒体块里的文字不参与点名（1.0.12 修的事故原文）────
+    # 事故原文（用户消息）：
+    #   [回复<的饮水思源(2224586893)>：那你告诉我，是爱莉还是你？][图片(xxx)]
+    # 引用块里既有「爱莉」又有「还是」，于是被判成"用户改口点名爱莉希雅"。
+    # 1.0.12 起先剥掉 [回复…] / [图片(…)] 这类中括号块（嵌套按最外层整块剥），
+    # 剥完没有任何点名信号 → 不补任何角色、内容不变。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "白发少女站在镜头前"
+        trigger = (
+            "[回复<的饮水思源(2224586893)>：那你告诉我，是爱莉还是你？][图片(xxx)]"
+        )
+        with FakeHistory([]), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage(trigger),
+                    "stream_id": "s-c43",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = c == raw and "爱莉希雅" not in c and "判定依据=无(不补)" in debugs
+        check(
+            "C43 引用/图片块里的文字不参与点名",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C43 引用/图片块里的文字不参与点名", False, f"{type(e).__name__}: {e}")
+
+    # ── C44 自我指代在上一条用户消息里 → 不补（1.0.12 修的事故主因）──
+    # 事故真实时序（12:14~12:15 同一会话）：
+    #   12:14:39 用户「那你再来图，要你自己～你出图了我就道歉～」 ← 真正的意图：要本尊
+    #   12:14:59 用户「嗯哼？」                                    ← 触发这次生图
+    #   画面描述「室内明亮光线下的半身照。白发少女站在镜头前，粉色眼睛…」（无角色名）
+    #   12:15:06 结果：补了爱莉希雅（更早用户点名过「爱莉」→ 粘性命中）
+    # 只看触发消息（「嗯哼？」）与描述都看不到自我指代，所以 1.0.12 把检查范围
+    # 扩大到「画面描述 + 触发消息 + 触发之前最近 N 条用户消息」
+    # （N = min(multi.recent_messages, 4)）。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "室内明亮光线下的半身照。白发少女站在镜头前，粉色眼睛"
+        history = [
+            history_message("画爱莉希雅", 60.0),  # 1 小时前：更早的角色点名（粘性来源）
+            history_message("那你再来图，要你自己～你出图了我就道歉～", 0.3),
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯哼？"),
+                    "stream_id": "s-c44",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == raw
+            and "爱莉希雅" not in c
+            and "自我指代" in debugs
+            and "判定依据=无(不补)" in debugs
+        )
+        check(
+            "C44 自我指代在上一条用户消息里 → 不补（不沿用旧点名）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C44 自我指代在上一条用户消息里 → 不补（不沿用旧点名）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C45 自我指代写在触发消息里 → 同样不补 ──────────────────────
+    # 与 C44 同一策略的另一条入口：自我指代就在触发消息本身（描述里无角色名，
+    # 上文一小时前点名过爱莉希雅）。断言内容不变，且日志里有自我指代诊断。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "白发少女站在镜头前"
+        history = [history_message("画爱莉希雅", 60.0)]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("那你再来图，要你自己～"),
+                    "stream_id": "s-c45",
+                },
+            )
+        c = out["args"]["content"]
+        ok = c == raw and "爱莉希雅" not in c and "自我指代" in logs.debugs()
+        check(
+            "C45 自我指代在触发消息里 → 不补",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C45 自我指代在触发消息里 → 不补", False, f"{type(e).__name__}: {e}")
+
+    # ── C46 自我指代 + general.true_self 指向角色表内角色 → 正常注入（1.0.13）──
+    # 1.0.12 里自我指代一律不补；1.0.13 起先把「本尊」定位到角色表里的角色：
+    #   general.true_self = "花火"（在 RS3 里）→ 必须补花火，而不是按粘性补更早
+    #   点名过的爱莉希雅。日志要能一眼看出「本尊身份」与「角色表命中」。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.true_self = "花火"
+        raw = "白发少女站在镜头前，粉色眼睛"
+        history = [history_message("画爱莉希雅", 60.0)]  # 更早的角色点名（粘性来源）
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("那你再来图，要你自己～"),
+                    "stream_id": "s-c46",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and c.startswith(raw)
+            and "本尊身份" in debugs
+            and "角色表命中" in debugs
+            and "(来源=配置)" in debugs
+        )
+        check(
+            "C46 自我指代 + true_self=花火 → 补花火（本尊身份）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C46 自我指代 + true_self=花火 → 补花火（本尊身份）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C47 true_self 留空 → 回落框架人格配置的 nickname（1.0.13）────────
+    # stub 方式：把 handler 模块里读人格配置的函数 ``_read_personality_identity``
+    # 换成返回 "伊甸"（伊甸在 RS 里），等价于框架人格配置里
+    # core.toml [personality] nickname = "伊甸"。
+    # 注意这里刻意返回**裸字符串**：真实实现返回 list[str]，插件对两种形状都做了
+    # 归一化（handler._normalize_identity_names），stub 成字符串也必须能用。
+    try:
+        from .. import handler as handler_module
+
+        cfg = make_config(roster=RS, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.true_self = ""  # 留空 → 读人格配置
+        raw = "白发少女站在镜头前，粉色眼睛"
+        history = [history_message("画爱莉希雅", 60.0)]
+        original = handler_module._read_personality_identity
+        handler_module._read_personality_identity = lambda: "伊甸"
+        try:
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("那你再来图，要你自己～"),
+                        "stream_id": "s-c47",
+                    },
+                )
+        finally:
+            handler_module._read_personality_identity = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "伊甸" in c
+            and "爱莉希雅" not in c
+            and "本尊身份" in debugs
+            and "(来源=人格配置)" in debugs
+            and "角色表命中" in debugs
+        )
+        check(
+            "C47 true_self 留空 → 回落人格配置 nickname",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C47 true_self 留空 → 回落人格配置 nickname",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C48 人格 nickname 不在角色表里 → 不补（1.0.13）──────────────────
+    # 同一个 stub 位置，这次让身份名指向角色表里没有的名字（真实实现返回
+    # list[str]，故这里用列表形状）：必须**不补**（不得退化成"按粘性补爱莉希雅"），
+    # 且日志写明不在角色表中、提示把该角色加入角色表。
+    try:
+        from .. import handler as handler_module
+
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.true_self = ""
+        raw = "白发少女站在镜头前，粉色眼睛"
+        history = [history_message("画爱莉希雅", 60.0)]
+        original = handler_module._read_personality_identity
+        handler_module._read_personality_identity = lambda: ["不存在的人"]
+        try:
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("那你再来图，要你自己～"),
+                        "stream_id": "s-c48",
+                    },
+                )
+        finally:
+            handler_module._read_personality_identity = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == raw
+            and "爱莉希雅" not in c
+            and "本尊身份" in debugs
+            and "不在角色表中" in debugs
+            and "判定依据=无(不补)" in debugs
+        )
+        check(
+            "C48 人格 nickname 不在角色表 → 不补（提示加入角色表）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C48 人格 nickname 不在角色表 → 不补（提示加入角色表）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
 
     # ── C14/C15 需要真调小模型 ─────────────────────────────────────
     if RUN_LLM:

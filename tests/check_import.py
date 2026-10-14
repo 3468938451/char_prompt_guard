@@ -181,8 +181,86 @@ def main() -> int:
         check("坐标默认分散", cfg.multi.coord_plan == "spread")
         check("natural 人数上限默认 2", cfg.multi.natural_max == 2)
         check("LLM 提取有超时兜底", cfg.general.llm_timeout > 0)
+        # 1.0.12 新增的两个开关
+        check(
+            "1.0.12 默认提醒主模型写标准标签",
+            cfg.general.notify_tag_rule is True,
+            f"notify_tag_rule={cfg.general.notify_tag_rule!r}",
+        )
+        check(
+            "1.0.12 默认自我指代不补",
+            cfg.general.skip_on_self_reference is True,
+            f"skip_on_self_reference={cfg.general.skip_on_self_reference!r}",
+        )
+        # 1.0.13 新增：本尊身份（留空时回落到框架人格配置的 personality.nickname）
+        check(
+            "1.0.13 本尊身份默认留空（留空读人格配置 nickname）",
+            cfg.general.true_self == "",
+            f"true_self={cfg.general.true_self!r}",
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.1 reminder 正文：标记说明必须保留，标签硬规则随开关增减 ────
+    try:
+        from ..plugin import _REMINDER_CONTENT, build_reminder_content
+
+        cfg = CharPromptGuardConfig()
+        with_rule = build_reminder_content(cfg)
+        cfg.general.notify_tag_rule = False
+        without_rule = build_reminder_content(cfg)
+        check(
+            "reminder 保留原有标记说明",
+            "#multi#" in with_rule and "#nochar#" in with_rule,
+        )
+        check(
+            "reminder 默认含「标签写在最前面」硬规则",
+            with_rule != without_rule
+            and "最前面" in with_rule
+            and "content_description" in with_rule,
+        )
+        check(
+            "notify_tag_rule=false 时 reminder 只保留标记说明",
+            without_rule == _REMINDER_CONTENT and "硬规则" not in without_rule,
+        )
+        check(
+            "配置读不到时 reminder 仍含标签规则（按默认）",
+            "最前面" in build_reminder_content(object()),
+        )
+    except Exception as e:  # noqa: BLE001
+        check("reminder 正文可拼装", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.2 人格配置读取：取不到本尊身份时返回空列表，任何失败都不抛异常 ──
+    try:
+        from ..config import CharPromptGuardConfig as GuardConfig
+        from ..handler import _read_personality_identity, resolve_true_self_identity
+
+        names = _read_personality_identity()
+        check(
+            "人格配置读取失败时返回空列表（不抛异常）",
+            isinstance(names, list) and all(isinstance(name, str) for name in names),
+            f"names={names!r}",
+        )
+
+        cfg = GuardConfig()
+        cfg.general.true_self = "爱莉希雅"
+        identity = resolve_true_self_identity(cfg)
+        check(
+            "true_self 非空时优先于人格配置（来源=配置）",
+            identity.candidates == ["爱莉希雅"] and identity.source == "配置",
+            f"candidates={identity.candidates!r} source={identity.source!r}",
+        )
+
+        cfg.general.true_self = ""
+        fallback = resolve_true_self_identity(cfg)
+        check(
+            "true_self 留空时候选名来自人格配置（取不到则为空）",
+            isinstance(fallback.candidates, list)
+            and fallback.source in {"", "人格配置"},
+            f"candidates={fallback.candidates!r} source={fallback.source!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("人格配置读取函数可调用", False, f"{type(e).__name__}: {e}")
 
     print("-" * 72)
     if _failures:

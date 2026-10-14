@@ -41,6 +41,7 @@ from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
 from .character import (
+    BASIS_USER_NAMED,
     CharacterEntry,
     NamingDecision,
     character_in_texts,
@@ -48,12 +49,18 @@ from .character import (
     entry_key,
     extract_characters_via_llm,
     find_characters_in_history,
+    find_roster_identity,
+    find_self_reference_word,
+    is_known_bot_message,
     iter_config_entries,
     merge_entries,
+    message_text,
     normalize_prompt_text,
+    order_messages_newest_first,
     parse_roster,
     replace_character_reference,
     resolve_naming_decision,
+    strip_quoted_blocks,
 )
 from .config import CharPromptGuardConfig
 
@@ -107,6 +114,16 @@ if _TOOL_CALL_EVENT is not None:
 _TOOL_NAME_PREFIX = "action-"
 #: 工具组件自己的前缀（``tool-xxx`` → ``xxx``）
 _COMPONENT_NAME_PREFIX = "tool-"
+
+#: 自我指代最多回看「触发之前最近几条**用户**消息」（1.0.12）。
+#:
+#: 实际上限取 ``min(multi.recent_messages, 这个值)``。为什么不能只看触发消息：
+#: 实测线上事故（12:14~12:15 同一会话）里，用户 12:14:39 说「那你再来图，要你自己～」，
+#: 20 秒后（12:14:59）用一句「嗯哼？」触发了生图 —— 触发消息本身不含自我指代词，
+#: 只看它就会按「主角粘性」沿用更早（12:12 引用块里）提到的「爱莉希雅」，把画面补错。
+#: 上限取 4 而不是无限往回翻：再往前容易把别的话题里的「本尊」翻出来，
+#: 反而压制掉正常的角色点名（``multi.recent_messages`` 默认 6，故默认回看 4 条）。
+_SELF_REFERENCE_SCAN_LIMIT = 4
 
 
 @dataclass(frozen=True)
@@ -488,6 +505,193 @@ def _cached_parse(key_text: str, cache: dict[str, Any], factory: Any) -> Any:
     return result
 
 
+# ── 「本尊身份」解析（1.0.13）─────────────────────────────────────
+#
+# 自我指代（本尊 / 你本人 / 你自己 …）要的是「bot 本尊」，而插件看不到聊天器的
+# 人设。1.0.12 的做法是一律不补；1.0.13 起给出两个**显式**来源：
+#
+#   ① ``general.true_self``（填角色表里的名字或别名）—— 填了就以它为准；
+#   ② 框架人格配置的 ``personality.nickname``，其后 ``alias_names`` 逐个尝试。
+#
+# 命中角色表（名字 → 别名 → 标签）→ 正常注入该角色；没命中、或两个来源都取不到
+# → 仍然**不补**（宁少勿多，绝不猜别的角色）。
+#
+# 明确不做的事：**不做外观识别**。不从「白发 / 粉眼 / 和服」这类画面关键词反推
+# 角色 —— 误差不可控，角色表也保持现有的 4 列（名字 | 游戏名 | 别名 | 标签）。
+
+#: 本尊身份来源：插件配置 ``general.true_self``
+_TRUE_SELF_SOURCE_CONFIG = "配置"
+#: 本尊身份来源：框架人格配置 ``personality.nickname`` / ``personality.alias_names``
+_TRUE_SELF_SOURCE_PERSONALITY = "人格配置"
+
+#: 读取 core 配置的模块路径（按顺序尝试）。
+#:
+#: ``src.core.config`` 是框架文档里的公开路径（``from src.core.config import
+#: get_core_config``）；后者是它背后的实现模块，包 ``__init__`` 因为环境问题
+#: 导入失败时仍有机会读到配置。
+_CORE_CONFIG_MODULES: tuple[str, ...] = (
+    "src.core.config",
+    "src.core.config.core_config",
+)
+
+
+@dataclass(frozen=True)
+class TrueSelfIdentity:
+    """「本尊身份」解析结果（1.0.13）。
+
+    Attributes:
+        candidates: 候选名，按优先级排列（``general.true_self`` 只有 1 个；
+            来自人格配置时是 ``nickname`` + 逐个 ``alias_names``），已去空白、去重
+        source: 来源说明（:data:`_TRUE_SELF_SOURCE_CONFIG` /
+            :data:`_TRUE_SELF_SOURCE_PERSONALITY`）；空串表示没取到任何身份名
+    """
+
+    candidates: list[str] = field(default_factory=list)
+    source: str = ""
+
+
+def _personality_section_from_plugin_api() -> Any | None:
+    """尝试用框架的插件 API（``config_api``）读 core 的 ``personality`` 节。
+
+    实测 ``src/app/plugin_system/api/config_api.py``（API_VERSION 1.0.0）**只提供
+    插件配置**的加载与查询 —— ``load_config`` / ``reload_config`` / ``get_config`` /
+    ``remove_config`` / ``get_loaded_plugins`` / ``initialize_all_configs``，
+    **没有**读 core 配置（``config/core.toml``）的入口。所以这里只能试一下
+    ``get_config("core")``：core 配置不经过 ConfigManager（它按插件名缓存），
+    正常会返回 ``None``，此时由调用方退回 :func:`_personality_section_from_core_config`。
+
+    整个函数用 ``importlib`` 动态导入 + try/except 包住：**任何失败都返回 None**，
+    不抛异常，也不把 config_api 变成插件的硬依赖。
+    """
+    try:
+        module = importlib.import_module("src.app.plugin_system.api.config_api")
+    except Exception as e:  # noqa: BLE001 —— 拿不到就换下一条路径
+        logger.debug(f"config_api 不可用，改读 core 配置对象: {e}")
+        return None
+    get_config = getattr(module, "get_config", None)
+    if get_config is None:
+        return None
+    try:
+        config = get_config("core")
+    except Exception as e:  # noqa: BLE001 —— 同上，失败即换路径
+        logger.debug(f"config_api.get_config('core') 调用失败: {e}")
+        return None
+    return getattr(config, "personality", None)
+
+
+def _personality_section_from_core_config() -> Any | None:
+    """直接读框架的 core 配置对象，取出 ``personality`` 节。
+
+    走 ``src.core.config.get_core_config()``（core 配置未初始化时它抛
+    ``RuntimeError``，被测/未启动运行时的环境就是这样）。同样用动态导入 +
+    try/except 包住：**任何失败都返回 None**，只留一条 DEBUG 说明原因。
+    """
+    for module_name in _CORE_CONFIG_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:  # noqa: BLE001 —— 该路径不可用就试下一个
+            logger.debug(f"core 配置模块 {module_name} 不可用: {e}")
+            continue
+        get_core_config = getattr(module, "get_core_config", None)
+        if get_core_config is None:
+            continue
+        try:
+            config = get_core_config()
+        except Exception as e:  # noqa: BLE001 —— 未初始化等情况：本次没有本尊身份
+            logger.debug(f"读取 core 配置失败，本次按「未取到本尊身份」处理: {e}")
+            return None
+        section = getattr(config, "personality", None)
+        if section is not None:
+            return section
+    return None
+
+
+def _normalize_identity_names(raw: Any) -> list[str]:
+    """把「本尊身份」候选名归一化成「去空白、去重、保序」的字符串列表。
+
+    约定 :func:`_read_personality_identity` 返回 ``list[str]``；这里额外兼容裸字符串
+    （以及元组/集合/None）：人格配置里 ``nickname`` 是字符串、``alias_names`` 是列表，
+    不同核心版本或人工改写的配置文件都可能给成别的形状，**任何形状都不能让判定崩掉**。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        return []
+    names: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in names:
+            continue
+        names.append(text)
+    return names
+
+
+def _read_personality_identity() -> list[str]:
+    """读取框架人格配置里的「本尊身份」候选名（nickname → alias_names）。
+
+    优先级与来源：
+
+    1. 插件 API ``config_api``（见 :func:`_personality_section_from_plugin_api`，
+       实测它没有 core 配置入口，正常取不到）；
+    2. core 配置对象 ``personality.nickname``（框架默认值是 ``小狐狸``）；
+    3. 同一个 ``personality`` 节的 ``alias_names``（逐个尝试）。
+
+    ``nickname`` 为空、或只有 ``alias_names`` 时，仍然返回其中非空的那部分。
+
+    **任何失败（模块不存在、配置未初始化、字段缺失、类型不对）都返回空列表**，
+    绝不抛异常 —— 它只是「有没有本尊身份」的一个来源，失败时判定退回
+    「不补 + 日志提示」，不影响生图。
+    """
+    for get_section in (
+        _personality_section_from_plugin_api,
+        _personality_section_from_core_config,
+    ):
+        try:
+            section = get_section()
+        except Exception as e:  # noqa: BLE001 —— 双保险：读取函数本身也不许抛
+            logger.debug(f"读取人格配置失败: {e}")
+            continue
+        if section is None:
+            continue
+        names = _normalize_identity_names(getattr(section, "nickname", ""))
+        for alias in _normalize_identity_names(getattr(section, "alias_names", None)):
+            if alias not in names:
+                names.append(alias)
+        if names:
+            logger.debug(f"人格配置提供本尊身份候选：{names}")
+            return names
+    return []
+
+
+def resolve_true_self_identity(config: CharPromptGuardConfig) -> TrueSelfIdentity:
+    """按优先级解析「本尊身份」候选名。
+
+    优先级：``general.true_self``（非空）→ 框架人格配置 ``personality.nickname``
+    → ``personality.alias_names``（逐个尝试）。
+
+    本函数只负责「取名字」，**不判断名字在不在角色表里** —— 命中与否由
+    :func:`character.find_roster_identity` 在调用处判断，日志里要能区分
+    「命中并补入」与「不在角色表中，不补」两种情况。
+    """
+    configured = str(
+        getattr(getattr(config, "general", None), "true_self", "") or ""
+    ).strip()
+    if configured:
+        return TrueSelfIdentity(
+            candidates=[configured], source=_TRUE_SELF_SOURCE_CONFIG
+        )
+    candidates = _normalize_identity_names(_read_personality_identity())
+    if candidates:
+        return TrueSelfIdentity(
+            candidates=candidates, source=_TRUE_SELF_SOURCE_PERSONALITY
+        )
+    return TrueSelfIdentity()
+
+
 class CharacterGuardHandler(BaseEventHandler):
     """生图前角色提示词检测与补全处理器。"""
 
@@ -729,6 +933,22 @@ class CharacterGuardHandler(BaseEventHandler):
                 texts.append(extra)
         return texts
 
+    @staticmethod
+    def _trigger_text(params: dict[str, Any]) -> str:
+        """取出触发本次生图的那条消息正文（没有 message 时为空串）。
+
+        ``_collect_context`` 与「自我指代」扫描都要用同一份文本，故抽成一处：
+        两处若各取一次，很容易出现「收集上文时用了 A、判定时看了 B」的偏差。
+        """
+        message = params.get("message")
+        if message is None:
+            return ""
+        return str(
+            getattr(message, "processed_plain_text", "")
+            or getattr(message, "content", "")
+            or ""
+        ).strip()
+
     async def _collect_candidates(
         self,
         params: dict[str, Any],
@@ -743,6 +963,10 @@ class CharacterGuardHandler(BaseEventHandler):
 
         - 描述点名：画面描述里已经写了角色表内角色 —— 由调用方直接放行/补标签，
           本函数只负责算出「判定集合」，供二次一致性检测对账；
+        - 自我指代（1.0.12 起；1.0.13 起能定位到角色）：用户要的是「bot 本尊」时，
+          先按「``general.true_self`` → 人格配置 ``nickname`` → ``alias_names``」取
+          本尊身份并在角色表里定位；**命中就补那个角色**，没命中或完全取不到身份名
+          才**直接不补**（见 ②.5），不走下面的粘性判定 —— 本尊是谁只有调用方知道；
         - 用户点名(粘性)：``character.resolve_naming_decision`` 的确定性结论
           （带 ``multi.stickiness_hours`` 时效、换人/追加规则）。**它压过 LLM 的
           猜测** —— 「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
@@ -774,11 +998,49 @@ class CharacterGuardHandler(BaseEventHandler):
         present_keys = {
             entry_key(entry) for entry in roster if character_in_texts(entry, texts)
         }
+        # ②.5 要用：描述里到底有没有角色表内角色（判定自我指代的前提之一）
+        description_has_character = any(
+            character_in_texts(entry, [content]) for entry in roster
+        )
+
+        # bot 自己的复述既不算点名、也不算「用户说过本尊」，所以先尽力解析本机 bot 的
+        # sender_id（解析不到就退化成「最近提及优先」，见 character.is_known_bot_message）。
+        # ②.5 与 ③ 共用这一份结果，只解析一次。
+        bot_ids = await self._resolve_bot_sender_ids(window)
+
+        # ②.5 自我指代（1.0.12 起；1.0.13 起能定位到具体角色）：用户要的是
+        # 「bot 本尊」，而「本尊是谁」只存在于调用方（聊天器）的内部设定里，
+        # 插件看不到。此时按粘性沿用旧点名会补错人（实测：更早用户点名过
+        # 「爱莉希雅」，插件就把它补进了「要你自己」的画面）。
+        # 1.0.13 起先按「general.true_self → 人格配置 nickname → alias_names」
+        # 取本尊身份：命中角色表就**正常注入那个角色**（走既有注入路径），
+        # 没命中或完全取不到身份名才不补（也不问 LLM —— 问它同样只能从上文里
+        # 猜出那个旧角色）。前提是**描述里没有角色表内角色**：描述里写明了角色
+        # 就是另一回事。
+        if (
+            config.general.skip_on_self_reference
+            and roster
+            and not description_has_character
+        ):
+            source, hit, scanned = self._detect_self_reference(
+                window=window,
+                trigger_text=self._trigger_text(params),
+                content=content,
+                bot_ids=bot_ids,
+                config=config,
+            )
+            if hit:
+                logger.debug(
+                    f"自我指代命中：来源={source} 词={hit!r}"
+                    f"（焦点范围=画面描述+触发消息+触发前最近 {scanned} 条用户消息）"
+                )
+                return self._resolve_self_reference(
+                    config=config,
+                    roster=roster,
+                    mentioned=mentioned,
+                )
 
         # ③ 用户点名 / 主角粘性（确定性、零成本）：本次判定的主依据。
-        # bot 自己的复述不算点名，所以先尽力解析本机 bot 的 sender_id（解析不到
-        # 就退化成「最近提及优先」，见 character.is_known_bot_message）。
-        bot_ids = await self._resolve_bot_sender_ids(window)
         naming = resolve_naming_decision(
             window,
             roster,
@@ -926,6 +1188,168 @@ class CharacterGuardHandler(BaseEventHandler):
             candidates=candidates[:max_candidates],
             decided=decided,
             llm_multi=llm_multi,
+            mentioned=mentioned,
+            naming=naming,
+            basis=basis,
+        )
+
+    @staticmethod
+    def _detect_self_reference(
+        *,
+        window: list[dict[str, Any]],
+        trigger_text: str,
+        content: str,
+        bot_ids: set[str],
+        config: CharPromptGuardConfig,
+    ) -> tuple[str, str, int]:
+        """在「焦点范围」里查找自我指代词（``本尊`` / ``你本人`` / ``你自己`` …）。
+
+        焦点范围（1.0.12）按顺序是：
+
+        1. **画面描述**（``content``）；
+        2. **触发本次生图的那条消息**；
+        3. **触发之前最近 N 条用户消息**，N =
+           ``min(multi.recent_messages, _SELF_REFERENCE_SCAN_LIMIT)``（默认 6 与 4
+           取小 → 4 条），从新到旧数，bot 自己的消息跳过、不占名额。
+
+        为什么要这么宽：实测事故（12:14~12:15 同一会话）里用户真正表达意图的是
+        12:14:39 的「那你再来图，要你自己～」，而触发消息是 20 秒后的「嗯哼？」，
+        画面描述里也没有角色名 —— 只看后两者根本看不到「要本尊」，插件就会按粘性
+        把更早（12:12 引用块里）提到的「爱莉希雅」补进画面。N 不放大到整个窗口，
+        是为了避免把别的话题里的「本尊」翻出来压制正常的角色点名。
+
+        注意这里用 :func:`character.message_text` 取正文：引用块/媒体块（``[回复…]``）
+        里的文字不算用户自己的表达，与点名扫描保持同一口径。
+
+        Returns:
+            ``(来源说明, 命中的自我指代词, 实际回看的用户消息条数)``；
+            没有命中时前两项为空串。
+        """
+        sources: list[tuple[str, str]] = [("画面描述", content)]
+        if trigger_text:
+            sources.append(("触发消息", strip_quoted_blocks(trigger_text)))
+
+        scan_limit = max(
+            1, min(int(config.multi.recent_messages), _SELF_REFERENCE_SCAN_LIMIT)
+        )
+        # _collect_context 只在 trigger_text 非空时才把触发消息追加在末尾，
+        # 所以「末尾那条是不是触发消息」可以直接由 trigger_text 判断。
+        history_messages = window[:-1] if trigger_text else window
+        scanned = 0
+        # order_messages_newest_first：窗口理论上已是「旧 → 新」，但时间戳乱序时
+        # 必须显式排一次，否则「最近 N 条用户消息」会数错（同 resolve_naming_decision 的口径）
+        for message in order_messages_newest_first(history_messages):
+            if scanned >= scan_limit:
+                break
+            if is_known_bot_message(message, bot_ids):
+                continue
+            scanned += 1
+            sources.append((f"触发前第 {scanned} 条用户消息", message_text(message)))
+
+        for source, text in sources:
+            hit = find_self_reference_word(text)
+            if hit:
+                return source, hit, scanned
+        return "", "", scanned
+
+    @staticmethod
+    def _resolve_self_reference(
+        *,
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        mentioned: int,
+    ) -> CandidateResult:
+        """自我指代命中后的判定：本尊身份 → 角色表命中就补，否则不补（1.0.13）。
+
+        流程（对应 README「本尊/自我指代怎么定」）：
+
+        1. 按 ``general.true_self`` → 人格配置 ``personality.nickname`` →
+           ``alias_names`` 取「本尊身份」候选名（见 :func:`resolve_true_self_identity`）；
+        2. 候选名**逐个**去角色表按「名字 → 别名 → 标签」找同一个角色
+           （见 :func:`character.find_roster_identity`）；
+        3. **命中** → 返回该角色作为候选，走既有注入路径（natural 追加中文说明 +
+           角色表标准标签；``tag_completion`` 逻辑照旧），日志：
+           ``判定依据=自我指代→本尊身份'<名字>'(来源=配置/人格配置)→角色表命中:<角色名>``；
+        4. **没命中** → 不补，日志写明「本尊身份不在角色表中，请加入角色表」；
+        5. **完全取不到身份名** → 保持 1.0.12 的保守行为（不补 + 原日志），
+           并补一句提示（填 ``general.true_self`` 或人格配置 nickname）。
+
+        无论哪种结果都**不猜测、不做外观识别**：拿不准就不补。
+
+        Returns:
+            :class:`CandidateResult`；命中时 ``candidates`` / ``decided`` 都是那一个角色
+        """
+        identity = resolve_true_self_identity(config)
+        hit_entry: CharacterEntry | None = None
+        matched_name = ""
+        # 候选名逐个试：nickname 不在角色表、别名在角色表时也要能命中
+        for candidate in identity.candidates:
+            hit_entry = find_roster_identity(candidate, roster)
+            if hit_entry is not None:
+                matched_name = candidate
+                break
+
+        if hit_entry is not None:
+            basis = (
+                f"判定依据=自我指代→本尊身份'{matched_name}'"
+                f"(来源={identity.source})"
+                f"→角色表命中:{hit_entry.name or hit_entry.tag or '?'}"
+            )
+            logger.debug(basis)
+            naming = NamingDecision(
+                kind="single",
+                characters=[hit_entry],
+                basis=BASIS_USER_NAMED,
+                note=f"自我指代：本尊身份'{matched_name}'（来源={identity.source}）",
+            )
+            return CandidateResult(
+                candidates=[hit_entry],
+                decided=[hit_entry],
+                llm_multi=False,
+                mentioned=mentioned,
+                naming=naming,
+                basis=basis,
+            )
+
+        if identity.candidates:
+            if len(identity.candidates) > 1:
+                logger.debug(
+                    f"本尊身份候选（来源={identity.source}）：{identity.candidates}，"
+                    "都不在角色表中"
+                )
+            # 人格配置的 nickname 有框架默认值（core.toml 里默认是「小狐狸」），
+            # 很容易落在角色表之外 —— 额外提示一条更省事的做法（判定依据那行不动）
+            if identity.source == _TRUE_SELF_SOURCE_PERSONALITY:
+                logger.debug(
+                    f"提示：本尊身份来自人格配置（{'、'.join(identity.candidates)}）；"
+                    "若与实际角色不符，可直接在 general.true_self 里填写角色表中的名字或别名覆盖"
+                )
+            # 「本尊是谁」有来源但角色表里没有 → 不补，并把该做什么写清楚
+            naming = NamingDecision(
+                kind="none",
+                note=(
+                    f"本尊身份='{identity.candidates[0]}' 不在角色表中，"
+                    "无法补标准标签；请把该角色加入角色表"
+                ),
+            )
+        else:
+            # 1.0.12 的原日志一字不改，后面补一句怎么配置
+            naming = NamingDecision(
+                kind="none",
+                note="检测到自我指代，本尊由调用方设定，插件不猜",
+            )
+        basis = naming.label()
+        if not identity.candidates:
+            basis = (
+                f"{basis}"
+                "（未取到本尊身份：请填写 general.true_self"
+                " 或在人格配置里设置 nickname）"
+            )
+        logger.debug(basis)
+        return CandidateResult(
+            candidates=[],
+            decided=[],
+            llm_multi=False,
             mentioned=mentioned,
             naming=naming,
             basis=basis,
@@ -1161,15 +1585,9 @@ class CharacterGuardHandler(BaseEventHandler):
         主模型一次发起多个生图时不必重复查库。**触发消息永远实时追加**，
         不吃缓存。
         """
-        message = params.get("message")
         stream_id = resolve_stream_id(params)
-        trigger_text = ""
-        if message is not None:
-            trigger_text = str(
-                getattr(message, "processed_plain_text", "")
-                or getattr(message, "content", "")
-                or ""
-            ).strip()
+        # 触发消息正文只从 params 取一处（_trigger_text），避免与自我指代扫描取到不同文本
+        trigger_text = self._trigger_text(params)
 
         messages: list[dict[str, Any]] = []
         if not stream_id:

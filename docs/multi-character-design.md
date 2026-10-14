@@ -147,7 +147,21 @@ coord_plan = "spread"    # spread | llm | none
 - **`multi.enabled = false`** 时回到单角色行为（命中任一角色即放行、只补最近讨论的那一个），
   可逐字节回归验证；
 - 默认值是 `true`（按需求确认结果），出问题只需把开关关回或把 `scope` 改成配置项之外的值；
-- 版本：**1.0.10**（在 1.0.9 基础上的修订：主角粘性 + 用户点名优先
+- 版本：**1.0.13**（在 1.0.12 基础上的修订：
+  ① 「本尊」不再一律不补 —— 自我指代命中时先按 `general.true_self` → 框架人格配置
+  `personality.nickname` → `alias_names` 取「本尊身份」，在角色表里按「名字 → 别名 → 标签」
+  命中就正常注入该角色，没命中或取不到身份名才不补（`handler.resolve_true_self_identity`
+  / `_read_personality_identity`，读人格配置走动态导入 + try/except，失败返回空）；
+  ② 明确**不做外观识别**（不从白发/粉眼/和服这类画面关键词反推角色），角色表仍是 4 列。
+  此前 1.0.12 的修订是
+  ① system reminder 追加「生图参数（`content` / `content_description`）最前面先写角色标准标签」
+  的硬规则（`general.notify_tag_rule`，默认开）；
+  ② 改口词「还是」改为**判语境**（选择疑问句「是 A 还是 B？」不算改口），并在点名识别前
+  剥掉 `[回复…]` / `[图片(…)]` 这类中括号块；
+  ③ 自我指代（`本尊` / `你本人` / `你自己` / `真身` …）时判定为**不补**
+  （`general.skip_on_self_reference`，检查范围 = 画面描述 + 触发消息 + 触发之前最近 N 条
+  用户消息，N = `min(multi.recent_messages, 4)`）。
+  此前 1.0.10 的修订是主角粘性 + 用户点名优先
   （`multi.stickiness_hours` / `multi.multi_window_minutes` / `multi.decide`）、
   二次一致性检测（`general.consistency_check` = off/warn/fix）与判定依据诊断日志。
   判定优先级固定为「描述点名 > 用户最近点名(粘性) > LLM 仲裁 > 不补」。
@@ -160,7 +174,7 @@ coord_plan = "spread"    # spread | llm | none
 | 脚本 | 覆盖 |
 | --- | --- |
 | `tests/check_import.py` | 真实导入、manifest 字段、api_version 模块存在性、组件声明一致、配置默认值 |
-| `tests/check_logic.py` | 40 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底、主角粘性/用户点名（换人 vs 追加、时效、压过 LLM）、二次一致性检测 warn/fix |
+| `tests/check_logic.py` | 48 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底、主角粘性/用户点名（换人 vs 追加、时效、压过 LLM）、二次一致性检测 warn/fix、改口词「还是」判语境（C42）、引用/媒体块不参与点名（C43）、自我指代不补（C44/C45）、本尊身份注入与回落人格配置（C46~C48） |
 | `tests/check_patch.py` | 框架补丁状态（未打 / 原版 / 修正版）判定 |
 
 ## 6. 测试计划

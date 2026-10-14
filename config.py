@@ -106,6 +106,40 @@ class CharPromptGuardConfig(BaseConfig):
                 "自动退回 warn 行为并打 WARNING"
             ),
         )
+        skip_on_self_reference: bool = Field(
+            default=True,
+            description=(
+                "自我指代时不补（保守策略）：画面描述、触发消息或触发之前最近几条用户消息里"
+                "出现「本尊 / 你本人 / 你自己 / 真正的你 / 真身 / 脱壳 / 摘壳 / 卸壳 / 本体」，"
+                "且画面描述里没有角色表内角色时，判定为不补。"
+                "1.0.13 起改为：先按 general.true_self → 框架人格配置 personality.nickname → "
+                "alias_names 取「本尊身份」，命中角色表就正常补入那个角色，没命中或取不到才不补。"
+                "「本尊是谁」只存在于聊天器（调用方）的内部设定里，插件看不到，"
+                "按主角粘性沿用旧点名会补错（实测：用户说「要你自己」，插件却把更早点名的"
+                "爱莉希雅补了进去，而描述本身已经写对了外观）。"
+                "关闭后回到 1.0.11 行为（普通「想看看你～」这类无自我指代的请求不受影响，"
+                "一直保持粘性）"
+            ),
+        )
+        true_self: str = Field(
+            default="",
+            description=(
+                "「本尊/你自己/你本人」这类自我指代指向的角色（填角色表中的名字或别名）。"
+                "留空时自动读取框架人格配置的 personality.nickname；填了则以本配置为准。"
+                "两者都取不到、或取到的名字不在角色表里时不补（只记日志提示，绝不猜别的角色）"
+            ),
+        )
+        notify_tag_rule: bool = Field(
+            default=True,
+            description=(
+                "是否提醒主模型在生图参数最前面写角色标准标签：system reminder 里追加一条硬规则 —— "
+                "调用生图动作（share_photo / share_drawing / draw_image）时，提示词参数"
+                "（content / content_description）最前面先写角色表第 4 列的标准标签"
+                "（如 Hanabi \\(honkai: star rail\\)），然后再写画面描述；"
+                "角色表未提供标签时写「角色名（游戏名）」。"
+                "关闭后 reminder 只保留标记说明（#multi# / #nochar# 等）"
+            ),
+        )
 
     @config_section("roster")
     class RosterSection(SectionBase):

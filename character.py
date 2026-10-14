@@ -198,6 +198,39 @@ def find_characters_in_text(
     return hits
 
 
+def find_roster_identity(
+    name: str, roster: list[CharacterEntry]
+) -> CharacterEntry | None:
+    """按「角色名 → 别名 → 标签」在角色表里找与 ``name`` 相同的角色（1.0.13）。
+
+    用于「本尊身份」定位：``general.true_self`` 或框架人格配置的 nickname 填的是
+    角色表里的名字（也可以是别名或标准标签）。比较走
+    :func:`normalize_prompt_text`（忽略大小写、反斜杠与下划线），因此
+    ``hanabi \\(honkai: star rail\\)`` 与 ``hanabi (Honkai: Star rail)`` 视为同一个。
+
+    三个维度分三轮比对：**角色名**优先于**别名**、别名优先于**标签** ——
+    否则「A 的别名恰好等于 B 的名字」时，会随机命中角色表里靠前的那个 A。
+
+    **只做同一性匹配，不做任何猜测**：对不上就返回 ``None``，由调用方走「不补」。
+
+    Returns:
+        命中的角色表条目；没命中返回 ``None``
+    """
+    target = normalize_prompt_text(name)
+    if not target or not roster:
+        return None
+    for entry in roster:
+        if normalize_prompt_text(entry.name) == target:
+            return entry
+    for entry in roster:
+        if any(normalize_prompt_text(alias) == target for alias in entry.aliases):
+            return entry
+    for entry in roster:
+        if normalize_prompt_text(entry.resolved_tag()) == target:
+            return entry
+    return None
+
+
 def find_characters_in_history(
     messages: list[dict[str, Any]],
     roster: list[CharacterEntry],
@@ -216,7 +249,9 @@ def find_characters_in_history(
     last_index: dict[str, int] = {}
     by_key: dict[str, CharacterEntry] = {}
     for index, message in enumerate(messages):
-        text = str(message.get("processed_plain_text") or message.get("content") or "")
+        # 走 message_text：引用/媒体块里的文字不算「提及过这个角色」
+        # （否则引用块会把 multi_only 的「多人场景」判断也带偏）
+        text = message_text(message)
         if not text:
             continue
         for entry in find_characters_in_text(text, roster):
@@ -246,12 +281,53 @@ ADDITIVE_WORDS: tuple[str, ...] = (
 
 #: 「改口」语义词：只取本条点名的角色，上一条点名的作废。
 #: 用户原话例如「算了」「还是画伊甸吧」「不是她」「换成伊甸」。
+#: 注意（1.0.12 起）：``还是`` **必须判语境**才算改口，见
+#: :func:`contains_corrective_word` —— 选择疑问句「是 A 还是 B？」不是改口。
 CORRECTIVE_WORDS: tuple[str, ...] = (
     "算了",
     "还是",
     "不是",
     "换",
     "改成",
+)
+
+#: 「还是」的改口语境前置词：在「还是」**前面 20 个字符**内出现这些词，
+#: 说明用户在否定上一个方案（「算了，还是画伊甸吧」「不要爱莉了，还是画伊甸」）。
+#:
+#: ``别`` 额外排除了「特别 / 区别 / 告别 / 个别」这类复合词（负向后顾）：
+#: 「我特别想知道是爱莉还是你」里的「别」不是改口信号，实测这类句子会被误判
+#: 成改口，与下面要修的事故同源。
+_CORRECTIVE_LEAD_PATTERN = re.compile(
+    r"算了|不要|不画|不拍|改|换"
+    r"|(?<![特分区个级类派差告性鉴离作干话诀永惜送久])别"
+)
+
+#: 「还是」的改口语境句式：``还是(画|要|来|看|拍|换)…吧``，用户在重新指定对象。
+_CORRECTIVE_HAISHI_PATTERN = re.compile(
+    r"还是\s*(?:画|要|来|看|拍|换)[^。！？!?，,；;：:\n]{0,12}?吧"
+)
+
+#: 「还是」前置语境的观察窗口（字符数）
+_CORRECTIVE_LEAD_WINDOW = 20
+
+#: 自我指代词：用户要的是「bot 自己 / 本尊」，而不是角色表里的某个角色。
+#:
+#: 「本尊是谁」只存在于调用方（聊天器）的内部设定里，插件看不到；硬按「主角粘性」
+#: 沿用旧点名会补错人 —— 实测事故：用户说「那你再来图，要你自己～」，画面描述其实
+#: 已经写对了外观，插件却把一小时前点名的「爱莉希雅」补了进去。
+#:
+#: 词表只收「明确指向 bot 自身」的说法，**不含「你」**（太泛：画「你」也可能指
+#: 角色表里的某个角色，收进来会把正常的「想看看你～」也变成不补）。
+SELF_REFERENCE_WORDS: tuple[str, ...] = (
+    "本尊",
+    "你本人",
+    "你自己",
+    "真正的你",
+    "真身",
+    "脱壳",
+    "摘壳",
+    "卸壳",
+    "本体",
 )
 
 #: 判定依据文案（会原样出现在 DEBUG 日志里，便于用户核对）
@@ -275,8 +351,15 @@ _USER_ROLE_VALUES = frozenset({"user", "human", "member", "customer", "friend"})
 
 
 def message_text(message: dict[str, Any]) -> str:
-    """取出消息的可读正文（与框架 ``_rows_to_message_dicts`` 的字段一致）。"""
-    return str(message.get("processed_plain_text") or message.get("content") or "")
+    """取出消息的可读正文（与框架 ``_rows_to_message_dicts`` 的字段一致）。
+
+    1.0.12 起**先剥掉中括号块**（``[回复…]`` / ``[图片(…)]`` / ``[视频(…)]`` /
+    ``[语音(…)]`` / ``[表情(…)]`` …）再返回：这些块里的文字是别人说的话或媒体
+    占位，不能当成用户本次的点名，详见 :func:`strip_quoted_blocks`。
+    """
+    return strip_quoted_blocks(
+        str(message.get("processed_plain_text") or message.get("content") or "")
+    )
 
 
 def message_time(message: dict[str, Any]) -> float | None:
@@ -384,6 +467,108 @@ def contains_any_word(text: str, words: tuple[str, ...]) -> bool:
     return any(_keyword_hits(text, word) for word in words)
 
 
+def _haishi_is_corrective(text: str) -> bool:
+    """判断文本里的「还是」是否处于**改口语境**。
+
+    只有下面两种语境才算改口，其余（尤其是「是 A 还是 B？」这种选择疑问句）不算：
+
+    1. 「还是」前面 :data:`_CORRECTIVE_LEAD_WINDOW` 个字符内出现
+       ``算了 / 不要 / 别 / 不画 / 不拍 / 改 / 换``（「算了，还是画伊甸吧」）；
+    2. 「还是」后面形如 ``还是(画|要|来|看|拍|换)…吧``（「还是画伊甸吧」）。
+    """
+    for match in re.finditer("还是", text):
+        head = text[max(0, match.start() - _CORRECTIVE_LEAD_WINDOW) : match.start()]
+        if _CORRECTIVE_LEAD_PATTERN.search(head):
+            return True
+        if _CORRECTIVE_HAISHI_PATTERN.match(text, match.start()):
+            return True
+    return False
+
+
+def contains_corrective_word(text: str) -> bool:
+    """判断文本里是否出现「改口」语义（只取本条点名的角色，上一条作废）。
+
+    1.0.11 及以前只要出现「还是」就算改口，于是选择疑问句被判成了改口：
+    实测事故原文 ``[回复<某人>：那你告诉我，是爱莉还是你？][图片(xxx)]`` 里，
+    引用块中的「还是」把 LLM 正确认出的「花火」顶掉，最后补成了「爱莉希雅」。
+
+    1.0.12 起的口径：
+
+    - ``算了 / 不是 / 换 / 改成`` 行为**完全不变**（出现即算改口）；
+    - ``还是`` **必须判语境**（见 :func:`_haishi_is_corrective`）；不构成改口语境时
+      本条判定退回「不确定 → 交 LLM 仲裁」，而不是强行认定用户改了口。
+    """
+    if not text:
+        return False
+    others = tuple(word for word in CORRECTIVE_WORDS if word != "还是")
+    if contains_any_word(text, others):
+        return True
+    return _haishi_is_corrective(text)
+
+
+def find_self_reference_word(text: str) -> str:
+    """返回文本里命中的第一个自我指代词；没有命中返回空串。
+
+    见 :data:`SELF_REFERENCE_WORDS`：用户要的是「bot 本尊」时，插件不该按粘性
+    沿用旧点名（「本尊是谁」只有调用方知道）。
+    """
+    if not text:
+        return ""
+    for word in SELF_REFERENCE_WORDS:
+        if word in text:
+            return word
+    return ""
+
+
+def strip_quoted_blocks(text: str) -> str:
+    """剥掉 ``[回复…]`` / ``[图片(…)]`` 这类中括号块（嵌套时按**最外层**整块剥掉）。
+
+    为什么要在「点名识别」之前剥掉：框架与适配器会把**引用**与**媒体占位**渲染成
+    中括号块，块里的文字要么是**别人说的话**，要么只是文件名 —— 它们不是本次用户
+    自己的点名。实测事故（1.0.12 要修的）：用户消息
+
+        [回复<的饮水思源(2224586893)>：那你告诉我，是爱莉还是你？][图片(xxx)]
+
+    里，引用块中的「还是」被当成用户的改口词，把 LLM 正确认出的「花火」顶掉，
+    最终补成了引用块里提到的「爱莉希雅」。
+
+    规则：
+
+    - 半角 ``[`` 到配对的 ``]`` 整块剥掉，**嵌套时按最外层**整体剥掉；
+    - 找不到配对 ``]`` 的孤立 ``[`` 按普通字符保留（绝不能把它后面的正文一起吃掉）。
+
+    这里刻意**不按前缀白名单**（回复/图片/…）过滤：不同适配器的块名不可穷举，而
+    「多剥一个块」最多是漏掉一次点名（宁可不补），「少剥一个块」却会补错角色。
+    """
+    if not text or "[" not in text:
+        return text
+    result: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char != "[":
+            result.append(char)
+            index += 1
+            continue
+        depth = 1
+        cursor = index + 1
+        while cursor < length and depth > 0:
+            if text[cursor] == "[":
+                depth += 1
+            elif text[cursor] == "]":
+                depth -= 1
+            cursor += 1
+        if depth > 0:
+            # 没有配对的 ]：按普通字符处理，继续往后扫（别把正文一起吃掉）
+            result.append(char)
+            index += 1
+            continue
+        result.append(" ")
+        index = cursor
+    return re.sub(r"\s+", " ", "".join(result)).strip()
+
+
 def merge_entries(*groups: list[CharacterEntry]) -> list[CharacterEntry]:
     """按给定顺序合并多组角色并去重（保留先出现的那个）。"""
     seen: set[str] = set()
@@ -461,13 +646,15 @@ def resolve_naming_decision(
 
     规则：
 
-    1. 只看**不是 bot 自己**的消息（bot 的复述不算点名）；
+    1. 只看**不是 bot 自己**的消息（bot 的复述不算点名），且消息正文先经
+       :func:`message_text` 剥掉 ``[回复…]`` / ``[图片(…)]`` 这类中括号块；
     2. 最近一条带角色表内角色的消息若已超出 ``stickiness_hours``，视为无信号
        （``kind="none"`` 且 ``stale=True``），不得回退到那个旧角色；
     3. 最近一条点名消息含 ≥2 个角色 → 多人（这些人，按角色表顺序）；
     4. 含 1 个角色且文本里有追加词（还有/一起/俩/都/加上/和她/and/both）
        → 多人（本条 + 上一条点名的角色，本条在前）；
-    5. 含 1 个角色且文本里有改口词（算了/还是/不是/换/改成）→ 只取本条那一个；
+    5. 含 1 个角色且文本里有改口词（算了/不是/换/改成，或**处于改口语境**的「还是」）
+       → 只取本条那一个；「是 A 还是 B？」这类选择疑问句**不算**改口（1.0.12 起）；
     6. 都不含：与上一条点名消息间隔 < ``multi_window_minutes`` → ``uncertain``
        （交给 LLM 仲裁，本函数给出「只补最近那一个」的保守结果）；
        间隔 ≥ 或没有上一条点名消息 → 只取本条那一个；
@@ -563,8 +750,8 @@ def resolve_naming_decision(
             note="追加语义，但上一条没有点名别的角色",
         )
 
-    # 3.3 改口词 → 只取本条那一个
-    if contains_any_word(current_text, CORRECTIVE_WORDS):
+    # 3.3 改口词 → 只取本条那一个（「还是」需判语境，见 contains_corrective_word）
+    if contains_corrective_word(current_text):
         return NamingDecision(
             kind="single",
             characters=list(current_hits[:1]),
