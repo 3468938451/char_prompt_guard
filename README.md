@@ -1,5 +1,29 @@
 # char_prompt_guard — 角色提示词守卫
 
+## ⚠️ 插件没生效 / 加载成功但从不起作用？先看这里
+
+本插件监听框架的「**工具/动作执行前事件**」。但**agent 类聊天器**（`default_chatter`、`neo_default_chatter`、KFC 等）走的是另一条调用路径，**框架默认不会发这个事件** —— 于是插件会「加载成功、日志却一直静默」。
+
+**这种情况下需要给框架打补丁（一次性，改一个文件）：**
+
+1. 下载补丁：仓库 [`framework-patch/llm_tool_call-pre-events.patch`](./framework-patch/llm_tool_call-pre-events.patch)（同一文件也作为 GitHub Release 资产提供）；
+2. 打补丁（在**框架根目录**执行）：
+   ```bash
+   git apply <下载路径>/llm_tool_call-pre-events.patch
+   # 若报错可加 --3way；仍失败就照补丁内容手工修改 src/core/utils/llm_tool_call.py
+   ```
+3. **重启 bot**。日志里出现「已补入角色 / 已补标准标签」即生效；若始终没有，再看下一步自检；
+4. 自检补丁是否打对：
+   ```powershell
+   $env:NEO_ROOT = "<框架根>"
+   python <插件目录>\tests\check_patch.py     # 期望：[PASS] …修正版补丁
+   ```
+5. 另外两个前提：
+   - 至少要装**一个生图插件**（`nai_artist` 或 `image_generator_plugin-neo`），否则本插件没有可接管的目标；
+   - 建议在 `[roster] characters` 里填写常用角色（含第 4 列的**转义标准标签**，如 `firefly \(honkai: star rail\)`），标签可靠性由此决定。
+
+> 补丁做两件事：① 在 agent 聊天器的工具调用路径上**补发执行前事件**；② 事件里带上 `stream_id`、并按新版 `name` 解析动作名。框架升级（`git pull`）会覆盖它，需要**重新打一次**。
+
 > 文档版本：1.0.14 · 作者：思源（siyuan）· 许可：MIT
 > 同时适配 **nai_artist** 与 **image_generator_plugin-neo** 两个生图插件。
 > 本插件由 **AI 辅助编写**（作者审阅与整合）：缺陷、遗漏或无意残留的第三方内容请见
