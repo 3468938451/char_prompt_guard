@@ -266,6 +266,10 @@ BASIS_NONE = "无"
 #: 宁可多扫一条，也不要让整条判定链路静默失效）
 _BOT_ROLE_VALUES = frozenset({"bot", "assistant", "model", "system", "ai"})
 
+#: 框架自带的 bot 发送者标记：``messages.person_id`` 对 bot 消息写的就是 ``bot``，
+#: 而适配器解析出的 bot_id 往往是 QQ 号之类，两者格式不同 —— 只比 bot_id 会漏判。
+_BOT_SENDER_MARKERS = frozenset({"bot", "system", "self", "assistant", "机器人", "系统"})
+
 #: 明确标成用户/成员时的角色取值
 _USER_ROLE_VALUES = frozenset({"user", "human", "member", "customer", "friend"})
 
@@ -301,6 +305,9 @@ def is_known_bot_message(
     for key in ("role", "sender_role", "message_role"):
         if str(message.get(key) or "").strip().lower() in _BOT_ROLE_VALUES:
             return True
+    for key in ("sender_id", "person_id", "sender_name", "user_name"):
+        if str(message.get(key) or "").strip().lower() in _BOT_SENDER_MARKERS:
+            return True
     sender_id = str(message.get("sender_id") or "").strip()
     return bool(sender_id and bot_ids and sender_id in bot_ids)
 
@@ -318,7 +325,12 @@ def is_attributed_user_message(
     for key in ("role", "sender_role", "message_role"):
         if str(message.get(key) or "").strip().lower() in _USER_ROLE_VALUES:
             return True
+    if is_known_bot_message(message, bot_ids):
+        # 框架写 person_id="bot" 的消息绝不能算用户点名（实测就是这么补错的）
+        return False
     sender_id = str(message.get("sender_id") or "").strip()
+    if sender_id.lower() in _BOT_SENDER_MARKERS:
+        return False
     return bool(sender_id and bot_ids and sender_id not in bot_ids)
 
 

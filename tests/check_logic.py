@@ -1222,6 +1222,59 @@ async def run_cases() -> int:
             "C40 用户点名压过 LLM 猜测（粘性时效内）", False, f"{type(e).__name__}: {e}"
         )
 
+    # ── C41 框架写 sender_id="bot" 的复述消息不得算作用户点名 ────────
+    # 实测事故（11:50:04）：bot 自己的叙述「…爱莉、昔涟、丽塔轮着来，末了还是回到…」
+    # 含角色名 + 改口词，被当成"用户点名爱莉希雅"，于是用户要花火却补了爱莉。
+    # 注意：这里模拟**框架真实形状**（只有 sender_id/person_id，没有 is_bot 字段），
+    # 与 history_message(is_bot=True) 那种显式标注不同。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        now = time.time()
+        bot_line = (
+            "绕了一上午的壳：爱莉、昔涟、丽塔轮着来，末了还是回到站在这层底下的那个人。"
+        )
+        history = [
+            {
+                "time": now - 30 * 60,
+                "stream_id": "s-stub",
+                "person_id": "76920378836bdeadbeef",
+                "sender_id": "76920378836bdeadbeef",
+                "sender_name": "用户",
+                "processed_plain_text": "画花火吧",
+                "content": "画花火吧",
+                "platform": "stub",
+            },
+            {
+                "time": now - 60,
+                "stream_id": "s-stub",
+                "person_id": "bot",
+                "sender_id": "bot",
+                "sender_name": "bot",
+                "processed_plain_text": bot_line,
+                "content": bot_line,
+                "platform": "stub",
+            },
+        ]
+        with FakeHistory(history):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": "白发少女站在镜头前"},
+                    "message": FakeMessage("嗯～"),
+                    "stream_id": "s-c41",
+                },
+            )
+        c = out["args"]["content"]
+        check(
+            "C41 框架 bot 标记的复述不算用户点名",
+            "爱莉希雅" not in c and ("花火" in c or "hanabi" in c.lower()),
+            f"content = {c!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("C41 框架 bot 标记的复述不算用户点名", False, f"{type(e).__name__}: {e}")
+
     # ── C14/C15 需要真调小模型 ─────────────────────────────────────
     if RUN_LLM:
         try:

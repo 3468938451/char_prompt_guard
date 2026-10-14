@@ -1,7 +1,7 @@
 {
     "name": "char_prompt_guard",
     "display_name": "角色提示词守卫",
-    "version": "1.0.10",
+    "version": "1.0.11",
     "description": "角色提示词守卫：bot 生图前检测提示词中是否已含角色；已含则放行，未含则按「描述点名 > 用户最近点名(粘性) > LLM 仲裁 > 不补」的优先级补入角色名+游戏名（或 NAI 角色标签），支持多角色同框自动补齐与二次一致性检测。兼容 nai_artist 与 image_generator_plugin-neo。",
     "author": "思源",
     "dependencies": {
