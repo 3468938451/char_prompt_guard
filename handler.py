@@ -5,6 +5,12 @@
 - 提示词里已经带有角色 → 放行；
 - 没有角色 → 按「角色表快速匹配 → LLM 兜底提取」的顺序从最近对话上文中
   找出当前指代的角色，补入提示词；多角色同框时按配置补齐多个。
+- 「这次该画谁」由**主题跟踪器**（:func:`monitor.track_subject`，1.0.14 起）给出：
+  按时间正序扫最近 ``monitor.window`` 条消息，逐条演进一个「当前主题」
+  （改口 / 多人 / 点名 / 本尊身份 / 代词回指），置信度 = 信号强度 × 时间衰减，
+  低于 ``monitor.min_confidence`` 就不补。``monitor.enabled = false`` 时**完全退回
+  1.0.13** 的「自我指代扫描（②.5）+ 用户点名/主角粘性（③）」链路（见
+  :meth:`CharacterGuardHandler._collect_candidates` 里的 else 分支）。
 
 不同生图插件的提示词语义不同，因此按「目标 Action」区分追加格式：
 
@@ -63,6 +69,7 @@ from .character import (
     strip_quoted_blocks,
 )
 from .config import CharPromptGuardConfig
+from .monitor import SubjectTrack, track_subject
 
 logger = get_logger("char_prompt_guard")
 
@@ -169,7 +176,8 @@ class CandidateResult:
             供二次一致性检测对账
         llm_multi: LLM 判定的「是否需要多人同框」
         mentioned: 上文中被提及的角色表内角色数（过滤前，供 multi_only 判断）
-        naming: 确定性的「用户点名/粘性」判定结果
+        naming: 确定性的「主题跟踪 / 用户点名·粘性」判定结果（1.0.14 起由主题跟踪给出，
+            见 :meth:`monitor.SubjectTrack.naming`）
         basis: 判定依据的可读文案（进日志与 WARNING）
     """
 
@@ -959,18 +967,27 @@ class CharacterGuardHandler(BaseEventHandler):
     ) -> CandidateResult:
         """收集候选角色。
 
-        判定优先级（1.0.10 起）：**描述点名 > 用户点名(粘性) > LLM 仲裁 > 不补**。
+        判定优先级（1.0.10 起，1.0.14 起第二级由主题跟踪承担）：**描述点名 >
+        主题跟踪（用户点名/粘性） > LLM 仲裁 > 不补**。
 
         - 描述点名：画面描述里已经写了角色表内角色 —— 由调用方直接放行/补标签，
           本函数只负责算出「判定集合」，供二次一致性检测对账；
-        - 自我指代（1.0.12 起；1.0.13 起能定位到角色）：用户要的是「bot 本尊」时，
-          先按「``general.true_self`` → 人格配置 ``nickname`` → ``alias_names``」取
-          本尊身份并在角色表里定位；**命中就补那个角色**，没命中或完全取不到身份名
-          才**直接不补**（见 ②.5），不走下面的粘性判定 —— 本尊是谁只有调用方知道；
+        - **主题跟踪**（1.0.14 起，``monitor.enabled = true``）：把「这次该画谁」交给
+          :func:`monitor.track_subject` —— 按时间正序扫最近 ``monitor.window`` 条消息
+          维护一个「当前主题」（改口 / 多人 / 点名 / 本尊身份 / 代词回指），置信度 =
+          信号强度 × 时间衰减，低于 ``monitor.min_confidence`` 就不补。它压过 LLM 的
+          猜测；主题**不可用**（本尊身份不在角色表、取不到身份名、代词无先行词）时
+          直接不补且不问 LLM。只有「换人还是追加不确定」（相邻两条点名消息靠得太近）
+          才交 LLM 仲裁，与 1.0.12 起的既有语义一致；
+        - 自我指代（1.0.12 起；1.0.13 起能定位到角色）：``monitor.enabled = false`` 时
+          走这条老链路 —— 按「``general.true_self`` → 人格配置 ``nickname`` →
+          ``alias_names``」取本尊身份并在角色表里定位；**命中就补那个角色**，
+          没命中或完全取不到身份名才**直接不补**（见 ②.5），不走粘性判定；
         - 用户点名(粘性)：``character.resolve_naming_decision`` 的确定性结论
-          （带 ``multi.stickiness_hours`` 时效、换人/追加规则）。**它压过 LLM 的
-          猜测** —— 「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
-        - LLM 仲裁：没有确定结论（无信号 / 换人还是追加不确定）时才问；
+          （带 ``multi.stickiness_hours`` 时效、换人/追加规则）—— 同样只在
+          ``monitor.enabled = false`` 时使用。**它压过 LLM 的猜测** ——
+          「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
+        - LLM 仲裁：主题为空 / 置信度不足 / 换人还是追加不确定时才问（条件见 ④）；
         - 都不成立 → 不补（宁少勿多）。
 
         Returns:
@@ -1008,69 +1025,132 @@ class CharacterGuardHandler(BaseEventHandler):
         # ②.5 与 ③ 共用这一份结果，只解析一次。
         bot_ids = await self._resolve_bot_sender_ids(window)
 
-        # ②.5 自我指代（1.0.12 起；1.0.13 起能定位到具体角色）：用户要的是
-        # 「bot 本尊」，而「本尊是谁」只存在于调用方（聊天器）的内部设定里，
-        # 插件看不到。此时按粘性沿用旧点名会补错人（实测：更早用户点名过
-        # 「爱莉希雅」，插件就把它补进了「要你自己」的画面）。
-        # 1.0.13 起先按「general.true_self → 人格配置 nickname → alias_names」
-        # 取本尊身份：命中角色表就**正常注入那个角色**（走既有注入路径），
-        # 没命中或完全取不到身份名才不补（也不问 LLM —— 问它同样只能从上文里
-        # 猜出那个旧角色）。前提是**描述里没有角色表内角色**：描述里写明了角色
-        # 就是另一回事。
-        if (
-            config.general.skip_on_self_reference
-            and roster
-            and not description_has_character
-        ):
-            source, hit, scanned = self._detect_self_reference(
-                window=window,
-                trigger_text=self._trigger_text(params),
-                content=content,
-                bot_ids=bot_ids,
-                config=config,
-            )
-            if hit:
-                logger.debug(
-                    f"自我指代命中：来源={source} 词={hit!r}"
-                    f"（焦点范围=画面描述+触发消息+触发前最近 {scanned} 条用户消息）"
-                )
-                return self._resolve_self_reference(
-                    config=config,
-                    roster=roster,
-                    mentioned=mentioned,
-                )
+        # ② 主题跟踪（1.0.14 起，``monitor.enabled = true`` 时的主判定）：按时间正序
+        # 扫最近 ``monitor.window`` 条消息，逐条演进一个「当前主题」，置信度 =
+        # 信号强度 × 时间衰减。它取代了 1.0.13 里分散在两处的规则 ——「自我指代扫描
+        # （②.5）」与「用户点名/主角粘性（③）」；规则、优先级与可读日志统一在
+        # ``monitor.track_subject`` 一处（README「主题跟踪」一节有完整表格）。
+        #
+        # ``monitor.enabled = false`` 时走下面的 else 分支：1.0.13 的两条链路
+        # 一字未改，可逐字节回归（用例 C53）。
+        monitor = getattr(config, "monitor", None)
+        monitor_on = bool(getattr(monitor, "enabled", False)) and bool(roster)
+        track: SubjectTrack | None = None
+        naming = NamingDecision()
 
-        # ③ 用户点名 / 主角粘性（确定性、零成本）：本次判定的主依据。
-        naming = resolve_naming_decision(
-            window,
-            roster,
-            stickiness_hours=float(config.multi.stickiness_hours),
-            multi_window_minutes=float(config.multi.multi_window_minutes),
-            bot_ids=bot_ids,
-        )
-        logger.debug(naming.label())
+        if monitor_on:
+            try:
+                track = track_subject(
+                    messages,
+                    roster,
+                    window=int(getattr(monitor, "window", 15)),
+                    min_confidence=float(getattr(monitor, "min_confidence", 0.5)),
+                    half_life_minutes=float(
+                        getattr(monitor, "half_life_minutes", 45.0)
+                    ),
+                    multi_window_minutes=float(config.multi.multi_window_minutes),
+                    # 自我指代规则与 1.0.13 同一前提：画面描述里已经写明了角色表内角色时，
+                    # 「本尊/你自己」不再改变主题（描述点名优先级最高）
+                    self_reference_enabled=(
+                        bool(config.general.skip_on_self_reference)
+                        and not description_has_character
+                    ),
+                    bot_ids=bot_ids,
+                    resolve_identity=lambda: resolve_true_self_identity(config),
+                )
+            except Exception as e:  # noqa: BLE001 —— 跟踪器自身出问题绝不能拦住生图
+                logger.warning(
+                    f"主题跟踪异常，本次退回 1.0.13 判定链路: {type(e).__name__}: {e}"
+                )
+                track = None
+                monitor_on = False
+            else:
+                logger.debug(track.log_line())
+                # 判定依据与主题轨迹一样重要：用户核对「为什么补了/没补」看的就是它
+                # （「本尊身份」/「不在角色表」/「置信度不足」等原因都在里面）
+                logger.debug(track.basis)
+                naming = track.naming()
+                if track.unavailable:
+                    # 本尊身份不在角色表 / 取不到身份名 / 代词没有先行词：宁可什么都不补，
+                    # 也绝不用粘性把更早的旧角色捡回来（1.0.12 起一直守的结论）。
+                    # 这里**不问 LLM**：问它同样只能从上文里猜出那个旧角色。
+                    return CandidateResult(
+                        candidates=[],
+                        decided=[],
+                        llm_multi=False,
+                        mentioned=mentioned,
+                        naming=naming,
+                        basis=track.basis,
+                    )
+
+        if not monitor_on:
+            # ②.5 自我指代（1.0.12 起；1.0.13 起能定位到具体角色）：用户要的是
+            # 「bot 本尊」，而「本尊是谁」只存在于调用方（聊天器）的内部设定里，
+            # 插件看不到。此时按粘性沿用旧点名会补错人（实测：更早用户点名过
+            # 「爱莉希雅」，插件就把它补进了「要你自己」的画面）。
+            # 1.0.13 起先按「general.true_self → 人格配置 nickname → alias_names」
+            # 取本尊身份：命中角色表就**正常注入那个角色**（走既有注入路径），
+            # 没命中或完全取不到身份名才不补（也不问 LLM —— 问它同样只能从上文里
+            # 猜出那个旧角色）。前提是**描述里没有角色表内角色**：描述里写明了角色
+            # 就是另一回事。
+            if (
+                config.general.skip_on_self_reference
+                and roster
+                and not description_has_character
+            ):
+                source, hit, scanned = self._detect_self_reference(
+                    window=window,
+                    trigger_text=self._trigger_text(params),
+                    content=content,
+                    bot_ids=bot_ids,
+                    config=config,
+                )
+                if hit:
+                    logger.debug(
+                        f"自我指代命中：来源={source} 词={hit!r}"
+                        f"（焦点范围=画面描述+触发消息+触发前最近 {scanned} 条用户消息）"
+                    )
+                    return self._resolve_self_reference(
+                        config=config,
+                        roster=roster,
+                        mentioned=mentioned,
+                    )
+
+            # ③ 用户点名 / 主角粘性（确定性、零成本）：1.0.13 的主依据。
+            naming = resolve_naming_decision(
+                window,
+                roster,
+                stickiness_hours=float(config.multi.stickiness_hours),
+                multi_window_minutes=float(config.multi.multi_window_minutes),
+                bot_ids=bot_ids,
+            )
+            logger.debug(naming.label())
 
         # ④ 决定要不要问 LLM（沿用 1.0.6 起的既有条件，另加「不确定」这一条）：
         #   - llm_mode="always"：显式要求每次都问，可识别角色表**外**的角色；
         #   - 没有任何上文命中：保持原有 LLM 兜底行为；
         #   - description_first 且描述里没有角色表内角色：让读过描述的 LLM 参与；
         #   - 上文出现 ≥2 个角色表内角色：多人场景需要 LLM 仲裁一次；
-        #   - 换人还是追加不确定（uncertain）：按规则交 LLM 仲裁。
-        # 注意：**问不问 LLM** 与 **听不听 LLM** 是两件事 —— 用户点名有确定结论时，
-        # LLM 的表内结论一律让位（见 ⑤），这里问一次只是为了 llm_mode="always" 下
-        # 还能认出角色表外的角色、以及保留 description_first 的既有排查能力。
+        #   - 换人还是追加不确定（uncertain / 主题跟踪的 ambiguous）：按规则交 LLM 仲裁。
+        # 注意：**问不问 LLM** 与 **听不听 LLM** 是两件事 —— 主题跟踪（或 1.0.13 的用户
+        # 点名）有确定结论时，LLM 的表内结论一律让位（见 ⑤），这里问一次只是为了
+        # llm_mode="always" 下还能认出角色表外的角色、以及保留 description_first 的
+        # 既有排查能力。
         llm_mode = str(config.multi.llm_mode).lower()
         multi_candidates = (
             config.multi.enabled
             and str(config.multi.scope).lower() == SCOPE_MULTI_ONLY
             and mentioned >= 2
         )
+        # 「换人还是追加不确定」的来源：monitor 开启时由主题跟踪给出（相邻两条点名
+        # 消息间隔 < multi.multi_window_minutes），关闭时沿用 resolve_naming_decision。
+        ambiguous = track.ambiguous if track is not None else naming.kind == "uncertain"
         need_llm = config.general.use_llm and (
             llm_mode == "always"
             or not history_candidates
             or (config.general.description_first and not present_keys)
             or multi_candidates
-            or naming.kind == "uncertain"
+            or ambiguous
         )
 
         llm_candidates: list[CharacterEntry] = []
@@ -1124,11 +1204,51 @@ class CharacterGuardHandler(BaseEventHandler):
                     seen_llm.add(key)
                     llm_candidates.append(entry)
 
-        # ⑤ 汇总。用户点名/粘性有确定结论时以它为准 —— LLM 的表内猜测一律让位
-        # （这就是本次要修的核心问题：用户点名流萤，LLM 却猜成爱莉希雅）；
-        # 只有 llm_mode="always" 这种显式开启的场景，才额外保留 LLM 认出来的
-        # **角色表外**角色（宁少勿多，不让模型的猜测混进画面）。
-        if naming.kind in {"single", "multi"}:
+        # ⑤ 汇总。优先级：主题跟踪（1.0.14）/ 用户点名·粘性（1.0.13）有确定结论时以它
+        # 为准 —— LLM 的表内猜测一律让位（这就是 1.0.10 起要修的核心问题：用户点名
+        # 流萤，LLM 却猜成爱莉希雅）；只有 llm_mode="always" 这种显式开启的场景，才
+        # 额外保留 LLM 认出来的**角色表外**角色（宁少勿多，不让模型的猜测混进画面）。
+        # 唯一的例外是「换人还是追加不确定」：相邻两条点名消息靠得太近又没有任何
+        # 追加/改口标记时，交 LLM 仲裁 —— 与 1.0.12 起「还是」判语境后的既有行为一致。
+        if track is not None and track.usable:
+            if track.ambiguous and llm_candidates:
+                candidates = list(llm_candidates)
+                decided = list(llm_candidates)
+                basis = (
+                    f"判定依据=LLM 仲裁:"
+                    f"{[entry.name or entry.tag or '?' for entry in llm_candidates]}"
+                    f" multi={str(llm_multi).lower()}"
+                    f"（主题跟踪={track.subject_names()}，但换人/追加不确定）"
+                )
+                logger.debug(basis)
+            else:
+                candidates = [
+                    entry
+                    for entry in track.entries
+                    if not character_in_texts(entry, texts)
+                ]
+                decided = list(track.entries)
+                basis = track.basis
+                if track.ambiguous:
+                    basis = f"{basis}；LLM 无结论，按主题跟踪结果补入"
+                outside = (
+                    [
+                        entry
+                        for entry in llm_candidates
+                        if not any(
+                            entry_key(entry) == entry_key(known) for known in roster
+                        )
+                    ]
+                    if llm_mode == "always"
+                    else []
+                )
+                if outside:
+                    logger.debug(
+                        "LLM 额外识别出角色表外的角色 "
+                        f"{[entry.name or entry.tag for entry in outside]}，一并补入"
+                    )
+                    candidates = merge_entries(candidates, outside)
+        elif naming.kind in {"single", "multi"}:
             candidates = [
                 entry
                 for entry in naming.characters
@@ -1178,10 +1298,12 @@ class CharacterGuardHandler(BaseEventHandler):
             decided = list(naming.characters)
             basis = f"{naming.label()}；LLM 无结论，宁少勿多只补最近那一个"
         else:
-            # 无信号（没有点名、或点名已超出粘性时效）
+            # 无信号（没有点名、或点名已超出粘性时效）；monitor 开启时由主题跟踪给出
+            # 具体原因（轨迹与判定依据在上面已经打过日志）：窗口内根本没有信号，
+            # 还是信号太旧被 min_confidence 挡掉。
             candidates = []
             decided = []
-            basis = naming.label()
+            basis = track.basis if track is not None else naming.label()
 
         max_candidates = max(1, int(config.multi.max_characters))
         return CandidateResult(
@@ -1203,6 +1325,12 @@ class CharacterGuardHandler(BaseEventHandler):
         config: CharPromptGuardConfig,
     ) -> tuple[str, str, int]:
         """在「焦点范围」里查找自我指代词（``本尊`` / ``你本人`` / ``你自己`` …）。
+
+        .. note::
+           1.0.14 起这条链路只在 ``monitor.enabled = false`` 时使用 —— 默认开启
+           **主题跟踪**（``monitor.track_subject``）时，自我指代是状态机里的一条规则
+           （主题 = 本尊身份），不再需要这里「按焦点范围找词」的启发式。保留它是为了
+           「关掉 monitor 就完全退回 1.0.13」（回归用例 C53）。
 
         焦点范围（1.0.12）按顺序是：
 
@@ -1260,6 +1388,13 @@ class CharacterGuardHandler(BaseEventHandler):
         mentioned: int,
     ) -> CandidateResult:
         """自我指代命中后的判定：本尊身份 → 角色表命中就补，否则不补（1.0.13）。
+
+        .. note::
+           与 :meth:`_detect_self_reference` 一样，1.0.14 起只在
+           ``monitor.enabled = false`` 时使用；默认的主题跟踪路径里，同样的
+           「本尊身份」定位逻辑在 ``monitor.track_subject`` 的自我指代分支，
+           日志字段（``本尊身份`` / ``(来源=…)`` / ``角色表命中`` / ``不在角色表中``）
+           与这里保持一致。
 
         流程（对应 README「本尊/自我指代怎么定」）：
 

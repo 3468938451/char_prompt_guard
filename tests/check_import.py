@@ -43,6 +43,7 @@ MODULES = [
     f"{PLUGIN_NAME}.character",
     f"{PLUGIN_NAME}.config",
     f"{PLUGIN_NAME}.handler",
+    f"{PLUGIN_NAME}.monitor",
     f"{PLUGIN_NAME}.plugin",
 ]
 
@@ -197,6 +198,27 @@ def main() -> int:
             "1.0.13 本尊身份默认留空（留空读人格配置 nickname）",
             cfg.general.true_self == "",
             f"true_self={cfg.general.true_self!r}",
+        )
+        # 1.0.14 新增：主题跟踪（[monitor] 节）
+        check(
+            "1.0.14 默认启用主题跟踪",
+            cfg.monitor.enabled is True,
+            f"monitor.enabled={cfg.monitor.enabled!r}",
+        )
+        check(
+            "1.0.14 主题跟踪窗口默认 15 条",
+            cfg.monitor.window == 15,
+            f"monitor.window={cfg.monitor.window!r}",
+        )
+        check(
+            "1.0.14 主题置信度阈值默认 0.5",
+            cfg.monitor.min_confidence == 0.5,
+            f"monitor.min_confidence={cfg.monitor.min_confidence!r}",
+        )
+        check(
+            "1.0.14 主题时间衰减半衰期默认 45 分钟",
+            cfg.monitor.half_life_minutes == 45.0,
+            f"monitor.half_life_minutes={cfg.monitor.half_life_minutes!r}",
         )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")

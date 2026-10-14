@@ -146,8 +146,24 @@ coord_plan = "spread"    # spread | llm | none
 
 - **`multi.enabled = false`** 时回到单角色行为（命中任一角色即放行、只补最近讨论的那一个），
   可逐字节回归验证；
+- **`monitor.enabled = false`**（1.0.14 起）时回到 1.0.13 的判定链路（自我指代扫描 +
+  用户点名/主角粘性），日志里不再出现 `主题跟踪` 行 —— 由 C53 逐条回归；
 - 默认值是 `true`（按需求确认结果），出问题只需把开关关回或把 `scope` 改成配置项之外的值；
-- 版本：**1.0.13**（在 1.0.12 基础上的修订：
+- 版本：**1.0.14**（在 1.0.13 基础上的修订：
+  ① 新增**主题跟踪器** `subject_monitor`（`monitor.py` 的 `track_subject`）—— 按时间正序
+  扫最近 `monitor.window` 条消息（默认 15）逐条演进「当前主题」：改口（先清空再按本条名字
+  设定）→ 本条含 ≥2 个角色表内角色或追加词（多人）→ 本条含 1 个角色 → 自我指代（主题 =
+  本尊身份，强度 0.95）→ 人称代词（主题不变，按粘性重新计时，强度 0.7）→ 普通闲聊
+  （主题与置信度都不变）；bot 消息只跳过。置信度 = 信号强度 × `exp(-Δt /
+  monitor.half_life_minutes)`，低于 `monitor.min_confidence`（默认 0.5）不补。
+  它取代了 1.0.13 里分散的「自我指代扫描 + 用户点名/主角粘性」两处规则，
+  `handler._collect_candidates` 里只保留一条衔接：主题可用 → 以它为准（LLM 的表内结论
+  让位）；主题「不可用」（本尊身份不在角色表 / 取不到身份名 / 代词无先行词）→ 不补且不问
+  LLM；主题为空或置信度不足 → 按既有条件走 LLM 兜底；「换人还是追加不确定」（相邻两条
+  点名消息间隔 < `multi.multi_window_minutes`）→ 仍交 LLM 仲裁；
+  ② 新增 `[monitor]` 配置节（`enabled` / `window` / `min_confidence` /
+  `half_life_minutes`），`monitor.enabled = false` 时**完全退回 1.0.13 行为**（C53 回归）。
+  此前 1.0.13 的修订是
   ① 「本尊」不再一律不补 —— 自我指代命中时先按 `general.true_self` → 框架人格配置
   `personality.nickname` → `alias_names` 取「本尊身份」，在角色表里按「名字 → 别名 → 标签」
   命中就正常注入该角色，没命中或取不到身份名才不补（`handler.resolve_true_self_identity`
@@ -174,7 +190,7 @@ coord_plan = "spread"    # spread | llm | none
 | 脚本 | 覆盖 |
 | --- | --- |
 | `tests/check_import.py` | 真实导入、manifest 字段、api_version 模块存在性、组件声明一致、配置默认值 |
-| `tests/check_logic.py` | 48 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底、主角粘性/用户点名（换人 vs 追加、时效、压过 LLM）、二次一致性检测 warn/fix、改口词「还是」判语境（C42）、引用/媒体块不参与点名（C43）、自我指代不补（C44/C45）、本尊身份注入与回落人格配置（C46~C48） |
+| `tests/check_logic.py` | 53 条用例：natural/tags 模式、多角色、运行时标记、自定义目标表、工具调用路径、动作名缺失兜底、主角粘性/用户点名（换人 vs 追加、时效、压过 LLM）、二次一致性检测 warn/fix、改口词「还是」判语境（C42）、引用/媒体块不参与点名（C43）、自我指代不补（C44/C45）、本尊身份注入与回落人格配置（C46~C48）、主题跟踪（C49 主题切换 / C50 多人同框 / C51 代词回指 / C52 置信度不足不补 / C53 `monitor.enabled=false` 退回 1.0.13） |
 | `tests/check_patch.py` | 框架补丁状态（未打 / 原版 / 修正版）判定 |
 
 ## 6. 测试计划

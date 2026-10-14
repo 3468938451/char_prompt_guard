@@ -26,6 +26,12 @@ C28/C29/C32 这三条守住的是"上文里**非用户点名**的旧角色不得
 没命中或完全取不到身份名才不补（日志会写明原因）。C47/C48 通过 monkeypatch
 替换 ``handler._read_personality_identity`` 来模拟人格配置（不必真的起框架运行时）。
 
+1.0.14 起「这次该画谁」交给**主题跟踪器**（``monitor.track_subject``，C49~C53）：
+按时间正序扫最近 ``monitor.window`` 条消息维护一个「当前主题」，置信度 =
+信号强度 × 时间衰减（``exp(-Δt / half_life)``），低于 ``monitor.min_confidence``
+就不补。C49 主题切换（旧主题 →「本尊」→ 花火）、C50 多人同框、C51 代词回指、
+C52 置信度不足不补、C53 ``monitor.enabled = false`` 完全退回 1.0.13。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -1310,7 +1316,9 @@ async def run_cases() -> int:
             # 模拟"LLM 读了画面描述与上文后给出的结论"：这次要画的是花火
             return CharacterExtraction(
                 characters=[
-                    CharacterEntry(name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)")
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
                 ],
                 multi=False,
             )
@@ -1600,6 +1608,231 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C48 人格 nickname 不在角色表 → 不补（提示加入角色表）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C49 主题跟踪：旧主题 →「本尊」切换 → 花火（1.0.14）───────────────
+    # 窗口里先「画爱莉希雅」（3 小时前）、再「我现在要看本尊」（10 分钟前），触发消息
+    # 只是一句「嗯哼？」。1.0.14 起由主题跟踪器按时间正序演进主题：
+    #     爱莉希雅(3h前) → [本尊:人格配置] → 花火 ← 当前主题（置信度 0.76）
+    # 本尊身份用 monkeypatch 替换 handler._read_personality_identity（等价于框架人格
+    # 配置里 nickname = "花火"），所以日志里应能看到「本尊身份」「角色表命中」与
+    # 「(来源=人格配置)」。断言注入的是**花火**（0.95 × exp(-10/45) ≈ 0.76 ≥ 0.5），
+    # 而不是按粘性补更早的爱莉希雅。
+    try:
+        from .. import handler as handler_module
+
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.true_self = ""  # 留空 → 读人格配置（下面 stub 成「花火」）
+        raw = "室内明亮光线下的半身照，白发少女站在镜头前"
+        history = [
+            history_message("画爱莉希雅", 180.0),  # 3 小时前：旧主题
+            history_message("我现在要看本尊", 10.0),  # 10 分钟前：本尊切换
+        ]
+        original = handler_module._read_personality_identity
+        handler_module._read_personality_identity = lambda: "花火"
+        try:
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("嗯哼？"),
+                        "stream_id": "s-c49",
+                    },
+                )
+        finally:
+            handler_module._read_personality_identity = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and c.startswith(raw)
+            and "主题跟踪" in debugs
+            and "本尊" in debugs
+            and "判定依据=主题跟踪" in debugs
+        )
+        check(
+            "C49 主题跟踪：本尊切换把主题从爱莉希雅换成花火",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C49 主题跟踪：本尊切换把主题从爱莉希雅换成花火",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C50 主题跟踪：一条消息点两名 → 多人同框（1.0.14）─────────────────
+    # 触发消息「我要爱莉希雅和流萤一起」既含 ≥2 个角色表内角色、也含追加词，
+    # 主题 = {爱莉希雅, 流萤}（多人）。natural 模式下两人各追加一段说明，
+    # 所以「画面角色」出现 2 次即证明走的是多人路径（而不是只补了第一个）。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "舞台上的双人合影"
+        with LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": raw},
+                    "message": FakeMessage("我要爱莉希雅和流萤一起"),
+                    "stream_id": "s-c50",
+                },
+            )
+        c = out["args"]["content"]
+        ok = (
+            "爱莉希雅" in c
+            and "流萤" in c
+            and c.count("画面角色") == 2
+            and c.startswith(raw)
+            and "主题跟踪" in logs.debugs()
+        )
+        check(
+            "C50 主题跟踪：一条消息点两名 → 多人补齐两人",
+            ok,
+            f"content = {c!r}\n        日志 = {logs.debugs()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C50 主题跟踪：一条消息点两名 → 多人补齐两人",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C51 主题跟踪：代词回指不改主题（1.0.14）──────────────────────────
+    # 「画花火吧」（10 分钟前）→「她今天穿什么来着？」（9 分钟前）→ 触发「嗯哼？」。
+    # 「她」是人称代词：主题**保持不变**（花火），只是按「粘性」重新计时
+    # （0.7 × exp(-9/45) ≈ 0.57 ≥ 0.5）。既不能被代词清空，也不能猜成别人。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "室内明亮光线下的半身照"
+        history = [
+            history_message("画花火吧", 10.0),
+            history_message("她今天穿什么来着？", 9.0),
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯哼？"),
+                    "stream_id": "s-c51",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and "流萤" not in c
+            and "主题跟踪" in debugs
+            and "代词" in debugs
+        )
+        check(
+            "C51 主题跟踪：代词回指保持主题（补花火）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C51 主题跟踪：代词回指保持主题（补花火）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C52 主题跟踪：置信度不足不补（1.0.14）────────────────────────────
+    # 窗口内唯一的主题信号是 3 小时前那句「画爱莉希雅」，其后没有任何新信号：
+    # 置信度 = 1.0 × exp(-180 / 45) ≈ 0.02 < 0.5 → **不补**（内容一字不改），
+    # 且不得退化成「按粘性补爱莉希雅」。日志要写清是置信度不足挡下来的。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "室内明亮光线下的半身照"
+        history = [history_message("画爱莉希雅", 180.0)]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯哼？"),
+                    "stream_id": "s-c52",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == raw
+            and "爱莉希雅" not in c
+            and "主题跟踪" in debugs
+            and "置信度" in debugs
+            and "判定依据=无(不补)" in debugs
+        )
+        check(
+            "C52 主题跟踪：置信度低于阈值 → 不补（内容不变）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C52 主题跟踪：置信度低于阈值 → 不补（内容不变）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C53 monitor.enabled=false → 完全退回 1.0.13（1.0.14）─────────────
+    # 同一个 C51 场景，把主题跟踪关掉后必须回到旧链路：用户点名(粘性) 补出花火，
+    # 而且日志里**不该**再出现主题跟踪的诊断行 —— 证明是真的退回了旧行为，
+    # 而不是"新逻辑碰巧给出同样结果"。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.monitor.enabled = False
+        raw = "室内明亮光线下的半身照"
+        history = [
+            history_message("画花火吧", 10.0),
+            history_message("她今天穿什么来着？", 9.0),
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯哼？"),
+                    "stream_id": "s-c53",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and "主题跟踪" not in debugs
+            and "判定依据=用户点名" in debugs
+        )
+        check(
+            "C53 monitor.enabled=false → 退回 1.0.13（用户点名/粘性）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C53 monitor.enabled=false → 退回 1.0.13（用户点名/粘性）",
             False,
             f"{type(e).__name__}: {e}",
         )

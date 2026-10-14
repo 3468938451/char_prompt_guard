@@ -344,7 +344,9 @@ _BOT_ROLE_VALUES = frozenset({"bot", "assistant", "model", "system", "ai"})
 
 #: 框架自带的 bot 发送者标记：``messages.person_id`` 对 bot 消息写的就是 ``bot``，
 #: 而适配器解析出的 bot_id 往往是 QQ 号之类，两者格式不同 —— 只比 bot_id 会漏判。
-_BOT_SENDER_MARKERS = frozenset({"bot", "system", "self", "assistant", "机器人", "系统"})
+_BOT_SENDER_MARKERS = frozenset(
+    {"bot", "system", "self", "assistant", "机器人", "系统"}
+)
 
 #: 明确标成用户/成员时的角色取值
 _USER_ROLE_VALUES = frozenset({"user", "human", "member", "customer", "friend"})

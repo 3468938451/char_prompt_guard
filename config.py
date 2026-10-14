@@ -297,7 +297,51 @@ class CharPromptGuardConfig(BaseConfig):
             description="是否注入 system reminder 告知主模型这些标记的用法",
         )
 
+    @config_section("monitor")
+    class MonitorSection(SectionBase):
+        """主题跟踪（``subject_monitor``，1.0.14 起）。"""
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用主题跟踪：按时间正序扫最近 window 条消息，维护一个「当前主题」"
+                "（这次该画谁），并给出置信度。规则依次是：改口（先清空再按本条的名字设定）→ "
+                "本条含 ≥2 个角色表内角色或追加词（多人同框）→ 本条含 1 个角色表内角色 → "
+                "自我指代（主题=本尊身份，取不到或不在角色表则不可用）→ 人称代词（主题不变，"
+                "回指上一个主题；没有先行词则不可用）→ 普通闲聊（主题不变）。"
+                "bot 自己的消息只跳过，既不算点名也不清空主题。"
+                "关闭后**完全退回 1.0.13 行为**（自我指代扫描 + 用户点名/主角粘性），"
+                "可用 tests/check_logic.py 的 C53 回归验证"
+            ),
+        )
+        window: int = Field(
+            default=15,
+            description=(
+                "主题跟踪的窗口大小（消息条数，只扫最近这么多条，上限 40）："
+                "窗口建议 10~20 条 —— 太小会漏掉稍早的主题信号（例如「先说画谁、隔几句才让出图」），"
+                "太大则容易把别的话题里的角色翻出来。默认 15 条"
+            ),
+        )
+        min_confidence: float = Field(
+            default=0.5,
+            description=(
+                "置信度阈值（0~1，越低越激进）：主题的置信度 = 信号强度 × 时间衰减，"
+                "低于阈值就不补（视同「没有信号」，交给 LLM 兜底或什么都不补）—— "
+                "避免把很久以前聊过的角色补进现在的画面。默认 0.5"
+            ),
+        )
+        half_life_minutes: float = Field(
+            default=45.0,
+            description=(
+                "时间衰减的半衰期（分钟）：衰减系数 = exp(-Δt / half_life)，"
+                "Δt 是「设定主题的那条消息」距本次触发消息的分钟数。"
+                "默认 45 分钟 —— 约 31 分钟后信号强度 1.0 的置信度降到 0.5 阈值附近，"
+                "即「半小时内说过的角色」才稳定生效；设 0 表示不随时间衰减"
+            ),
+        )
+
     general: GeneralSection = Field(default_factory=GeneralSection)
     roster: RosterSection = Field(default_factory=RosterSection)
     targets: TargetsSection = Field(default_factory=TargetsSection)
     multi: MultiSection = Field(default_factory=MultiSection)
+    monitor: MonitorSection = Field(default_factory=MonitorSection)
