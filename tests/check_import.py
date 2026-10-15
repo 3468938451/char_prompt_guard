@@ -45,6 +45,7 @@ MODULES = [
     f"{PLUGIN_NAME}.handler",
     f"{PLUGIN_NAME}.monitor",
     f"{PLUGIN_NAME}.plugin",
+    f"{PLUGIN_NAME}.tag_hint",
 ]
 
 # manifest 必需字段（框架缺一个直接拒绝加载）
@@ -162,6 +163,18 @@ def main() -> int:
             "订阅 before_tool_call（agent 聊天器把 Action 当工具调用）",
             "before_tool_call" in events,
         )
+        # 1.0.17：参数说明注入的重试时机（本插件常比生图插件先加载完）。
+        # 老核心没有这个事件时不该算失败 —— 那种情况插件会自动退回「首次生图事件」。
+        from src.core.components.types import EventType as _EventType
+
+        has_all_loaded_event = (
+            getattr(_EventType, "ON_ALL_PLUGIN_LOADED", None) is not None
+        )
+        check(
+            "订阅 on_all_plugin_loaded（参数说明注入的重试时机）",
+            ("on_all_plugin_loaded" in events) or not has_all_loaded_event,
+            "核心未提供该事件" if not has_all_loaded_event else str(events),
+        )
     except Exception as e:  # noqa: BLE001
         check("读取订阅事件", False, f"{type(e).__name__}: {e}")
 
@@ -220,6 +233,12 @@ def main() -> int:
             cfg.monitor.half_life_minutes == 45.0,
             f"monitor.half_life_minutes={cfg.monitor.half_life_minutes!r}",
         )
+        # 1.0.17 新增：把「标签在最前」写进生图动作的**参数说明**
+        check(
+            "1.0.17 默认注入参数说明（tag_first_hint）",
+            cfg.general.tag_first_hint is True,
+            f"tag_first_hint={cfg.general.tag_first_hint!r}",
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
 
@@ -251,6 +270,66 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("reminder 正文可拼装", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.15 参数说明注入（1.0.17）：文案 + 开关语义 ────────────────
+    try:
+        from .. import tag_hint
+        from ..config import CharPromptGuardConfig as HintConfig
+
+        check(
+            "追加句含「标准标签」与转义示例",
+            "标准标签" in tag_hint.HINT_SUFFIX
+            and "Hanabi \\(Honkai: Star Rail\\)" in tag_hint.HINT_SUFFIX
+            and tag_hint.HINT_MARKER in tag_hint.HINT_SUFFIX,
+            f"HINT_SUFFIX = {tag_hint.HINT_SUFFIX!r}",
+        )
+        check(
+            "追加句与原说明用换行分隔（只追加、不覆盖）",
+            tag_hint.HINT_SEPARATOR == "\n",
+        )
+
+        hint_cfg = HintConfig()
+        check(
+            "默认开启参数说明注入",
+            tag_hint.tag_hint_enabled(hint_cfg) is True,
+        )
+        hint_cfg.general.tag_first_hint = False
+        check(
+            "tag_first_hint=false 时不注入",
+            tag_hint.tag_hint_enabled(hint_cfg) is False,
+        )
+        hint_cfg.general.tag_first_hint = True
+        hint_cfg.general.enabled = False
+        check(
+            "general.enabled=false 时同样不注入",
+            tag_hint.tag_hint_enabled(hint_cfg) is False,
+        )
+        hint_cfg.general.enabled = True
+        hint_cfg.targets.enabled = False
+        check(
+            "targets.enabled=false 时同样不注入",
+            tag_hint.tag_hint_enabled(hint_cfg) is False,
+        )
+        check(
+            "配置读不到时按默认（开）处理，且不抛异常",
+            tag_hint.tag_hint_enabled(object()) is True,
+        )
+
+        # 空表/无签名不炸：这是「静默降级」的最小回归
+        empty = tag_hint.inject_tag_first_hint(
+            [], config=HintConfig(), action_getter=lambda _sig: None
+        )
+        check(
+            "没有目标动作时返回「未注入」而不抛异常",
+            empty.ok is False and empty.injected == [],
+            empty.log_line(),
+        )
+        check(
+            "未知结构（plugin 为空的签名）被跳过",
+            tag_hint.target_signature(object()) == "",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("参数说明注入模块可调用", False, f"{type(e).__name__}: {e}")
 
     # ── 5.2 人格配置读取：取不到本尊身份时返回空列表，任何失败都不抛异常 ──
     try:

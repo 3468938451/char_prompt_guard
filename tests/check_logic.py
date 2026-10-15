@@ -38,6 +38,14 @@ C52 置信度不足不补、C53 ``monitor.enabled = false`` 完全退回 1.0.13�
 **强制**问一次 LLM 并按**当前画面描述**判定：LLM 给出角色表内结论就采用（C54），
 LLM 没结论就不补（C55）。两者分别出现在不同消息里时行为不变（最后一条点名生效）。
 
+1.0.17 起多一条**让模型自己写标签**的通道（C56~C59）：把「最前面必须先写角色的
+标准标签」**直接追加进生图动作的参数说明**（``general.tag_first_hint``，纯内存改
+``execute`` 的注解，不写文件）—— 主模型在工具定义里就能看到，比 system reminder
+这种旁白强得多。C56 用假 Action（注解是 PEP 563 字符串，与两个上游生图插件写法
+一致）跑通「原说明保留 + 追加句进入 schema + 类型没被改坏 + schema 缓存被清」；
+C57 关掉开关后说明**一字不改**；C58 空注册表**不抛异常**、返回「未注入」标记；
+C59 连续调用只追加一次（幂等），并且卸载时能把说明**还原**成原文。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -57,7 +65,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Self
+from typing import Annotated, Self
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
@@ -302,6 +310,87 @@ def tags_params(
         "args": args,
         "message": FakeMessage(text),
     }
+
+
+# ── 参数说明注入（1.0.17，C56~C59）用的假动作 ──────────────────────────
+#
+# 假动作**不继承** BaseAction，但 ``to_schema()`` 走框架真正的 schema 生成器
+# （``parse_function_signature``），所以它们是"改注解 → 框架生成参数说明"这条
+# 链路的真实替身；不必起组件运行时，也就能在离线用例里验。
+#
+# 本文件顶部有 ``from __future__ import annotations``，因此下面这些注解在运行时
+# 都是**字符串**（PEP 563），与 nai_artist / image_generator_plugin-neo 的写法
+# 完全一致 —— 覆盖的正是真实环境里最难的那条路径（要靠 get_type_hints 解析）。
+
+#: 假 nai_artist ``share_photo.content`` 的原始说明（Annotated 元数据）
+FAKE_PHOTO_DESC = "原始说明：写画面描述，写给下游翻译模型"
+#: 假 image_generator_plugin-neo ``draw_image.content_description`` 的原始说明
+FAKE_TAGS_DESC = "原始说明：完整正面提示词，按模型的语言与权重规则组织"
+
+
+class _FakeActionBase:
+    """假动作的公共部分：``to_schema()`` 用框架自己的 schema 生成器。"""
+
+    name: str = "fake_action"
+    description: str = "假的生图动作"
+
+    @classmethod
+    def to_schema(cls) -> dict:
+        """对齐 ``BaseAction.to_schema()``（action.py:141）的调用方式。"""
+        from src.core.components.utils.schema_utils import parse_function_signature
+
+        return parse_function_signature(
+            cls.execute, f"action-{cls.name}", cls.description
+        )
+
+
+class _FakePhotoAction(_FakeActionBase):
+    """nai_artist:share_photo 的替身（提示词参数 ``content``）。"""
+
+    name = "share_photo"
+
+    async def execute(
+        self, content: Annotated[str, FAKE_PHOTO_DESC]
+    ) -> tuple[bool, str]:
+        """执行生图并发送。
+
+        Args:
+            content: 自然语言画面描述
+        """
+        return True, content
+
+
+class _FakeTagsAction(_FakeActionBase):
+    """image_generator_plugin-neo:draw_image 的替身（参数 ``content_description``）。"""
+
+    name = "draw_image"
+
+    async def execute(
+        self, content_description: Annotated[str, FAKE_TAGS_DESC]
+    ) -> tuple[bool, str]:
+        """执行画图动作。
+
+        Args:
+            content_description: 完整正面提示词
+        """
+        return True, content_description
+
+
+def param_description(action_cls: type, param: str) -> str:
+    """读一个动作类当前生成的参数说明（走框架的 schema 生成器）。"""
+    return action_cls.to_schema()["function"]["parameters"]["properties"][param][
+        "description"
+    ]
+
+
+def action_getter_for(registry: dict[str, type] | None = None):
+    """造一个假的「动作注册表」：签名 → 假 Action 类（空表 = 什么都没注册）。"""
+    table = dict(registry or {})
+
+    def getter(signature: str):
+        return table.get(signature)
+
+    return getter
 
 
 async def run_cases() -> int:
@@ -1968,6 +2057,212 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C55 拆单但 LLM 无结论 → 不补（内容不变，不回退旧点名）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C56 参数说明注入：原说明保留 + 追加「标签在最前」（1.0.17）────────
+    # 真实的生图插件给 content 写的说明是"写画面描述，写给下游翻译模型"，
+    # 主模型照着写，标准标签就没了。这里验的是注入本身：改的是假动作的注解，
+    # 说明由**框架自己的 schema 生成器**重新生成后必须同时满足：
+    #   · 原文还在、且仍在最前面（只追加，不覆盖）；
+    #   · 追加句进来了；
+    #   · type 等说明以外的字段一字未变（别把第三方动作的 schema 改坏）；
+    #   · ActionManager 的 schema 缓存被清（否则 API 侧还会拿到旧 schema）。
+    # 顺带钉住「注入用的签名/参数名」与 handler 的内置目标表一致。
+    try:
+        from .. import tag_hint
+        from ..handler import _BUILTIN_TARGETS, TargetSpec
+
+        tag_hint.reset_state()
+        spec = TargetSpec(
+            plugin="nai_artist", action="share_photo", prompt_arg="content"
+        )
+        builtin_shape = {
+            tag_hint.target_signature(item): item.prompt_arg
+            for item in _BUILTIN_TARGETS
+        }
+        cleared: list[str] = []
+        before = _FakePhotoAction.to_schema()["function"]["parameters"]["properties"][
+            "content"
+        ]
+        result = tag_hint.inject_tag_first_hint(
+            [spec],
+            config=make_config(),
+            action_getter=action_getter_for(
+                {"nai_artist:action:share_photo": _FakePhotoAction}
+            ),
+            cache_clearer=cleared.append,
+        )
+        after = _FakePhotoAction.to_schema()["function"]["parameters"]["properties"][
+            "content"
+        ]
+        desc = after.get("description", "")
+        ok = (
+            result.ok
+            and result.injected == ["nai_artist:action:share_photo.content"]
+            and builtin_shape
+            == {
+                "nai_artist:action:share_photo": "content",
+                "nai_artist:action:share_drawing": "content",
+                "nai_artist:action:share_visual": "content",
+                "image_generator_plugin-neo:action:draw_image": "content_description",
+            }
+            and FAKE_PHOTO_DESC in desc  # 原说明一字未丢
+            and desc.startswith(FAKE_PHOTO_DESC)  # 且仍在最前面
+            and tag_hint.HINT_MARKER in desc  # 追加句进来了
+            and desc.count("附加要求") == 1
+            and after.get("type") == before.get("type") == "string"  # 类型没被改坏
+            and cleared == ["nai_artist:action:share_photo"]  # schema 缓存被清
+        )
+        check(
+            "C56 注入参数说明：原说明保留 + 追加「标准标签在最前」",
+            ok,
+            f"description = {desc!r}\n"
+            f"        类型 before/after = {before.get('type')!r}/{after.get('type')!r}\n"
+            f"        清理缓存 = {cleared!r}\n"
+            f"        结果 = {result.log_line()}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C56 注入参数说明：原说明保留 + 追加「标准标签在最前」",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C57 tag_first_hint=False → 一个字节都不改（1.0.17）───────────────
+    # 关掉开关时**完全不碰**第三方动作：说明仍等于原始字符串，缓存也不清。
+    # 用另一个假动作（neo 的 draw_image / content_description），
+    # 免得受 C56 已经改过的那个类影响。
+    try:
+        from .. import tag_hint
+        from ..handler import TargetSpec
+
+        tag_hint.reset_state()
+        spec = TargetSpec(
+            plugin="image_generator_plugin-neo",
+            action="draw_image",
+            prompt_arg="content_description",
+        )
+        cfg = make_config()
+        cfg.general.tag_first_hint = False
+        getter = action_getter_for(
+            {"image_generator_plugin-neo:action:draw_image": _FakeTagsAction}
+        )
+        cleared: list[str] = []
+        before = param_description(_FakeTagsAction, "content_description")
+        result = tag_hint.inject_tag_first_hint(
+            [spec], config=cfg, action_getter=getter, cache_clearer=cleared.append
+        )
+        after = param_description(_FakeTagsAction, "content_description")
+        ok = (
+            result.enabled is False
+            and result.ok is False
+            and result.injected == []
+            and before == FAKE_TAGS_DESC
+            and after == FAKE_TAGS_DESC  # 等于原始字符串，不是"看起来没变"
+            and tag_hint.HINT_MARKER not in after
+            and cleared == []
+        )
+        check(
+            "C57 tag_first_hint=false 时参数说明完全未被修改",
+            ok,
+            f"before = {before!r}\n        after  = {after!r}\n"
+            f"        结果 = {result.log_line()}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C57 tag_first_hint=false 时参数说明完全未被修改",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C58 找不到目标动作（空注册表）→ 不抛异常、返回「未注入」（1.0.17）──
+    # 插件通常比生图插件先加载完，那一刻注册表里什么都没有。这条路径必须
+    # 静默降级：既不抛异常，也不谎报注入成功，只把签名记进 unavailable。
+    try:
+        from .. import tag_hint
+        from ..handler import _BUILTIN_TARGETS
+
+        tag_hint.reset_state()
+        cleared: list[str] = []
+        result = tag_hint.inject_tag_first_hint(
+            _BUILTIN_TARGETS,
+            config=make_config(),
+            action_getter=action_getter_for(),  # 空注册表
+            cache_clearer=cleared.append,
+        )
+        ok = (
+            result.ok is False
+            and result.injected == []
+            and result.enabled is True
+            and result.unavailable
+            == [
+                "nai_artist:action:share_photo",
+                "nai_artist:action:share_drawing",
+                "nai_artist:action:share_visual",
+                "image_generator_plugin-neo:action:draw_image",
+            ]
+            and cleared == []
+        )
+        check(
+            "C58 目标动作未注册时静默降级（不抛异常、返回未注入）",
+            ok,
+            f"结果 = {result.log_line()}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C58 目标动作未注册时静默降级（不抛异常、返回未注入）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C59 注入幂等 + 卸载可还原（1.0.17）─────────────────────────────
+    # 加载时试一次、事件里又试一次，不能出现两句「附加要求」；
+    # 插件卸载时把参数说明还原回原文（内存改动不该在卸载后继续生效）。
+    # 用的假动作与 C57 同一个，而 C57 开关是关的、没改过它，所以起点是原文。
+    try:
+        from .. import tag_hint
+        from ..handler import TargetSpec
+
+        tag_hint.reset_state()
+        spec = TargetSpec(
+            plugin="image_generator_plugin-neo",
+            action="draw_image",
+            prompt_arg="content_description",
+        )
+        getter = action_getter_for(
+            {"image_generator_plugin-neo:action:draw_image": _FakeTagsAction}
+        )
+        cfg = make_config()
+        first = tag_hint.inject_tag_first_hint([spec], config=cfg, action_getter=getter)
+        once = param_description(_FakeTagsAction, "content_description")
+        second = tag_hint.inject_tag_first_hint(
+            [spec], config=cfg, action_getter=getter
+        )
+        twice = param_description(_FakeTagsAction, "content_description")
+        restored = tag_hint.restore_tag_first_hint(action_getter=getter)
+        after_restore = param_description(_FakeTagsAction, "content_description")
+        key = "image_generator_plugin-neo:action:draw_image.content_description"
+        ok = (
+            first.injected == [key]
+            and once.count("附加要求") == 1
+            and second.injected == []
+            and second.already == [key]  # 第二次识别为"已注入过"
+            and twice == once  # 连续两次调用，说明一模一样（只追加一次）
+            and restored == [key]
+            and after_restore == FAKE_TAGS_DESC  # 卸载后回到原文
+        )
+        check(
+            "C59 注入幂等（只追加一次）且卸载可还原",
+            ok,
+            f"一次后 = {once!r}\n        二次后 = {twice!r}\n"
+            f"        还原后 = {after_restore!r}\n"
+            f"        还原列表 = {restored!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C59 注入幂等（只追加一次）且卸载可还原",
             False,
             f"{type(e).__name__}: {e}",
         )

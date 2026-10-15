@@ -140,6 +140,24 @@ class CharPromptGuardConfig(BaseConfig):
                 "关闭后 reminder 只保留标记说明（#multi# / #nochar# 等）"
             ),
         )
+        tag_first_hint: bool = Field(
+            default=True,
+            description=(
+                "是否在生图动作的参数说明里追加「最前面必须先写角色标准标签」这一句"
+                "（1.0.17 起，纯内存改动、不写文件）：调用生图动作时，提示词参数"
+                "（content / content_description）的说明末尾会多一条附加要求 —— "
+                "最前面先写角色表第 4 列的标准标签（如 Hanabi \\(honkai: star rail\\)），"
+                "然后再写画面描述；角色表未提供标签时写「角色名（游戏名）」。"
+                "与 notify_tag_rule 的区别：那条是 system reminder（旁白），"
+                "这一条直接写进工具定义里的参数说明，主模型生成参数时第一眼就能看到，"
+                "是让标准标签稳定出现在提示词最前面的主要通道。"
+                "只作用于内置目标动作（share_photo / share_drawing / share_visual / "
+                "draw_image）的提示词参数；找不到动作、结构不认识时静默跳过，"
+                "绝不影响生图。关闭后完全不改动第三方动作的参数说明"
+                "（reminder 不受影响，仍由 notify_tag_rule 控制）；"
+                "general.enabled = false 或 targets.enabled = false 时同样不注入"
+            ),
+        )
 
     @config_section("roster")
     class RosterSection(SectionBase):

@@ -29,6 +29,14 @@
 
 对 args 的修改会被 ActionManager 回写并替换实际传给 Action 的参数，
 因此补全发生在生图与提示词翻译之前。
+
+**1.0.17 的第二个通道（参数说明注入，与本文件的判定链无关）**：主模型之所以不写
+标准标签，是因为 nai_artist 给 ``content`` 写的参数说明本身就是「写画面描述，写给
+下游翻译模型」—— 它照着说明写，标签自然没有。1.0.17 起
+:mod:`tag_hint` 会把「最前面必须先写角色的标准标签」**直接追加进动作参数说明**
+（纯内存改注解），让主模型在工具定义里就看到这条要求。本文件只负责提供两个
+「再试一次」的时机：``on_all_plugin_loaded``（本插件常比生图插件先加载完）与首次
+生图事件；注入逻辑、一次性标志位、失败降级全在 :mod:`tag_hint`，**判定链一行未改**。
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ from src.app.plugin_system.base import BaseEventHandler
 from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
+from . import tag_hint
 from .character import (
     BASIS_USER_NAMED,
     CharacterEntry,
@@ -119,6 +128,25 @@ _TOOL_CALL_EVENT = getattr(EventType, "BEFORE_TOOL_CALL", None)
 _SUBSCRIBE_EVENTS: list[EventType | str] = [EventType.BEFORE_ACTION_CALL]
 if _TOOL_CALL_EVENT is not None:
     _SUBSCRIBE_EVENTS.append(_TOOL_CALL_EVENT)
+
+# 「全部插件加载完成」（1.0.17）：只用来做一次「参数说明注入」的重试。
+#
+# 插件加载顺序由 ``loader.PluginLoader.resolve_load_order``（Kahn 拓扑 + 字典序）
+# 决定，本插件的 ``dependencies`` 是空的，于是通常排在
+# ``image_generator_plugin-neo`` / ``nai_artist`` **前面** —— 也就是说
+# ``on_plugin_loaded`` 执行时，要改的那些动作**还没注册**。这个事件在所有插件
+# 都加载完之后发布（``src/app/runtime/bot.py:809``），是重新注入的最佳时机；
+# 核心若没有这个事件（老版本），自动退回「首次生图事件」再试一次。
+_ALL_PLUGIN_LOADED_EVENT = getattr(EventType, "ON_ALL_PLUGIN_LOADED", None)
+if _ALL_PLUGIN_LOADED_EVENT is not None:
+    _SUBSCRIBE_EVENTS.append(_ALL_PLUGIN_LOADED_EVENT)
+
+
+def _event_value(event: Any) -> str:
+    """事件名归一化：``EventType`` 与裸字符串都能比（事件总线传的是裸字符串）。"""
+    value = getattr(event, "value", None)
+    return value if isinstance(value, str) else str(event)
+
 
 #: 工具名相对 Action 名多出来的前缀（``action-share_photo`` → ``share_photo``）
 _TOOL_NAME_PREFIX = "action-"
@@ -720,9 +748,36 @@ class CharacterGuardHandler(BaseEventHandler):
     async def execute(
         self, event_name: str, params: dict[str, Any]
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """处理 before_action_call 事件。"""
+        """处理 before_action_call / before_tool_call 事件。
+
+        另外订阅了「全部插件加载完成」（1.0.17），只借用那个时机做一次参数说明注入
+        重试：本插件 dependencies 为空，拓扑排序下常排在生图插件前面，加载时目标
+        动作可能还没注册（详见 handler 模块顶部对注入时机的说明）。
+        """
         config = self._config()
         if not config.general.enabled or not config.targets.enabled:
+            return EventDecision.SUCCESS, params
+
+        # 1.0.17：把「标签写在最前面」追加进生图动作的**参数说明**（纯内存改动）。
+        # 插件加载时（on_plugin_loaded）已经试过一次；本插件 dependencies 为空，
+        # 拓扑排序（Kahn + 名称字典序）下通常排在 nai_artist /
+        # image_generator_plugin-neo **前面**，那一次多半"目标动作还没注册"。
+        # 所以这里再给一次重试机会（先到者触发）：
+        #   · on_all_plugin_loaded（全部插件加载完成，动作一定已注册）—— 正常就是它；
+        #   · 首个事件 —— 兜底（核心不发上面那个事件时）。
+        # 一次性标志位在 tag_hint 内部：跑过一次之后每次事件都是常数级空操作；
+        # **与下面的判定链完全无关**，所以再加一层 try/except 兜底 ——
+        # 这里任何失败都只记 DEBUG，绝不拦住生图。
+        try:
+            tag_hint.maybe_inject_on_event(_BUILTIN_TARGETS, config=config)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                f"注入参数说明失败（已忽略，不影响生图）: {type(e).__name__}: {e}"
+            )
+
+        if _event_value(event_name) == _event_value(_ALL_PLUGIN_LOADED_EVENT):
+            # 生命周期事件：只借用这个时机做上面的注入重试。判定链只对生图事件
+            # 有意义（这个事件的 params 里没有 args / signature），直接放行。
             return EventDecision.SUCCESS, params
 
         targets = _cached_parse(config.targets.list, _targets_cache, parse_targets)

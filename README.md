@@ -24,7 +24,7 @@
 
 > 补丁做两件事：① 在 agent 聊天器的工具调用路径上**补发执行前事件**；② 事件里带上 `stream_id`、并按新版 `name` 解析动作名。框架升级（`git pull`）会覆盖它，需要**重新打一次**。
 
-> 文档版本：1.0.16 · 作者：思源（siyuan）· 许可：MIT
+> 文档版本：1.0.17 · 作者：思源（siyuan）· 许可：MIT
 > 同时适配 **nai_artist** 与 **image_generator_plugin-neo** 两个生图插件。
 > 本插件由 **AI 辅助编写**（作者审阅与整合）：缺陷、遗漏或无意残留的第三方内容请见
 > [AI_USAGE.md](./AI_USAGE.md)（无担保 / 责任限制 / 第三方内容通知即处理 / 反馈渠道）。
@@ -249,7 +249,7 @@ enabled = false
 
 | # | 改动 | 说明 |
 | --- | --- | --- |
-| ① | **提醒主模型写标准标签** | 插件加载时的 system reminder 里追加一条硬规则：调用生图动作（`share_photo` / `share_drawing` / `draw_image`）时，提示词参数（`content` / `content_description`）**最前面必须先写角色的标准标签**（角色表第 4 列，如 `Hanabi \(honkai: star rail\)`），然后再写画面描述；角色表没提供标签时写「角色名（游戏名）」。`general.notify_tag_rule = false` 可关掉，只保留原有的标记说明（`#multi#` / `#nochar#` 等） |
+| ① | **提醒主模型写标准标签** | 插件加载时的 system reminder 里追加一条硬规则：调用生图动作（`share_photo` / `share_drawing` / `draw_image`）时，提示词参数（`content` / `content_description`）**最前面必须先写角色的标准标签**（角色表第 4 列，如 `Hanabi \(honkai: star rail\)`），然后再写画面描述；角色表没提供标签时写「角色名（游戏名）」。`general.notify_tag_rule = false` 可关掉，只保留原有的标记说明（`#multi#` / `#nochar#` 等）。**1.0.17 起同一条要求还会被直接写进生图动作的参数说明**（`general.tag_first_hint`）—— 那条通道强得多，见下文[两条通道](#让模型把标准标签写在最前面两条通道1017-起) |
 | ② | **「还是」判语境 + 剥引用块** | `算了 / 不是 / 换 / 改成` 行为不变；`还是` **只有处于改口语境**才算改口 —— 它前面 20 字内出现 `算了 / 不要 / 别 / 不画 / 不拍 / 改 / 换`，或形如「还是（画/要/来/看/拍/换）…吧」。**「是 A 还是 B？」这类选择疑问句不再算改口**，判定退回「不确定 → 交 LLM 仲裁」。同时在点名识别之前，先剥掉 `[回复…]`、`[图片(…)]`、`[视频(…)]`、`[语音(…)]`、`[表情(…)]` 这类中括号块（嵌套时按最外层整块剥）—— 块里是别人说的话或媒体占位，不算用户本次的点名 |
 | ③ | **自我指代宁可不补** | 出现 `本尊 / 你本人 / 你自己 / 真正的你 / 真身 / 脱壳 / 摘壳 / 卸壳 / 本体`，且画面描述里**没有**角色表内角色时，判定为**不补**，DEBUG 日志为 `判定依据=无(不补)（检测到自我指代，本尊由调用方设定，插件不猜）`。检查范围是「**画面描述 + 触发消息 + 触发之前最近 N 条用户消息**」（N = `min(multi.recent_messages, 4)`）—— 「本尊是谁」只存在于聊天器的人设里，插件看不到，按主角粘性沿用旧点名会补错人。`general.skip_on_self_reference = false` 可关掉；**普通「想看看你～」不受影响**，仍按 1.0.11 的粘性行为补角色。**1.0.13 起**「本尊是谁」有了显式来源（`general.true_self` → 人格配置 `personality.nickname`），命中角色表就正常补入该角色，见下文「本尊/自我指代怎么定」。**1.0.14 起**这条规则由主题跟踪统一实现（自我指代词 → 主题 = 本尊身份，强度 0.95，不可用时直接不补），见上文「主题跟踪」 |
 
@@ -266,6 +266,52 @@ enabled = false
 1.0.12 起：引用块先被剥掉、疑问句里的「还是」也不算改口（②），
 焦点范围内的自我指代让插件保守地什么都不补（③），画面交给调用方自己写的描述。
 1.0.13 起③不再"一律不补"：只要能把「本尊」定位到角色表里的角色，就正常补入（见下节）。
+
+### 让模型把标准标签写在最前面：两条通道（1.0.17 起）
+
+真实事故：调用方（KFC）明明知道「标签 `Hanabi` 要挂最前头」，实际写给 `share_photo`
+的 `content` 却只有中文外观描述（`清晨…白发少女刚起床…粉色眼睛…`）—— 因为 nai_artist
+给 `content` 写的参数说明本身就是「写画面描述，写给下游翻译模型」，主模型照着说明写，
+标签就没了。插件只好靠推断（主题跟踪 / 拆单 / LLM）补，偶发补错。
+
+所以插件用**两条互相独立**的通道让主模型自己就把标签写上；两条都关掉时，判定链
+（描述点名 > 主题跟踪 > LLM 仲裁 > 不补）仍然照常工作 —— **插件始终是软约束，
+判定链保留为兜底**：
+
+| 通道 | 配置 | 默认 | 作用位置 | 强度 |
+| --- | --- | --- | --- | --- |
+| ① system reminder | `general.notify_tag_rule` | `true` | 注入 `actor` bucket 的一条提醒（相当于旁白） | 弱：只是"顺带提一句"，压不过工具定义里逐字的参数说明 |
+| ② **参数说明注入** | `general.tag_first_hint` | `true` | **直接改生图动作提示词参数的说明文本**（内存内改 `execute` 的注解，不写文件） | 强：主模型在工具定义里第一眼就看到这条要求，生成参数时就照着写 |
+
+②具体做了什么（以 nai_artist 的 `content` 为例）：参数说明末尾会多出一句
+
+> 附加要求：本参数最前面必须先写角色的标准标签（例如 `Hanabi \(Honkai: Star Rail\)`），
+> 然后才是画面描述；若角色表未提供标签，则写「角色名（游戏名）」。
+
+原说明**一字不改**（追加句接在换行之后），参数类型也不动 —— 注入后插件会用框架自己的
+schema 生成器自检一次「说明是不是新的 + `type`/`enum`/`default` 是不是一字未变」，
+任一条不满足就**还原**并记 WARNING。目标只有**内置目标动作的提示词参数**：
+`share_photo` / `share_drawing` / `share_visual` 的 `content`、`draw_image` 的
+`content_description`。
+
+几个要点：
+
+- **时机**：插件加载时（`on_plugin_loaded`）先试一次。本插件的 `dependencies` 是空的，
+  拓扑排序（Kahn + 名称字典序）下**通常排在生图插件前面**，那一次多半"目标动作还没注册"，
+  于是再给一次重试机会，由**先到者**触发 —— `on_all_plugin_loaded`（全部插件加载完成，
+  动作一定已注册，正常情况就是它）或首个事件（兜底：核心没有上面那个事件时）。
+  一次性标志位保证最多两轮，之后每次事件都是常数级空操作；
+- **幂等**：说明里已经有这句时直接跳过，反复触发、热重载都不会出现两句「附加要求」；
+- **可撤销**：插件卸载时把改过的说明还原成原文。全程纯内存改动，进程重启也会恢复；
+- **静默降级**：找不到动作、结构不认识、注解解析不了、自检不通过……一律只打
+  DEBUG/WARNING 并继续，**绝不拦住插件加载或生图**（日志里能看到
+  `目标动作 … 尚未注册，本次跳过参数说明注入` 这类说明）；
+- **怎么关**：`tag_first_hint = false` 就完全不碰第三方动作的参数说明
+  （`notify_tag_rule` 不受影响）；`general.enabled = false` 或
+  `targets.enabled = false` 时同样不注入。想两条通道一起关，把两个开关都设 `false`；
+- **只覆盖内置目标**：`[targets] list` 里自己加的第三方动作**不会**被注入参数说明
+  （那是给"非内置生图插件"用的接管配置），reminder 里的规则仍然适用；
+- **成功日志**：`已为 nai_artist:action:share_photo 的参数说明追加「标签在最前」提示（参数 content）`。
 
 ### 本尊/自我指代怎么定（`general.true_self`，1.0.13 起）
 
@@ -325,7 +371,7 @@ true_self = "花火"   # 留空则自动读框架人格配置的 personality.nic
 ## 安装
 
 1. 安装至少一个受支持的生图插件（nai_artist 或 image_generator_plugin-neo）；
-2. 将本插件目录（或 `char_prompt_guard-1.0.16.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
+2. 将本插件目录（或 `char_prompt_guard-1.0.17.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
 3. 重启 bot，插件会自动生成默认配置：`config/plugins/char_prompt_guard/config.toml`。
 
 ## 配置说明
@@ -344,6 +390,7 @@ consistency_check = "warn"  # 二次一致性检测：off / warn（默认，只�
 skip_on_self_reference = true  # 自我指代（本尊/你本人/你自己/…）且描述里没有角色表内角色时不补
 true_self = ""            # 「本尊」对应的角色（角色表里的名字或别名）；留空自动读人格配置 personality.nickname
 notify_tag_rule = true    # 在 system reminder 里要求主模型把角色标准标签写在生图参数最前面
+tag_first_hint = true     # 1.0.17：把同一句要求直接追加进生图动作的「参数说明」（纯内存改动）
 translate_model = ""      # 提取用模型名（留空用 UTILS_SMALL）
 llm_timeout = 20.0        # LLM 提取超时秒数（0=不限时；防模型挂起卡住生图）
 append_format = "（画面角色：“{name}”，出自游戏《{game}》）"
@@ -488,7 +535,7 @@ nai_artist:action:share_drawing | content | natural ; image_generator_plugin-neo
 | `#tags#` | 强制把角色标签直接追加进提示词 |
 | `#nochar#` | 本次完全不要自动补角色 |
 
-为了让主模型知道这些标记可用，插件加载时会向 `actor` bucket 注入一条简短的 system reminder（`notify_bot = false` 可关闭）。它**不会**改变主模型写画面的习惯，只是提供了"需要时能显式控制"的手段。1.0.12 起这条 reminder 还会追加一条硬规则：生图参数（`content` / `content_description`）**最前面先写角色的标准标签**，再写画面描述（`notify_tag_rule = false` 可关掉这条，只保留标记说明）。
+为了让主模型知道这些标记可用，插件加载时会向 `actor` bucket 注入一条简短的 system reminder（`notify_bot = false` 可关闭）。它**不会**改变主模型写画面的习惯，只是提供了"需要时能显式控制"的手段。1.0.12 起这条 reminder 还会追加一条硬规则：生图参数（`content` / `content_description`）**最前面先写角色的标准标签**，再写画面描述（`notify_tag_rule = false` 可关掉这条，只保留标记说明）。1.0.17 起同一条要求还会被**直接追加进生图动作的参数说明**（`general.tag_first_hint`，默认开）—— 主模型在工具定义里就能看到，比 reminder 有效得多；两条通道的对比见上文[「让模型把标准标签写在最前面：两条通道」](#让模型把标准标签写在最前面两条通道1017-起)。
 
 如果想完全不做多人判断，把 `decide` 改成 `latest`（总是只补最近点名的那个）或
 `always_multi`（总是多人）；旧字段 `decision` 的 `off`（总是单人）/ `always`（总是多人）也仍然有效。
@@ -594,7 +641,7 @@ python tests\check_privacy.py
 也就是说：在 agent 聊天器下插件收不到任何通知，表现是「装上去毫无反应、日志里连一条记录都没有」。
 **这不是插件坏了，是钩子没来。** 解决办法是打框架补丁：
 
-> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.16.mfp` / 插件目录只含插件自身；
+> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.17.mfp` / 插件目录只含插件自身；
 > 补丁属于框架侧改动，随**交付包**的 `framework-patch/` 目录单独提供，请先把它拷到本机（例如
 > 放到框架根旁边的任意位置），再执行下面命令；路径按你实际存放位置替换。
 
@@ -652,6 +699,10 @@ git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch
   唯一命中；**有歧义（多个目标同参数名）时宁可不处理**，避免误改别的动作。
 - **加载时打一条能力自检日志**（见上）：核心缺 `before_tool_call` 时直接 WARNING 提示，
   不用再靠猜。
+- **参数说明注入全走公开 API**（1.0.17）：取动作优先用
+  `action_api.get_action_class`（拿不到再退回组件注册表），清 schema 缓存用
+  `action_api.clear_schema_cache`；框架没提供这些入口时静默降级、只打 DEBUG，
+  不会因为上游改版把插件加载搞失败。
 
 ### `min_core_version` 说明
 

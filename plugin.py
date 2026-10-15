@@ -6,6 +6,11 @@
 同时把「角色补全已开启 + 可用的运行时标记 + 生图参数的标签书写规则」以
 system reminder 的形式告知主模型，让它可以按需决定本次要单人还是多人、
 用哪种注入方式，并把角色标准标签写在提示词最前面。
+
+1.0.17 起再加一条**更强的**通道：插件加载时（以及「全部插件加载完成」/首次生图
+事件时各重试一次）把同一句「最前面必须先写角色的标准标签」**直接追加进生图动作
+的参数说明**（``general.tag_first_hint``，纯内存改动）—— 主模型在工具定义里就能
+看到这条要求，比 system reminder 这种"旁白"有效得多。逻辑都在 :mod:`tag_hint`。
 """
 
 from __future__ import annotations
@@ -15,8 +20,9 @@ from typing import Any, ClassVar
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
+from . import tag_hint
 from .config import CharPromptGuardConfig
-from .handler import CharacterGuardHandler
+from .handler import _BUILTIN_TARGETS, CharacterGuardHandler
 
 logger = get_logger("char_prompt_guard")
 
@@ -81,7 +87,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.16"
+    plugin_version: str = "1.0.17"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。
@@ -127,6 +133,17 @@ class CharPromptGuardPlugin(BasePlugin):
 
         self._log_runtime_capability()
 
+        # 1.0.17：把「标签写在最前面」直接追加进生图动作的**参数说明**（纯内存改动，
+        # 不写文件）。这是比 reminder 强得多的通道，所以放在 reminder 之前、且不受
+        # multi.notify_bot 影响 —— 两条通道互相独立，各有各的开关
+        # （tag_first_hint / notify_tag_rule）。
+        #
+        # 本插件 dependencies 为空，拓扑排序通常把它排在 nai_artist /
+        # image_generator_plugin-neo **前面**，所以这一次多半会因为「目标动作还没注册」
+        # 而空手而归；那种情况下 handler 会在「全部插件加载完成」或首次生图事件时
+        # 再试一次（见 tag_hint.maybe_inject_on_event）。这里失败只记 DEBUG，不报错。
+        tag_hint.inject_on_load(_BUILTIN_TARGETS, config=config)
+
         if not config.general.enabled or not config.multi.notify_bot:
             logger.debug("char_prompt_guard 未注入标记说明 reminder")
             return
@@ -147,13 +164,21 @@ class CharPromptGuardPlugin(BasePlugin):
             logger.warning(f"注册 system reminder 失败: {e}")
 
     async def on_plugin_unloaded(self) -> None:
-        """插件卸载时移除 reminder。
+        """插件卸载时移除 reminder，并把改过的参数说明还原。
 
         注意：``prompt_api`` 目前只提供 reminder 的 ``add`` / ``get``，
         **没有 bucket 级删除接口**（只有 stream 级有 ``delete_stream_reminder``），
         所以这里只能直接走底层的 SystemReminderStore；等上游补上 API 再换回
         prompt_api。store 是纯内存单例，进程重启即清空。
+
+        1.0.17 起参数说明也是内存内改动，同样在卸载时还原（``tag_hint`` 只记
+        「改过哪几个参数 + 原说明」），尽力而为、失败只记 DEBUG。
         """
+        try:
+            tag_hint.restore_tag_first_hint()
+        except Exception as e:  # noqa: BLE001 —— 还原失败不该打断卸载流程
+            logger.debug(f"还原生图动作的参数说明失败: {e}")
+
         try:
             from src.core.prompt import get_system_reminder_store
 
