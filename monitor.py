@@ -19,6 +19,10 @@
   （``monitor.min_confidence`` 这条闸门就是为它设的，见 tests C52）；
 - **拿不准就不补**：本尊身份不在角色表、代词没有先行词、置信度不足 —— 一律不补，
   绝不用「粘性」把更早的旧角色捡回来；
+- **同一条消息里的「本尊 + 角色名」＝拆单（1.0.16）**：调用方常把一单拆成两张图
+  （「本尊看看，然后穿着爱莉来看看～」＝先画本尊、再画壳），这一轮既不能按角色名
+  定主题、也不能按本尊身份定主题，只标记「不可单独确定」并交下游按**当前画面
+  描述**由 LLM 判定；
 - **不做外观识别**：不从「白发 / 粉眼 / 和服」这类画面关键词反推角色。
 
 状态机（窗口内按时间正序逐条演进，初态 ``subject = 无``）：
@@ -30,6 +34,11 @@
 改口语境的「还是」）                          （信号强度 1.0）
 含 ≥2 个角色表内角色，或含追加词              ``subject = 这些人``（多人；追加词会与
 （``ADDITIVE_WORDS``：还有/一起/俩/都/加上…）  现有主题合并）
+**同一条**消息里既有自我指代词、又有角色      **拆单（一单多件，1.0.16 起）**：
+表内角色                                     主题保持「不可单独确定」—— 既不是那个
+                                            角色名、也不是本尊身份 → ``status = "split"``，
+                                            交下游按**当前画面描述**由 LLM 判定；
+                                            判定不出（LLM 空/失败/超时）就不补
 含 1 个角色表内角色                          ``subject = 该角色``（信号强度 1.0）
 含自我指代词（``SELF_REFERENCE_WORDS``）      ``subject = 本尊身份``（强度 0.95）；
                                             解析不到 / 不在角色表 → **不可用**
@@ -190,14 +199,16 @@ class SubjectTrack:
         confidence: 当前主题的置信度 = 信号强度 × 时间衰减
         trace: 演进轨迹（进 DEBUG 日志），形如
             ``爱莉希雅(3h前) → [本尊:人格配置] → 花火``
-        status: ``ok`` / ``low_confidence`` / ``unavailable`` / ``empty``
+        status: ``ok`` / ``low_confidence`` / ``unavailable`` / ``empty`` /
+            ``split``（1.0.16 起：同一条消息里既有自我指代又有角色表内角色 →
+            一单多件，「当前主题」不可单独确定，交下游按当前画面描述判定）
         reason: 不可用或不补的**具体**原因（进判定依据，用户要能一眼看出该改什么）
         basis: 完整的判定依据文案（形如 ``判定依据=主题跟踪:...（置信度 0.76）``）
         ambiguous: 是否「换人还是追加不确定」（相邻两条点名消息间隔 <
             ``multi.multi_window_minutes``，且本条没有追加/改口标记）——
             为真时交 LLM 仲裁（沿用 1.0.10 起的既有语义）
         signal_kind: 最近一次信号类型（``named`` / ``multi`` / ``additive`` /
-            ``corrective`` / ``self`` / ``pronoun``）
+            ``corrective`` / ``self`` / ``pronoun`` / ``split``）
         signal_label: 最近一次信号的可读描述（进判定依据）
         signal_stamp: 最近一次信号那条消息的时间戳
         self_source: 本尊身份来源（``配置`` / ``人格配置``）
@@ -234,6 +245,16 @@ class SubjectTrack:
         """是否属于「不可用」：本尊身份不在角色表 / 取不到身份名 / 代词无先行词。"""
         return self.status == "unavailable"
 
+    @property
+    def split(self) -> bool:
+        """是否属于「拆单」（1.0.16）：同一条消息里既有自我指代又有角色表内角色。
+
+        调用方把一单拆成多张图（先本尊、再壳）时，这一轮的主题**不可单独确定** ——
+        既不能按那个角色名补（1.0.15 的事故），也不能按本尊身份补。下游应改问
+        LLM 按**当前画面描述**判定（见 ``handler._collect_candidates`` 的拆单分支）。
+        """
+        return self.status == "split"
+
     def subject_names(self) -> str:
         """当前主题的角色名列表。"""
         return _names(self.entries)
@@ -244,7 +265,9 @@ class SubjectTrack:
         可用的主题按 ``single`` / ``multi`` 返回（沿用 ``multi.decide="bot"`` 的
         现有语义）；「换人还是追加不确定」返回 ``uncertain``（与 1.0.13 完全一致，
         确保 ``_resolve_multi`` 不会被误判成多人）；其余一律 ``none`` —— 由主题跟踪
-        自己的 :attr:`basis` 说明为什么没补。
+        自己的 :attr:`basis` 说明为什么没补。**拆单**（1.0.16）也走 ``none``：
+        主题不可单独确定，是否补入由下游按当前画面描述问 LLM 决定，而不是由这里
+        给出候选人（见 ``handler._collect_candidates`` 的拆单分支）。
         """
         if self.usable:
             if self.ambiguous:
@@ -276,6 +299,11 @@ class SubjectTrack:
                 tail += "；换人还是追加不确定，交 LLM 仲裁"
         elif self.unavailable:
             tail = f"← 不可用（{self.reason}）"
+        elif self.split:
+            tail = (
+                "← 不可单独确定（拆单：一单多件，按当前画面描述交 LLM 判定；"
+                "判定不出就不补）"
+            )
         elif self.entries:
             tail = (
                 f"← 置信度 {self.confidence:.2f} 低于阈值 {self.min_confidence:g}，不补"
@@ -344,6 +372,12 @@ def track_subject(
     attributed = True
     unavailable_reason = ""
     ambiguous = False
+    #: 拆单（1.0.16）：最近一次「同一条消息里既有自我指代又有角色名」的那条
+    #: （存自我指代词与角色名，供 trace / 判定依据文案用）。它是**可以被打断**的
+    #: 状态：之后任何一条能定主题的消息（改口 / 点名 / 多人 / 本尊身份）都会把它
+    #: 清掉 —— 与「最后一条点名生效」的既有口径一致。
+    split_word = ""
+    split_names = ""
     last_named_stamp: float | None = None
     trace_parts: list[str] = []
     user_count = 0
@@ -376,6 +410,9 @@ def track_subject(
             current = []
             unavailable_reason = ""
             ambiguous = False
+            # 改口是「重新指定」，旧的一单多件标记一并作废（最后一条消息生效）
+            split_word = ""
+            split_names = ""
             trace_parts.append("[改口]")
             if chars:
                 current = list(chars)
@@ -393,8 +430,40 @@ def track_subject(
                 signal_label = "改口（本条没有新名字）"
             continue
 
+        # ①.5 拆单（1.0.16）：**同一条**消息里既有自我指代词、又有角色表内角色。
+        # 典型是调用方把一单拆成两张图 —— 用户「本尊看看，然后穿着爱莉来看看～」
+        # 是一单两件（先看本尊、再看壳），当前这张要画的是哪一件只有**画面描述**
+        # 说得清，对话上文里两者权重相同。
+        # 所以这里既不能按那个角色名定主题（1.0.15 的事故：整条消息被
+        # 「用户点名→爱莉希雅」吃掉，把 LLM 按画面认出的「花火」压掉了），也不能
+        # 按本尊身份定主题 —— 只标记「拆单/不可单独确定」，交下游按当前画面判定。
+        # **只在同一条消息内成立**：两者分别出现在不同消息里时按原规则走
+        # （「先看本尊」→「穿爱莉」＝最后一条点名生效）。
+        if chars and self_word:
+            current = []
+            unavailable_reason = ""
+            ambiguous = False
+            split_word = self_word
+            split_names = _names(chars)
+            # 拆单没有自己的置信度：它不给结论，只表示「主题不可单独确定」
+            strength = 0.0
+            signal_stamp = stamp
+            signal_kind = "split"
+            signal_label = f"拆单→{self_word}+{split_names}"
+            trace_parts.append(f"[拆单:{self_word}+{split_names}]")
+            trace_parts.append("需按当前画面判定")
+            logger.debug(
+                f"主题跟踪：同一条消息里既有自我指代'{self_word}'又有角色名"
+                f"（{split_names}）→ 拆单（一单多件），主题不可单独确定，"
+                "交 LLM 按当前画面描述判定；判定不出就不补"
+            )
+            continue
+
         # ② 本条含 ≥2 个角色表内角色，或含追加词 → 多人主题
         if len(chars) >= 2 or (chars and additive):
+            # 能量化主题的消息一定晚于拆单 —— 旧的拆单标记作废（最后一条消息生效）
+            split_word = ""
+            split_names = ""
             if len(chars) >= 2:
                 # 一条消息里点了多个名字：主题就是这些人，**不与旧主题合并** ——
                 # 与 1.0.10 起的 resolve_naming_decision 一致，免得把上一位留下
@@ -419,6 +488,8 @@ def track_subject(
 
         # ③ 本条含 1 个角色表内角色 → 主题 = 该角色
         if chars:
+            split_word = ""
+            split_names = ""
             current = list(chars)
             unavailable_reason = ""
             strength = STRENGTH_NAMED
@@ -446,6 +517,10 @@ def track_subject(
 
         # ④ 自我指代 → 主题 = 本尊身份（解析不到 / 不在角色表 → 不可用）
         if self_word:
+            # 本条没有角色名（有的话①.5 就拆单了）：本尊身份是能定主题的信号，
+            # 旧的拆单标记作废（最后一条消息生效）
+            split_word = ""
+            split_names = ""
             names: list[str] = []
             source = ""
             if resolve_identity is not None:
@@ -516,6 +591,11 @@ def track_subject(
                 signal_kind = "pronoun"
                 signal_label = f"代词回指'{pronoun}'→{_names(current)}"
                 trace_parts.append(f"[代词:{pronoun}]")
+            elif split_word:
+                # 拆单还没被下游裁定（1.0.16）：代词只是回指「刚才那件事」，
+                # 不该把拆单改写成「代词无先行词」——主题照旧是「不可单独确定」，
+                # 仍交 LLM 按当前画面描述判定（别让触发消息里的一句「你」抹掉拆单）。
+                trace_parts.append(f"[代词:{pronoun}]")
             else:
                 current = []
                 unavailable_reason = f"代词'{pronoun}'无先行词（窗口内没有更早的主题）"
@@ -557,6 +637,18 @@ def track_subject(
         entries = []
         confidence = 0.0
         reason = unavailable_reason
+    elif split_word:
+        # 拆单（1.0.16）：主题「不可单独确定」—— 不设主题、不给置信度，
+        # 交下游按**当前画面描述**由 LLM 判定（判定不出就不补）。
+        # 放在 unavailable 之后：拆单自己会清掉 unavailable，而拆单之后的
+        # 「本尊身份取不到」等消息会清掉拆单 —— 两条路都是「最后一条消息生效」。
+        status = "split"
+        entries = []
+        confidence = 0.0
+        reason = (
+            f"拆单（一单多件）：同一条消息里既有自我指代'{split_word}'"
+            f"又有角色名'{split_names}'，需按当前画面描述交 LLM 判定，判定不出就不补"
+        )
     elif not current:
         status = "empty"
         entries = []
@@ -594,6 +686,11 @@ def track_subject(
         min_confidence=min_confidence,
     )
     track.basis = format_basis(track, self_matched)
+    if track.split:
+        logger.debug(
+            "主题跟踪命中「拆单（一单多件）」：同一条消息里既有自我指代又有角色名，"
+            "本轮主题不可单独确定 —— 交 LLM 按当前画面描述判定，判定不出就不补"
+        )
     if track.ambiguous:
         logger.debug(
             "主题跟踪命中「换人还是追加不确定」："
@@ -608,7 +705,8 @@ def format_basis(track: SubjectTrack, self_matched: str = "") -> str:
 
     - 可用：``判定依据=主题跟踪:本尊身份'花火'(来源=配置)→角色表命中:花火（置信度 0.95）``
       / ``判定依据=主题跟踪:用户点名→伊甸（置信度 0.98）``；
-    - 不可用 / 置信度不足 / 无信号：``判定依据=无(不补)（主题跟踪:<具体原因>）``。
+    - 不可用 / 置信度不足 / 无信号 / **拆单**：``判定依据=无(不补)（主题跟踪:<具体原因>）``
+      —— 拆单（1.0.16）时原因里会写明「拆单（一单多件）」，交下游按当前画面由 LLM 判定。
 
     「本尊身份」「(来源=…)」「角色表命中」这几个字段是 1.0.13 起就有的诊断文案，
     用户排查时按它们找，因此 1.0.14 原样保留。

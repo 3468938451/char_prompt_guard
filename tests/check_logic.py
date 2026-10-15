@@ -32,6 +32,12 @@ C28/C29/C32 这三条守住的是"上文里**非用户点名**的旧角色不得
 就不补。C49 主题切换（旧主题 →「本尊」→ 花火）、C50 多人同框、C51 代词回指、
 C52 置信度不足不补、C53 ``monitor.enabled = false`` 完全退回 1.0.13。
 
+1.0.16 起补上**拆单（一单多件）**（C54/C55）：**同一条**用户消息里既有自我指代词、
+又有角色表内角色（「本尊看看，然后穿着爱莉来看看～」＝调用方把一单拆成两张图）时，
+主题「不可单独确定」—— 不再让「角色名」把自我指代吞掉（1.0.15 的事故），改为
+**强制**问一次 LLM 并按**当前画面描述**判定：LLM 给出角色表内结论就采用（C54），
+LLM 没结论就不补（C55）。两者分别出现在不同消息里时行为不变（最后一条点名生效）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -1833,6 +1839,135 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C53 monitor.enabled=false → 退回 1.0.13（用户点名/粘性）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C54 拆单：一条消息里既有「本尊」又有角色名 → 交 LLM 按画面判定（1.0.16）──
+    # 线上事故：用户「本尊看看，然后穿着爱莉来看看～」是**一单两件**（调用方把它拆成
+    # 两张图：先看本尊、再看壳），当前这张是**本尊**那张。
+    # 1.0.15 的状态机里「角色名」命中就整条 continue，同一条消息里的自我指代被吞掉：
+    #   主题跟踪(15条): … → 爱莉希雅(刚刚) ← 当前主题（置信度 0.99）
+    #   判定依据=主题跟踪:用户点名→爱莉希雅（置信度 0.99）
+    # 于是 LLM 按画面正确认出的「花火」（本尊）被主题压掉，补成了爱莉希雅。
+    # 1.0.16 起同一条消息里「自我指代 + 角色名」= **拆单**：主题「不可单独确定」，
+    # 强制问一次 LLM 并**采纳它按当前画面描述给出的角色表内结论**（唯一允许 LLM
+    # 压过主题的情形）。
+    # 这里刻意把 description_first 关掉、llm_mode 设为 fallback，且上文史里本来就有
+    # 爱莉希雅的命中 —— 1.0.16 之前的 need_llm 条件**全部为假**，只有「拆单强制走
+    # LLM」才会真的问一次，用例因此守得住「强制」这条。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.description_first = False  # 旧条件全不成立 → 只能靠拆单强制问
+        cfg.multi.llm_mode = "fallback"
+        raw = "清晨室内明亮柔和的光线。白发少女刚起床，站在镜头前，粉色眼睛看向镜头"
+        calls = {"n": 0}
+
+        async def fake_extract(**kwargs):
+            calls["n"] += 1
+            # 模拟「LLM 读了画面描述与上文后的结论」：这张要画的是本尊（花火）
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
+                ],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("嗯～"),
+                        "stream_id": "s-c54",
+                    },
+                )
+        finally:
+            handler_module.extract_characters_via_llm = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and c.startswith(raw)
+            and "拆单" in debugs
+            and "花火" in debugs
+            and calls["n"] == 1  # 拆单强制走 LLM（旧条件全为假，不强制就不会问）
+        )
+        check(
+            "C54 拆单：本尊+爱莉 → LLM 按画面判定补花火",
+            ok,
+            f"content = {c!r}\n        LLM 调用次数 = {calls['n']}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C54 拆单：本尊+爱莉 → LLM 按画面判定补花火",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C55 拆单但 LLM 没有结论 → 不补（内容一字不改）（1.0.16）────────────
+    # 同一个拆单场景，LLM 这次什么都没给（返回空 / 失败 / 超时都走这条）：主题是
+    # 「不可单独确定」，插件**不补**任何角色 —— 既不按 LLM 猜，也绝不回退到上文里
+    # 那个爱莉希雅；日志写明「拆单且无法按画面判定」。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.description_first = False  # 同上：只有拆单会强制问 LLM
+        cfg.multi.llm_mode = "fallback"
+        raw = "清晨室内明亮柔和的光线。白发少女刚起床，站在镜头前，粉色眼睛看向镜头"
+
+        async def fake_extract(**kwargs):
+            return CharacterExtraction(characters=[], multi=False)
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("嗯～"),
+                        "stream_id": "s-c55",
+                    },
+                )
+        finally:
+            handler_module.extract_characters_via_llm = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == raw
+            and "爱莉希雅" not in c
+            and "拆单" in debugs
+            and "拆单且无法按画面判定" in debugs
+        )
+        check(
+            "C55 拆单但 LLM 无结论 → 不补（内容不变，不回退旧点名）",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C55 拆单但 LLM 无结论 → 不补（内容不变，不回退旧点名）",
             False,
             f"{type(e).__name__}: {e}",
         )

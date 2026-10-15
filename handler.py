@@ -7,10 +7,13 @@
   找出当前指代的角色，补入提示词；多角色同框时按配置补齐多个。
 - 「这次该画谁」由**主题跟踪器**（:func:`monitor.track_subject`，1.0.14 起）给出：
   按时间正序扫最近 ``monitor.window`` 条消息，逐条演进一个「当前主题」
-  （改口 / 多人 / 点名 / 本尊身份 / 代词回指），置信度 = 信号强度 × 时间衰减，
+  （改口 / 多人 / 点名 / 本尊身份 / 代词回指 / 拆单），置信度 = 信号强度 × 时间衰减，
   低于 ``monitor.min_confidence`` 就不补。``monitor.enabled = false`` 时**完全退回
   1.0.13** 的「自我指代扫描（②.5）+ 用户点名/主角粘性（③）」链路（见
   :meth:`CharacterGuardHandler._collect_candidates` 里的 else 分支）。
+- **拆单**（1.0.16 起）：同一条用户消息里既有自我指代词又有角色表内角色时（调用方
+  把一单拆成两张图：先看本尊、再看壳），主题「不可单独确定」—— 这是唯一允许 LLM
+  压过主题的情形：强制问一次 LLM，按**当前画面描述**判定；判定不出就不补。
 
 不同生图插件的提示词语义不同，因此按「目标 Action」区分追加格式：
 
@@ -974,11 +977,18 @@ class CharacterGuardHandler(BaseEventHandler):
           本函数只负责算出「判定集合」，供二次一致性检测对账；
         - **主题跟踪**（1.0.14 起，``monitor.enabled = true``）：把「这次该画谁」交给
           :func:`monitor.track_subject` —— 按时间正序扫最近 ``monitor.window`` 条消息
-          维护一个「当前主题」（改口 / 多人 / 点名 / 本尊身份 / 代词回指），置信度 =
+          维护一个「当前主题」（改口 / 多人 / 点名 / 本尊身份 / 代词回指 / 拆单），置信度 =
           信号强度 × 时间衰减，低于 ``monitor.min_confidence`` 就不补。它压过 LLM 的
           猜测；主题**不可用**（本尊身份不在角色表、取不到身份名、代词无先行词）时
           直接不补且不问 LLM。只有「换人还是追加不确定」（相邻两条点名消息靠得太近）
           才交 LLM 仲裁，与 1.0.12 起的既有语义一致；
+        - **拆单**（1.0.16 起，主题跟踪的 ``split``）：同一条用户消息里既有自我指代词
+          又有角色表内角色（「本尊看看，然后穿着爱莉来看看～」＝一单两件）时，主题
+          「不可单独确定」。这是**唯一**允许 LLM 压过主题的情形：强制问一次 LLM，
+          它给出的**角色表内**结论直接采用（日志
+          ``判定依据=拆单→LLM 按画面判定:<角色名>``）；LLM 空 / 失败 / 超时 /
+          ``use_llm = false`` → **不补**（日志 ``判定依据=无(不补)（拆单且无法按画面判定）``）。
+          其它 status（可用 / 不可用 / 置信度不足 / 空）的一切照旧；
         - 自我指代（1.0.12 起；1.0.13 起能定位到角色）：``monitor.enabled = false`` 时
           走这条老链路 —— 按「``general.true_self`` → 人格配置 ``nickname`` →
           ``alias_names``」取本尊身份并在角色表里定位；**命中就补那个角色**，
@@ -987,7 +997,7 @@ class CharacterGuardHandler(BaseEventHandler):
           （带 ``multi.stickiness_hours`` 时效、换人/追加规则）—— 同样只在
           ``monitor.enabled = false`` 时使用。**它压过 LLM 的猜测** ——
           「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
-        - LLM 仲裁：主题为空 / 置信度不足 / 换人还是追加不确定时才问（条件见 ④）；
+        - LLM 仲裁：主题为空 / 置信度不足 / 换人还是追加不确定 / **拆单**时才问（条件见 ④）；
         - 都不成立 → 不补（宁少勿多）。
 
         Returns:
@@ -1126,12 +1136,13 @@ class CharacterGuardHandler(BaseEventHandler):
             )
             logger.debug(naming.label())
 
-        # ④ 决定要不要问 LLM（沿用 1.0.6 起的既有条件，另加「不确定」这一条）：
+        # ④ 决定要不要问 LLM（沿用 1.0.6 起的既有条件，另加「不确定」与「拆单」）：
         #   - llm_mode="always"：显式要求每次都问，可识别角色表**外**的角色；
         #   - 没有任何上文命中：保持原有 LLM 兜底行为；
         #   - description_first 且描述里没有角色表内角色：让读过描述的 LLM 参与；
         #   - 上文出现 ≥2 个角色表内角色：多人场景需要 LLM 仲裁一次；
-        #   - 换人还是追加不确定（uncertain / 主题跟踪的 ambiguous）：按规则交 LLM 仲裁。
+        #   - 换人还是追加不确定（uncertain / 主题跟踪的 ambiguous）：按规则交 LLM 仲裁；
+        #   - **拆单**（1.0.16，主题跟踪的 split）：**强制**问一次，不受上面几条限制。
         # 注意：**问不问 LLM** 与 **听不听 LLM** 是两件事 —— 主题跟踪（或 1.0.13 的用户
         # 点名）有确定结论时，LLM 的表内结论一律让位（见 ⑤），这里问一次只是为了
         # llm_mode="always" 下还能认出角色表外的角色、以及保留 description_first 的
@@ -1142,11 +1153,17 @@ class CharacterGuardHandler(BaseEventHandler):
             and str(config.multi.scope).lower() == SCOPE_MULTI_ONLY
             and mentioned >= 2
         )
+        # 拆单（1.0.16）：monitor 开启时由主题跟踪给出 —— 同一条用户消息里既有自我
+        # 指代词又有角色表内角色（「本尊看看，然后穿着爱莉来看看～」＝一单两件）。
+        # 此时主题**不可单独确定**，且**只有这一种情形**允许 LLM 压过主题：
+        # 它读得到本次的**画面描述**，能判断当前这张图是「本尊」还是「壳」。
+        split = bool(track is not None and track.split)
         # 「换人还是追加不确定」的来源：monitor 开启时由主题跟踪给出（相邻两条点名
         # 消息间隔 < multi.multi_window_minutes），关闭时沿用 resolve_naming_decision。
         ambiguous = track.ambiguous if track is not None else naming.kind == "uncertain"
         need_llm = config.general.use_llm and (
-            llm_mode == "always"
+            split
+            or llm_mode == "always"
             or not history_candidates
             or (config.general.description_first and not present_keys)
             or multi_candidates
@@ -1203,6 +1220,41 @@ class CharacterGuardHandler(BaseEventHandler):
                         continue
                     seen_llm.add(key)
                     llm_candidates.append(entry)
+
+        # ④.5 拆单（1.0.16）：主题跟踪给出的结论是「不可单独确定」（同一条用户消息里
+        # 既有自我指代词、又有角色表内角色），**只在这一种情形下**允许 LLM 压过主题 ——
+        # 它读得到本次的**画面描述**，而主题跟踪只看对话上文，两者在拆单场景里权重相同
+        # （这正是 1.0.15 的事故：「本尊看看，然后穿着爱莉来看看～」被整条判成
+        # 「用户点名→爱莉希雅」，把 LLM 按画面正确认出的本尊=花火压掉了）。
+        # 只采纳**角色表内**的结论：拆单时主题跟踪给不出任何可核对的候选人，角色表外的
+        # 名字无从对账，宁可不补（与 `llm_mode="always"` 的「额外认人」是两回事）。
+        # LLM 没结论（空 / 失败 / 超时 / `use_llm = false`）→ 什么都不补。
+        if split:
+            in_roster = [
+                entry
+                for entry in llm_candidates
+                if any(entry_key(entry) == entry_key(known) for known in roster)
+            ]
+            if in_roster:
+                candidates = list(in_roster)
+                decided = list(in_roster)
+                basis = (
+                    "判定依据=拆单→LLM 按画面判定:"
+                    f"{'、'.join(entry.name or entry.tag or '?' for entry in in_roster)}"
+                )
+            else:
+                candidates = []
+                decided = []
+                basis = "判定依据=无(不补)（拆单且无法按画面判定）"
+            logger.debug(basis)
+            return CandidateResult(
+                candidates=candidates[: max(1, int(config.multi.max_characters))],
+                decided=decided,
+                llm_multi=llm_multi,
+                mentioned=mentioned,
+                naming=naming,
+                basis=basis,
+            )
 
         # ⑤ 汇总。优先级：主题跟踪（1.0.14）/ 用户点名·粘性（1.0.13）有确定结论时以它
         # 为准 —— LLM 的表内猜测一律让位（这就是 1.0.10 起要修的核心问题：用户点名
