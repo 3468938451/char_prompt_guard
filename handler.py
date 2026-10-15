@@ -102,6 +102,50 @@ off/warn/fix，与期望集合那套互不影响）：
 - 与既有对账**两条独立、可以各自触发**：本条跑在 :meth:`CharacterGuardHandler._finalize`
   里、:meth:`CharacterGuardHandler._apply_consistency_check` **之后**，因此既有对账
   若已修正过内容，本条按**修正后**的文本再判一次；两条都命中时日志各有一条。
+
+**1.0.21 的「角色解析（LLM）」**（用户反馈：只删不补等于"这个角色的提示词没有进去"）：
+1.0.20 的 ``fix`` 把画面里那个过期的错误标签**删掉**，却没有补上用户真正点名的角色的
+标签，用户侧看到的是"角色没进去"。1.0.21 因此新增 ``general.auto_resolve_characters``
+（默认开）与 :meth:`CharacterGuardHandler._resolve_outside_character`：用**已配置的
+模型**（同一套 ``llm_api``、同一个 ``translate_model`` / ``llm_timeout``，不带新依赖）
+把表外角色解析成「正式名 + 作品名 + NAI 标签」，再走两个入口：
+
+- **入口①替换**（:meth:`CharacterGuardHandler._apply_outside_naming_check`）：表外点名
+  对账判定为冲突、``consistency_check="fix"`` 且解析成功 → 用解析出的标签（+ natural
+  模式的中文说明）**替换**画面里的错误标签，日志
+  ``一致性检查=冲突已修正（fix）：把画面里的「花火」替换为「刻律德拉」（替换 N 处），依据=角色解析(LLM):刻律德拉 → Kleidra…``；
+- **入口②补入**（:meth:`CharacterGuardHandler._resolved_for_injection` +
+  :meth:`CharacterGuardHandler._inject_resolved`，在 ``execute`` 里跑在判定链**之前**）：
+  用户在最近消息里点名了表外角色、解析成功、而画面里**没有任何角色标签**（例如描述只有
+  外观）→ 按 ``natural`` / ``tags`` 模式把解析结果补进提示词最前面（复用既有注入格式与
+  ``tag_completion``），日志 ``已按角色解析补入（LLM）：<中文名> → <标签>``。
+
+**1.0.21 修正（一次实测回归）**：入口①原本会被「期望集合对账」抢在前面 —— ``_finalize``
+把解析结果并进判定集合，``fix`` 模式下对账先做了替换，于是日志里的依据写成
+``判定集合=…``、natural 模式的中文说明也没补上（用例 C72 就是这么失败的）。
+现在解析结果**不再并进判定集合**：对账只负责它自己的证据（判定 / 主题跟踪 / 记忆库），
+解析结果一律由入口①处理 —— 依据里能看出「用的是角色解析」，中文说明与标准标签也一起补。
+
+解析结果的**校验与降级**（:func:`character.parse_resolution_payload` /
+:func:`character.validate_tag`）：``unknown=true`` / JSON 坏 / 标签不符合规范 /
+``confidence`` 低于 0.5 → 一律视为**解析失败**，退化为 1.0.20 的行为（``warn`` 不变 /
+``fix`` 只删除），日志 ``角色解析(LLM)失败：<原因>``；任何异常（超时 / 网络 / 解析）
+只记 DEBUG/WARNING，**绝不拦住生图**。解析成功额外打一条 INFO
+``建议加入角色表：<中文名> | <作品名> | <英文名小写>,<中文名> | <标签>``
+（**只打日志，绝不自动改配置文件**）。
+
+**缓存**（1.0.21 修正：**读写在调用方**，即
+:meth:`CharacterGuardHandler._resolve_with_cache`）：同一角色名**不重复问模型** ——
+成功缓存 24 小时（:data:`character.RESOLVE_CACHE_TTL_SECONDS`）、失败负缓存 10 分钟
+（:data:`character.RESOLVE_FAILURE_TTL_SECONDS`）；命中缓存时日志为
+``角色解析(缓存): …``。``character.resolve_character_via_llm`` 保持**纯解析**
+（不读不写缓存、也不打成功日志），否则回归用例替换掉它的同时会把缓存一起替换掉
+（C75：两次生图只允许问一次模型）。缓存的存储与清空入口在 :mod:`character`
+（``resolve_cache_get`` / ``resolve_cache_put`` / :func:`character.reset_resolve_cache`），
+「何时读、何时写、命中怎么打日志」全在 handler。
+``memory.write_back`` 为真时，解析结果还会**写回记忆库**
+（:meth:`CharacterGuardHandler._write_resolved_to_memory`，走
+``memory.MemoryClient.write`` 这一条现有写回通道，三元组照旧同时非空）。
 """
 
 from __future__ import annotations
@@ -129,6 +173,7 @@ from .character import (
     BASIS_USER_NAMED,
     CharacterEntry,
     NamingDecision,
+    ResolvedCharacter,
     character_in_texts,
     content_contains_tag,
     delete_character_reference,
@@ -146,6 +191,9 @@ from .character import (
     order_messages_newest_first,
     parse_roster,
     replace_character_reference,
+    resolve_cache_get,
+    resolve_cache_put,
+    resolve_character_via_llm,
     resolve_naming_decision,
     strip_quoted_blocks,
 )
@@ -618,6 +666,18 @@ _history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _BOT_ID_CACHE_TTL = 60.0
 _bot_id_cache: dict[str, tuple[float, str | None]] = {}
 
+# 角色解析（LLM）结果的**调用方**缓存（1.0.21 修正）：**策略**在这里，**存储在**
+# ``character``（``resolve_cache_get`` / ``resolve_cache_put`` / ``reset_resolve_cache``）。
+#
+# 为什么必须把「读缓存 / 写缓存」搬到调用方：解析函数是回归用例替换（打桩）的那一层
+# ——``tests/check_logic.py`` 的 ``FakeResolve`` 同时替换 ``character`` 与 ``handler``
+# 里的 ``resolve_character_via_llm``。缓存若写在被替换的那一层里，用例里第二次生图
+# 照样会调模型（C75 断言第二次必须命中缓存、只问一次），等于没有缓存。
+#
+# 键走 ``character.normalize_prompt_text``（忽略大小写 / 反斜杠 / 下划线）；
+# 成功缓存 24 小时、失败（unknown / 标签非法 / 超时 / 异常）负缓存 10 分钟，
+# TTL 与上限常量、以及清空入口都在 ``character``（用例隔离只清一处）。
+
 
 def _cached_parse(key_text: str, cache: dict[str, Any], factory: Any) -> Any:
     """按配置文本缓存解析结果。"""
@@ -885,6 +945,33 @@ def _memory_candidate_names(
     return names
 
 
+def _conflicting_roster_entries(
+    texts: list[str],
+    roster: list[CharacterEntry],
+    naming_scope: UserNamingScope,
+    exclude: CharacterEntry | None = None,
+) -> list[CharacterEntry]:
+    """画面里「用户这次没点过」的角色表内角色（1.0.20 起的一致口径）。
+
+    与 :meth:`CharacterGuardHandler._apply_outside_naming_check` 里的冲突判定
+    **完全同一条规则**（1.0.21 抽成模块级函数，好让「该不该解析」这一步
+    先按同一个口径预判，避免为一个根本用不上的解析去问模型）：
+
+    - ``texts``：参与「已含角色」检测的文本（提示词 + ``detect_args``）；
+    - ``roster``：角色表；
+    - ``naming_scope``：用户最近几条用户消息 —— 里面**提过**的角色不算冲突
+      （用户自己点的，画面里出现它是正常的）；
+    - ``exclude``：解析出的角色（1.0.21）—— 刚替换进来/刚补入的那个不算冲突。
+    """
+    return [
+        entry
+        for entry in roster
+        if character_in_texts(entry, texts)
+        and not character_in_texts(entry, naming_scope.texts)
+        and (exclude is None or entry_key(entry) != entry_key(exclude))
+    ]
+
+
 def _roster_match_names(roster: list[CharacterEntry]) -> list[str]:
     """**完整角色表**里所有可参与匹配的词：每个条目的 name + 全部别名 + 标准标签。
 
@@ -1109,11 +1196,14 @@ class UserNamingScope:
         scanned: 触发之前实际回看的用户消息条数（触发消息不算在内）
         names: 从这些消息里提取出的**表外**名字（已过滤：长度 / 纯标点 /
             常见词黑名单 / 角色表内的名字与别名），去重、保序
+        sources: 每个表外名字**来自哪条消息**（与 ``names`` 一一对应，1.0.21 起）：
+            解析角色时用它当「触发语」写回记忆库（「这身是？」比裸名字信息更多）
     """
 
     texts: list[str] = field(default_factory=list)
     scanned: int = 0
     names: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
 
     def names_text(self) -> str:
         """表外名字的可读列表（进日志）：``刻律德拉、卡芙卡``。"""
@@ -1233,9 +1323,63 @@ class CharacterGuardHandler(BaseEventHandler):
             params=params, config=config, roster=roster
         )
         texts = self._detection_texts(content, spec, args)
+        # 1.0.21：把用户点名的表外角色**解析**一次（复用 llm_api，结果带缓存），
+        # 只对**第一个**表外名字解析，避免一次生图打好几次模型。
+        # 只有「两个入口之一真的用得上」时才问（见 _resolve_outside_character）：
+        # 角色在角色表内的普通场景**一次模型都不问**。
+        # 解析失败（unknown / 超时 / 标签非法 / 开关关掉）返回 None —— 一律退回
+        # 1.0.20 的行为，绝不拦住生图。
+        resolved = await self._resolve_outside_character(
+            config=config,
+            naming_scope=user_naming,
+            texts=texts,
+            roster=roster,
+        )
         present_keys = {
             entry_key(entry) for entry in roster if character_in_texts(entry, texts)
         }
+
+        # 1.0.21 入口②（**补入**）：用户点名了表外角色、解析成功，而画面里
+        # **一个角色标签都没有**（典型：描述只写了外观）→ 按目标的 natural / tags
+        # 模式把解析结果补进提示词最前面，然后走**既有注入路径**（不另写一套）。
+        # 放在判定链**之前**是有意的：解析结果是模型给出的确定结论，比按粘性从
+        # 上万里挑一个角色更可信；此时 present_keys 必为空，所以只要解析成功就补。
+        # 画面里已经有角色标签时不在这里动 —— 那是「替换」那一条入口的事
+        # （见 _apply_outside_naming_check）。
+        injected = self._resolved_for_injection(
+            content=content,
+            spec=spec,
+            args=args,
+            roster=roster,
+            user_naming=user_naming,
+            resolved=resolved,
+        )
+        if injected is not None:
+            self._inject_resolved(
+                content=content,
+                spec=spec,
+                args=args,
+                resolved=injected,
+                config=config,
+            )
+            logger.info(
+                f"已按角色解析补入（LLM）：{injected.name} → {injected.resolved_tag()}"
+            )
+            return await self._finalize(
+                params=params,
+                args=args,
+                spec=spec,
+                original=raw_content,
+                final_content=args[spec.prompt_arg],
+                decided=[injected],
+                roster=roster,
+                config=config,
+                basis=f"判定依据=角色解析(LLM):{injected.name}",
+                track=None,
+                memory=None,
+                naming_scope=user_naming,
+                resolved=injected,
+            )
 
         # 1.0.18：判定**不确定**且描述里没有角色表内角色时，先去外部记忆库
         # （Booku Memory）做一次「再确认」。命中「触发词 → 角色表内角色」的明确
@@ -1310,7 +1454,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 )
                 if not completion_tags:
                     logger.debug("提示词已包含角色，放行")
-                return self._finalize(
+                return await self._finalize(
                     params=params,
                     args=args,
                     spec=spec,
@@ -1323,6 +1467,7 @@ class CharacterGuardHandler(BaseEventHandler):
                     track=result.track,
                     memory=reconcile_lookup,
                     naming_scope=user_naming,
+                    resolved=resolved,
                 )
             target_characters = candidates[:1]
         else:
@@ -1338,7 +1483,7 @@ class CharacterGuardHandler(BaseEventHandler):
             )
             if not completion_tags:
                 logger.debug("未识别到需要补入的角色，放行")
-            return self._finalize(
+            return await self._finalize(
                 params=params,
                 args=args,
                 spec=spec,
@@ -1351,6 +1496,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 track=result.track,
                 memory=reconcile_lookup,
                 naming_scope=user_naming,
+                resolved=resolved,
             )
 
         new_content = self._apply(
@@ -1362,7 +1508,7 @@ class CharacterGuardHandler(BaseEventHandler):
             control=control,
         )
         if new_content is None:
-            return self._finalize(
+            return await self._finalize(
                 params=params,
                 args=args,
                 spec=spec,
@@ -1375,6 +1521,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 track=result.track,
                 memory=reconcile_lookup,
                 naming_scope=user_naming,
+                resolved=resolved,
             )
 
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
@@ -1385,7 +1532,7 @@ class CharacterGuardHandler(BaseEventHandler):
             f"{' / 多人' if multi else ''}）: {names}"
             f"{f' → 追加 {appended!r}' if appended else ''}"
         )
-        return self._finalize(
+        return await self._finalize(
             params=params,
             args=args,
             spec=spec,
@@ -1398,6 +1545,7 @@ class CharacterGuardHandler(BaseEventHandler):
             track=result.track,
             memory=reconcile_lookup,
             naming_scope=user_naming,
+            resolved=resolved,
         )
 
     # ── 记忆库再确认（1.0.18）─────────────────────────────────────
@@ -2396,11 +2544,16 @@ class CharacterGuardHandler(BaseEventHandler):
                 texts.append(message_text(message))
 
             names: list[str] = []
+            sources: dict[str, str] = {}
             for text in texts:
                 for name in extract_outside_names(text, roster):
                     if name not in names:
                         names.append(name)
-            scope = UserNamingScope(texts=texts, scanned=scanned, names=names)
+                        # 记住它来自哪句话（1.0.21：解析成功后写回记忆库时的触发语）
+                        sources[name] = text
+            scope = UserNamingScope(
+                texts=texts, scanned=scanned, names=names, sources=sources
+            )
             if names:
                 logger.debug(f"表外点名扫描: {scope.label()}")
             return scope
@@ -2410,7 +2563,345 @@ class CharacterGuardHandler(BaseEventHandler):
             )
             return UserNamingScope()
 
-    def _apply_outside_naming_check(
+    # ── 角色解析（LLM，1.0.21）────────────────────────────────────
+
+    async def _resolve_outside_character(
+        self,
+        *,
+        config: CharPromptGuardConfig,
+        naming_scope: UserNamingScope | None,
+        texts: list[str] | None = None,
+        roster: list[CharacterEntry] | None = None,
+    ) -> CharacterEntry | None:
+        """把「用户点名的表外角色」解析成标准标签（1.0.21）；失败返回 ``None``。
+
+        入口①（替换）/ 入口②（补入）共用这一次解析 —— 只在需要时调用。
+
+        开关与前提（**全部满足才问**，任何一条不满足都在调用模型**之前** return，
+        并留一条 DEBUG ``角色解析=跳过（<原因>）``）：
+
+        - ``general.auto_resolve_characters``（默认开）；
+        - ``general.consistency_check != "off"`` —— 「完全不检查」自然也不该问模型；
+        - 焦点范围内**确实有**表外点名（:class:`UserNamingScope.names`）；
+        - **至少有一个入口真的需要它**（``texts`` / ``roster`` 给出来时才检查）：
+          **画面里没有角色表内角色** → 只可能是入口②（**补入**，例如描述只写了外观）；
+          **画面里有角色表内角色** → 只可能是入口①（**替换**），此时要求存在
+          「用户这次没点过的表内角色」才算冲突。两个条件都不成立（画面里是用户
+          这次点过的表内角色）时，这次解析**不可能被用上**，于是**一次模型都不问**
+          —— 角色在角色表内的普通场景（C76）走的正是这条，零成本；
+        - 只对**第一个**表外名字解析（一次生图最多一次模型调用）。
+
+        解析走 :meth:`_resolve_with_cache`（同一套 ``llm_api``、同一个
+        ``translate_model`` / ``llm_timeout``；**调用方缓存**命中时不再问模型）；
+        成功后按 ``memory.write_back`` 把这次解析**写回记忆库**（沿用现有写回通道，
+        含 ``core_tags`` / ``diffusion_tags`` / ``opposing_tags`` 三元组）。
+
+        **本函数不抛异常**：任何失败都只记 DEBUG/WARNING 并返回 ``None``，
+        由调用方逐字退回 1.0.20 的行为。
+        """
+        if not bool(getattr(config.general, "auto_resolve_characters", True)):
+            logger.debug("角色解析=跳过（general.auto_resolve_characters=false）")
+            return None
+        mode = (
+            str(getattr(config.general, "consistency_check", "") or "").strip().lower()
+        )
+        if mode == "off":
+            logger.debug("角色解析=跳过（general.consistency_check=off，本次不检查）")
+            return None
+        if naming_scope is None or not naming_scope.names:
+            logger.debug("角色解析=跳过（用户最近的几条消息里没有角色表外的点名）")
+            return None
+        if texts is not None or roster is not None:
+            # 「有没有入口真的需要它」：见 docstring —— 两个入口都不成立时一次都不问。
+            # 注意这里不能拿「这个名字在不在用户消息里」当条件：它本来就来自用户消息
+            # （extract_outside_names 的输入就是那几条），那样写等于永远不解析。
+            present = [
+                entry for entry in (roster or []) if character_in_texts(entry, texts or [])
+            ]
+            if present and not _conflicting_roster_entries(
+                texts or [], roster or [], naming_scope
+            ):
+                # 画面里是**用户这次点过的**表内角色 → 不是冲突，也不需要补入
+                logger.debug(
+                    "角色解析=跳过（画面里的角色表内角色用户这次点过："
+                    "没有冲突要修正、也没有空缺要补入）"
+                )
+                return None
+        name = naming_scope.names[0]
+        result = await self._resolve_with_cache(
+            config=config,
+            name=name,
+            context_text=naming_scope.sources.get(name, ""),
+        )
+        if result is None or not result.ok or result.entry is None:
+            return None
+        await self._write_resolved_to_memory(
+            config=config,
+            resolved=result,
+            trigger=self._resolve_trigger(name, naming_scope),
+        )
+        return result.entry
+
+    async def _resolve_with_cache(
+        self,
+        *,
+        config: CharPromptGuardConfig,
+        name: str,
+        context_text: str = "",
+    ) -> ResolvedCharacter | None:
+        """解析一个表外角色；**命中缓存就不再问模型**（1.0.21 的调用方缓存）。
+
+        缓存**在这里读、在这里写**（存储与 TTL 常量在 :mod:`character`）：
+        解析函数 :func:`character.resolve_character_via_llm` 是回归用例替换（打桩）
+        的那一层，缓存写在它内部时，用例里第二次生图照样会调模型（C75 断言只问一次）。
+
+        - 命中（成功 24 小时 / 失败 10 分钟）→ 日志 ``角色解析(缓存): …``，
+          **一次模型调用都不发**；
+        - 未命中 → 问一次模型，把结果（成功或失败）写进缓存：
+          成功打 INFO ``角色解析(模型): …`` + ``建议加入角色表：…``，
+          失败打 DEBUG ``角色解析(LLM)失败：<原因>``（异常则 WARNING）。
+
+        **本函数不抛异常**（异常一律转成失败结果并写负缓存）；调用方拿到
+        ``ok`` 为假的结果时退回 1.0.20 的行为。
+
+        Returns:
+            :class:`character.ResolvedCharacter`；连结果都拿不到（异常）时返回 ``None``
+        """
+        cached = resolve_cache_get(name)
+        if cached is not None:
+            logger.info(cached.log_line())
+            self._log_roster_suggestion(cached)
+            return cached
+
+        try:
+            result = await resolve_character_via_llm(
+                name,
+                translate_model=str(config.general.translate_model or ""),
+                timeout=float(config.general.llm_timeout or 0.0),
+                context_text=context_text,
+            )
+        except Exception as e:  # noqa: BLE001 —— 解析是「多一条路」，不许拦住生图
+            logger.warning(f"角色解析(LLM)失败：{type(e).__name__}: {e}（角色={name!r}）")
+            # 异常也要进负缓存：同一个角色不必为每一张图都再等一次超时
+            resolve_cache_put(
+                name,
+                ResolvedCharacter(
+                    reason=f"调用失败({type(e).__name__}: {e})", raw_name=name
+                ),
+            )
+            return None
+
+        resolve_cache_put(name, result)
+        if not result.ok or result.entry is None:
+            logger.debug(f"角色解析(LLM)失败：{result.reason or '未知原因'}（角色={name!r}）")
+            return None
+        logger.info(result.log_line())
+        self._log_roster_suggestion(result)
+        return result
+
+    @staticmethod
+    def _log_roster_suggestion(resolved: ResolvedCharacter) -> None:
+        """打一条「建议加入角色表：…」的 INFO（**只打日志，绝不自动改配置文件**）。
+
+        形如 ``建议加入角色表：刻律德拉 | 崩坏：星穹铁道 (Honkai: Star Rail) |
+        kleidra,刻律德拉 | kleidra \\(honkai: star rail\\)`` —— 用户可以直接
+        粘贴进 ``roster.characters``。
+        """
+        line = resolved.roster_line()
+        if line:
+            logger.info(f"建议加入角色表：{line}")
+
+    @staticmethod
+    def _resolve_trigger(name: str, naming_scope: UserNamingScope) -> str:
+        """解析写回记忆库时用的「触发词」：优先取该名字来自的那条用户消息。
+
+        用户的原话（「这身是？」「刻律德拉那身」）比裸名字信息更多，检索时也更容易
+        命中；取不到或过长时退回 ``角色解析``。
+        """
+        source = str(naming_scope.sources.get(name) or "").strip()
+        if source and len(source) <= 20:
+            return source
+        return "角色解析"
+
+    @staticmethod
+    async def _write_resolved_to_memory(
+        *,
+        config: CharPromptGuardConfig,
+        resolved: ResolvedCharacter,
+        trigger: str,
+    ) -> None:
+        """把一次成功的角色解析写回记忆库（1.0.21）；失败只记日志。
+
+        走 :meth:`memory.MemoryClient.write`（**现有写回通道**）而不是
+        ``memory.lookup``：解析结果不依赖关键词检索，不需要（也不该）被
+        「检索失败退避窗口」挡住 —— 那条退避是给读取用的。
+
+        写回内容里的三元组照旧由 :meth:`memory.MemoryClient.write` 组装
+        （1.0.20 已修：``core_tags`` / ``diffusion_tags`` / ``opposing_tags``
+        **同时非空**，不要退回只发 ``core_tags``）。
+
+        ``memory.write_back = false`` 时**一条也不写**（用户在配置里明确关掉了写回）；
+        记忆库不可用时 :meth:`memory.MemoryClient.write` 自己吞掉异常并记 INFO。
+        """
+        if resolved.entry is None:
+            return
+        if not memory_api.memory_enabled(config):
+            return
+        section = getattr(config, "memory", None)
+        if getattr(section, "write_back", True) is False:
+            return
+        try:
+            client = memory_api.build_client(config)
+            if client.invalid_base_url:
+                return
+            memory_id = await client.write(
+                trigger_word=trigger,
+                character=memory_api.MemoryCharacter(
+                    name=resolved.entry.name,
+                    game=resolved.entry.game,
+                    aliases=tuple(resolved.entry.aliases),
+                    tag=resolved.entry.resolved_tag(),
+                ),
+                scenario=f"角色解析(LLM)：{resolved.raw_name or resolved.entry.name}",
+            )
+            if memory_id:
+                logger.debug(
+                    f"角色解析结果已写回记忆库：{resolved.entry.name}（id={memory_id}）"
+                )
+        except Exception as e:  # noqa: BLE001 —— 写回失败只记日志，绝不影响生图
+            logger.debug(
+                f"角色解析结果写回记忆库失败（已忽略）: {type(e).__name__}: {e}"
+            )
+
+    def _resolved_for_injection(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        roster: list[CharacterEntry],
+        user_naming: UserNamingScope | None,
+        resolved: CharacterEntry | None,
+    ) -> CharacterEntry | None:
+        """判断是否该走 1.0.21 的入口②（**补入**）；返回要补入的角色或 ``None``。
+
+        条件（全部满足）：
+
+        1. 解析成功（``resolved`` 非空、且带标准标签）；
+        2. 画面里**一个角色标签都没有** —— 用「**角色表内**角色的名字 / 别名 /
+           标准标签在提示词里是否出现」判断（检测文本 = 提示词 + ``detect_args``，
+           与既有的「已含角色」检测同一口径）。注意：**画面里那个表外角色的中文名
+           不算** —— 描述里写了「刻律德拉」而没写任何标准标签时，仍然属于"没有标签"，
+           正是本入口要处理的场景；
+        3. 用户最近说过的话里**没有**这个解析结果（已经写过就没必要再补）。
+
+        画面里已经有角色标签时不在这里动：那种情况属于**替换**（入口①，
+        见 :meth:`_apply_outside_naming_check`），两条入口不会互相打架。
+        """
+        if resolved is None or not resolved.resolved_tag():
+            return None
+        if user_naming is not None and character_in_texts(resolved, user_naming.texts):
+            return None
+        texts = self._detection_texts(content, spec, args)
+        if any(character_in_texts(entry, texts) for entry in roster):
+            return None
+        return resolved
+
+    def _inject_resolved(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        resolved: CharacterEntry,
+        config: CharPromptGuardConfig,
+    ) -> None:
+        """把解析结果按目标模式**补进**提示词（1.0.21 入口②）。
+
+        只是 :meth:`_resolved_presentation` 的「写回 args」外壳 —— 与既有注入共用
+        同一批模板 / 同一个 ``tag_completion`` 开关，**不新造一套格式**。
+        """
+        args[spec.prompt_arg] = self._resolved_presentation(
+            content=content, spec=spec, args=args, resolved=resolved, config=config
+        )
+
+    def _resolved_presentation(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        resolved: CharacterEntry,
+        config: CharPromptGuardConfig,
+    ) -> str:
+        """把解析结果的表现层合并进 ``content`` 并返回（1.0.21 入口①/②共用）。
+
+        - ``natural``：复用既有的追加模板
+          （``（画面角色：“<中文名>”，出自游戏《<作品名>》）``），并在
+          ``tag_completion`` 开启时把转义标准标签**写进提示词最前面** ——
+          实测下游翻译模型会把中文角色名翻坏，标签才是最稳的那一层；
+        - ``tags``：直接复用既有的标签追加逻辑（``_apply``）。
+
+        入口②（补入）与入口①（替换）都走这里：替换之后画面里只有模型给的英文标签，
+        natural 模式若不补中文说明，用户看到的仍旧是"角色没进去"（实测 C72）。
+        """
+        if spec.append_mode == APPEND_MODE_TAGS:
+            merged = self._apply(
+                args=args,
+                spec=spec,
+                content=content,
+                characters=[resolved],
+                config=config,
+                control=BotControl(),
+            )
+            return content if merged is None else merged
+        clause = self._build_resolved_append_text(resolved, config)
+        tag = resolved.resolved_tag()
+        pieces = [content.rstrip()]
+        if clause:
+            pieces.append(clause)
+        merged = "\n".join(piece for piece in pieces if piece)
+        if tag and config.general.tag_completion and not content_contains_tag(merged, tag):
+            merged = f"{tag}, {merged}".strip().rstrip(",").rstrip()
+        return merged
+
+    def _build_resolved_append_text(
+        self, resolved: CharacterEntry, config: CharPromptGuardConfig
+    ) -> str:
+        """:meth:`_build_append_text` 的**不会抛异常**版本（1.0.21）。
+
+        解析出来的名字／作品名是**模型给的自由文本**：万一里面带 ``{`` ``}``，
+        ``str.format`` 会抛 ``ValueError`` 甚至 ``KeyError``。这里兜住并退回
+        「（画面角色：“<名字>”）」，绝不让一次格式化失败拦住生图。
+        """
+        try:
+            return self._build_append_text(resolved, config)
+        except Exception as e:  # noqa: BLE001 —— 模板填充失败就退回最简写法
+            logger.debug(f"追加模板填充失败，退回最简写法: {type(e).__name__}: {e}")
+            return f"（画面角色：“{resolved.name}”）"
+
+    @staticmethod
+    def _resolved_origin(entry: CharacterEntry) -> str:
+        """解析结果的来源说明（进替换日志，1.0.21）。
+
+        形如 ``刻律德拉 → Kleidra，作品《崩坏：星穹铁道 (Honkai: Star Rail)》``：
+        英文名优先取别名里的 ASCII 写法（模型给的 ``name_en``），没有别名时退回
+        标准标签；作品名用解析出的 ``game``。两份信息都取不到时只写名字 ——
+        **绝不编造**（日志与画面用同一份数据，用户对着日志就能核对画面）。
+        """
+        english = next(
+            (
+                alias.strip()
+                for alias in entry.aliases
+                if alias.strip() and alias.strip().isascii()
+            ),
+            "",
+        )
+        origin = f"{entry.name} → {english or entry.resolved_tag()}"
+        game = entry.game.strip()
+        return f"{origin}，作品《{game}》" if game else origin
+
+    async def _apply_outside_naming_check(
         self,
         *,
         content: str,
@@ -2419,8 +2910,9 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         config: CharPromptGuardConfig,
         naming_scope: UserNamingScope | None = None,
+        resolved: CharacterEntry | None = None,
     ) -> str:
-        """「用户点名了角色表外角色」的冲突检测（1.0.20）。
+        """「用户点名了角色表外角色」的冲突检测（1.0.20；1.0.21 起会**替换**）。
 
         与 :meth:`_apply_consistency_check`（期望集合对账）**完全独立、可各自触发**：
 
@@ -2438,11 +2930,21 @@ class CharacterGuardHandler(BaseEventHandler):
         3. 这批用户消息里**没有提过** ``Y``（用户这次没点它）。
 
         任一不成立 → 不判冲突，只记 DEBUG（保持 1.0.19 行为：用户点过画面的角色、
-        或压根没有表外点名时，一个字都不动）。
+        或压根没有表外点名时，一个字都不动）。没有表外点名时，画面里的表内角色
+        **都在用户自己说过的话里**的话仍报「正常」（画面与用户说法一致），
+        否则才是真正的「跳过」（没有可对账的另一侧）。
+
+        **1.0.21 起的 ``fix`` 分两种结局**：``general.auto_resolve_characters`` 开着
+        且解析成功（``resolved`` 非空）时，把画面里的 ``Y`` **替换**成解析出的标签
+        （而不是只删除），并按 :meth:`_resolved_presentation` 补上 natural 模式的
+        中文说明与标准标签 —— 用户反馈的正是「删掉之后没有补上正确角色的标签」；
+        解析失败（``unknown`` / 超时 / 标签非法）时逐字退回 1.0.20 的删除行为。
 
         Args:
             content: **已经是最终文本**（既有对账若修正过，这里是修正后的内容 ——
                 本方法在 :meth:`_finalize` 里跑在 :meth:`_apply_consistency_check` 之后）
+            resolved: 本次**预解析**出的表外角色（1.0.21；调用方只对第一个表外点名
+                解析一次，``None`` 表示没解析或解析失败）
         """
         mode = (
             str(getattr(config.general, "consistency_check", "") or "").strip().lower()
@@ -2452,18 +2954,35 @@ class CharacterGuardHandler(BaseEventHandler):
         if mode not in {"warn", "fix"}:
             # 非法取值在上面那条检查里已经记过 WARNING，这里静默按 warn 处理
             mode = "warn"
+        texts = self._detection_texts(content, spec, args)
         if naming_scope is None or not naming_scope.names:
-            logger.debug("表外点名检查=跳过（用户最近的几条消息里没有角色表外的点名）")
+            present = [entry for entry in roster if character_in_texts(entry, texts)]
+            named = {
+                entry_key(entry)
+                for entry in roster
+                if naming_scope is not None
+                and character_in_texts(entry, naming_scope.texts)
+            }
+            if present and all(entry_key(entry) in named for entry in present):
+                # 没有表外点名，但画面里的表内角色**都是用户自己点过的**：
+                # 画面与用户说法一致 —— 报「正常」，别让用户以为这条检查没跑
+                logger.debug(
+                    "表外点名检查=正常（画面里的角色表内角色都在用户最近说过的话里"
+                    f"出现过：{_entry_names(present)}；表外点名=无）"
+                )
+            else:
+                logger.debug(
+                    "表外点名检查=跳过（用户最近的几条消息里没有角色表外的点名）"
+                )
             return content
 
-        texts = self._detection_texts(content, spec, args)
         present = [entry for entry in roster if character_in_texts(entry, texts)]
-        # 冲突 = 画面里有、但用户这批消息里**没点过**的角色表内角色
-        conflicts = [
-            entry
-            for entry in present
-            if not character_in_texts(entry, naming_scope.texts)
-        ]
+        # 冲突 = 画面里有、但用户这批消息里**没点过**的角色表内角色。
+        # 1.0.21：刚由解析结果替换进来的那个角色不算冲突（它就是用户点名的角色）。
+        # 规则与 _conflicting_roster_entries 完全一致（那边是"该不该解析"的预判）。
+        conflicts = _conflicting_roster_entries(
+            texts, roster, naming_scope, exclude=resolved
+        )
         if not conflicts:
             logger.debug(
                 "表外点名检查=正常（画面里的角色表内角色都在用户最近说过的话里"
@@ -2484,9 +3003,38 @@ class CharacterGuardHandler(BaseEventHandler):
             logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suggestion}")
             return content
 
-        # fix：**删除**画面里那个角色的可识别文本。
-        # 为什么是删除而不是替换：用户点名的是角色表**外**的角色，插件没有它的
-        # 标准标签（也绝不编造游戏名/标签），拿别的角色顶上只会错得更彻底。
+        # fix ①：1.0.21 起优先**替换**（解析成功时）。
+        # 为什么替换比删除好：用户要的就是「这个角色的提示词进去」—— 画面里那个过期的
+        # 旧标签删掉却不补正确标签，用户侧看到的是「角色没进去」（实测反馈）。
+        # 替换范围仍然**只用已知字符串**：错误角色的名字 / 别名 / 标准标签 →
+        # 一个由模型解析、且已被规范校验过的标准标签（不猜、不编）。
+        if resolved is not None and resolved.resolved_tag():
+            replaced = content
+            hits = 0
+            for entry in conflicts:
+                replaced, count = replace_character_reference(replaced, entry, resolved)
+                hits += count
+            if hits > 0 and not any(
+                character_in_texts(entry, self._detection_texts(replaced, spec, args))
+                for entry in conflicts
+            ):
+                # 依据必须体现**来源**：这次替换用的不是判定集合，而是角色解析(LLM)
+                # 的结果（用户对着日志才能看出「凭什么把花火换成刻律德拉」）
+                logger.info(
+                    f"一致性检查=冲突已修正（fix）：把画面里的「{_entry_names(conflicts)}」"
+                    f"替换为「{resolved.name or resolved.tag}」（替换 {hits} 处），"
+                    f"依据=角色解析(LLM):{self._resolved_origin(resolved)}"
+                )
+                # natural 模式补中文说明 + 标准标签（tags 模式补标签）：
+                # 否则画面里只剩模型给的英文标签，用户侧仍旧是"角色没进去"
+                return self._resolved_presentation(
+                    content=replaced, spec=spec, args=args, resolved=resolved, config=config
+                )
+
+        # fix ②：解析失败（unknown / 超时 / 标签非法）或替换不成功时，
+        # 逐字退回 1.0.20 的**删除**行为 —— 宁可不补，也不要留着错的标签。
+        # 为什么是删除而不是拿别的角色顶上：插件手上没有表外角色的标准标签，
+        # 拿另一个角色顶上只会错得更彻底。
         cleaned = content
         removed = 0
         for entry in conflicts:
@@ -2512,7 +3060,7 @@ class CharacterGuardHandler(BaseEventHandler):
 
     # ── 收尾：二次一致性检测 → 按需写回 ────────────────────────────
 
-    def _finalize(
+    async def _finalize(
         self,
         *,
         params: dict[str, Any],
@@ -2527,6 +3075,7 @@ class CharacterGuardHandler(BaseEventHandler):
         track: SubjectTrack | None = None,
         memory: memory_api.MemoryLookup | None = None,
         naming_scope: UserNamingScope | None = None,
+        resolved: CharacterEntry | None = None,
     ) -> tuple[EventDecision, dict[str, Any]]:
         """统一的收尾：跑二次一致性检测，内容有变化才回写 args。
 
@@ -2540,29 +3089,42 @@ class CharacterGuardHandler(BaseEventHandler):
            + 记忆库确认结果）对账；
         2. :meth:`_apply_outside_naming_check`：与「用户最近几条**用户消息**」对账
            （``naming_scope``）—— 用户点名了**角色表外**的角色、画面里却是用户
-           这次没点过的角色表内角色时报警 / 删除。
+           这次没点过的角色表内角色时报警 / 替换 / 删除。
 
         第 2 条跑在第 1 条**之后**：第 1 条若已修正过内容，第 2 条按**修正后**的文本
         再判一次；两条都命中时日志各留一条，互不覆盖。
+
+        **1.0.21**：``resolved`` 是本次预解析出的表外角色（见
+        :meth:`_resolve_outside_character`），只交给第 2 条做**替换** + 补中文说明。
+
+        .. note::
+           1.0.21 修正（实测回归）：解析结果**不再并进第 1 条的判定集合**。
+           并进去时 ``fix`` 模式的对账会抢在入口①之前做替换，日志依据被写成
+           ``判定集合=…``、natural 模式的中文说明也没补上（用例 C72 就是这么失败的）。
+           对账只负责它自己的证据（判定集合 / 主题跟踪 / 记忆库）；解析结果的替换、
+           中文说明与标准标签统一由入口①（:meth:`_apply_outside_naming_check`）处理，
+           依据里就能看出「用的是角色解析(LLM)」。也不会因此误报：解析出的角色是
+           角色表**之外**的，不可能被对账的 ``extras``（只遍历角色表）算成冲突。
         """
         checked = self._apply_consistency_check(
             content=final_content,
             spec=spec,
             args=args,
             roster=roster,
-            decided=decided,
+            decided=list(decided),
             config=config,
             basis=basis,
             track=track,
             memory=memory,
         )
-        checked = self._apply_outside_naming_check(
+        checked = await self._apply_outside_naming_check(
             content=checked,
             spec=spec,
             args=args,
             roster=roster,
             config=config,
             naming_scope=naming_scope,
+            resolved=resolved,
         )
         if checked != original:
             args[spec.prompt_arg] = checked

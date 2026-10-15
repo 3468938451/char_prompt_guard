@@ -60,6 +60,25 @@ class CharPromptGuardConfig(BaseConfig):
                 "关闭后回到旧行为：角色表在上文命中就不再问 LLM（更省 token）"
             ),
         )
+        auto_resolve_characters: bool = Field(
+            default=True,
+            description=(
+                "角色不在角色表（或角色表条目缺标准标签）时，是否调用已配置的模型把它解析成"
+                "「正式名 + 作品名 + NAI 标签」（与角色提取同一套 llm_api，模型沿用 translate_model，"
+                "超时沿用 llm_timeout，不引入新依赖）。解析成功后："
+                "① 用户点名表外角色、而画面里挂着**用户这次没点过**的角色表内标签时，"
+                "把画面里那个错误标签**替换**成解析出的标签（consistency_check=fix 时；"
+                "warn 时只在「画面里没有任何角色标签」那种情况下补入）；"
+                "② 用户点名表外角色、而画面里**没有任何角色标签**（例如描述只写了外观）时，"
+                "按目标的 natural / tags 模式把解析结果**补进**提示词最前面；"
+                "③ 额外打一条 INFO 给出可直接粘贴的角色表行（**只打日志，绝不自动改配置文件**）。"
+                "解析结果会缓存（进程内 24 小时）并可用于后续注入；"
+                "memory.write_back 开启时还会把这次解析写回记忆库（沿用现有写回通道）。"
+                "unknown=true / JSON 解析失败 / 标签不符合规范 / confidence 低于 0.5 → 视为解析失败，"
+                "退回 1.0.20 的行为（warn 只报、fix 只删除）；任何异常都只记日志，绝不拦住生图。"
+                "关闭后**完全退回 1.0.20 行为**（一次模型调用都不发）"
+            ),
+        )
         tag_completion: bool = Field(
             default=True,
             description=(
@@ -112,7 +131,13 @@ class CharPromptGuardConfig(BaseConfig):
                 "即为冲突 —— off 完全不检查（连用户消息都不扫）、warn 只打 WARNING 且内容"
                 "一字不改、fix **删除**画面里那个错误角色的名字/别名/标准标签（用户点名的"
                 "角色没有标准标签可替换，只能删；外观描述原文保留）。它与期望集合对账"
-                "互相独立、可各自触发（实测事故里期望集合为空、只有这条能发现冲突）"
+                "互相独立、可各自触发（实测事故里期望集合为空、只有这条能发现冲突）。"
+                "1.0.21 起这条 fix 会先尝试用 general.auto_resolve_characters 解析出表外角色的"
+                "标准标签：解析成功则把画面里的错误标签**替换**成解析出的标签（而不是只删除），"
+                "并按 natural 补中文说明、按 tag_completion 补标准标签，日志为「一致性检查="
+                "冲突已修正（fix）：把画面里的「花火」替换为「刻律德拉」（替换 N 处），"
+                "依据=角色解析(LLM):刻律德拉 → Kleidra，作品《崩坏：星穹铁道 (Honkai: Star Rail)》」；"
+                "解析失败（unknown / 超时 / 标签非法）时行为与 1.0.20 一致"
             ),
         )
         skip_on_self_reference: bool = Field(
@@ -187,7 +212,8 @@ class CharPromptGuardConfig(BaseConfig):
                 "供 image_generator_plugin-neo 这类「提示词即标签」的生图插件直接使用；"
                 "nai_artist 不需要该列。建议游戏名带英文作品名、别名带英文角色名。"
                 "多行或分号(;)分隔均可；整行以 # 开头为注释。留空则只用 LLM 从上文识别角色。"
-                "例：爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia | elysia \\(honkai impact 3rd\\)"
+                "示例（只有一行，按同样格式逐行添加你自己的角色，照抄改掉即可）："
+                "爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | elysia \\(honkai impact 3rd\\)"
             ),
         )
 

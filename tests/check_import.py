@@ -278,6 +278,29 @@ def main() -> int:
             cfg.memory.memory_type == "knowledge",
             f"memory.memory_type={cfg.memory.memory_type!r}",
         )
+        # 1.0.21 新增：角色表之外的角色用已配置的模型解析成标准标签
+        check(
+            "1.0.21 默认启用角色解析（auto_resolve_characters）",
+            cfg.general.auto_resolve_characters is True,
+            f"auto_resolve_characters={cfg.general.auto_resolve_characters!r}",
+        )
+        # 1.0.21：角色表示例只留一行「爱莉希雅」（方便照抄改掉），
+        # 但四列写法、分隔符与注释规则仍然写在说明里。
+        # 说明文本从模型字段里读：框架自己的 Field 与 pydantic v2 的 FieldInfo
+        # 都有 .description（分别从类属性 / model_fields 取），
+        # 两处都取不到时用空串 —— 断言会因此失败，正好暴露差异。
+        roster_field = type(cfg.roster).__dict__.get("characters")
+        if roster_field is None:
+            roster_field = type(cfg.roster).model_fields.get("characters")
+        roster_desc = str(getattr(roster_field, "description", "") or "")
+        check(
+            "1.0.21 角色表示例只留一行爱莉希雅（照抄改掉即可）",
+            "爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | "
+            r"elysia \(honkai impact 3rd\)" in roster_desc
+            and "伊甸" not in roster_desc
+            and "留空则只用 LLM 从上文识别" in roster_desc,
+            f"characters.description={roster_desc!r}",
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
 
@@ -607,6 +630,162 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("表外点名模块可调用", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.21 角色解析（1.0.21）：标签规范、严格校验、入口与开关 ──────────
+    # 这一节只做「装得上、调得动」的冒烟 —— 完整的替换 / 补入行为在
+    # check_logic.py 的 C72~C76；这里钉住三件事：
+    # ① 标签规范真的会拦住模型的常见错法（大写、括号未转义、全角括号）；
+    # ② unknown / 标签非法 / confidence 太低一律判成**解析失败**（返回 None）；
+    # ③ 入口与缓存函数都在，且「关掉开关时一次模型都不问」。
+    try:
+        from .. import handler as guard_handler
+        from ..character import (
+            CHARACTER_RESOLVE_MIN_CONFIDENCE,
+            RESOLVE_CACHE_TTL_SECONDS,
+            parse_resolution_payload,
+            reset_resolve_cache,
+            resolve_cache_get,
+            resolve_cache_put,
+            validate_tag,
+        )
+        from ..character import resolve_character_via_llm as _resolve_fn
+        from ..config import CharPromptGuardConfig as ResolveCfg
+
+        good = r"kleidra \(honkai: star rail\)"
+        check(
+            "1.0.21 标签规范：合法标签通过",
+            validate_tag(good)[0] is True,
+            f"validate_tag({good!r}) = {validate_tag(good)!r}",
+        )
+        bad_tags = {
+            "大写 + 括号未转义": "Kleidra (Honkai: Star Rail)",
+            "全角括号": "kleidra（honkai: star rail）",
+            "括号未转义": "kleidra (honkai: star rail)",
+            "没有作品名括号": "kleidra",
+            "大写作品名": "kleidra \\(Honkai: Star Rail\\)",
+            "空": "",
+        }
+        rejected = {
+            label: validate_tag(tag)[0] is False for label, tag in bad_tags.items()
+        }
+        check(
+            "1.0.21 标签规范：大写 / 未转义括号 / 全角括号 / 空标签全部拦下",
+            all(rejected.values()),
+            f"逐项 = {rejected!r}",
+        )
+
+        ok_payload = {
+            "unknown": False,
+            "name_cn": "刻律德拉",
+            "name_en": "Kleidra",
+            "game_cn": "崩坏：星穹铁道",
+            "game_en": "Honkai: Star Rail",
+            "tag": good,
+            "confidence": 0.9,
+        }
+        entry, reason, confidence = parse_resolution_payload(ok_payload)
+        check(
+            "1.0.21 解析结果：合法 JSON → 条目（名字 / 作品名 / 标签 / 英文别名）",
+            entry is not None
+            and entry.name == "刻律德拉"
+            and entry.game == "崩坏：星穹铁道 (Honkai: Star Rail)"
+            and entry.resolved_tag() == good
+            # 别名**按模型给的原文**保留（这里模型写的是 name_en=`Kleidra`，就存
+            # `Kleidra`，不会被改写成小写）；比较走大小写不敏感 —— 与实现
+            # （``aliases`` 用小写去重、但保留第一次出现的写法）保持一致
+            and "Kleidra" in entry.aliases
+            and any(alias.lower() == "kleidra" for alias in entry.aliases)
+            and confidence == 0.9
+            and reason == "",
+            f"entry={entry!r} reason={reason!r} confidence={confidence!r}",
+        )
+        unknown_entry, unknown_reason, _ = parse_resolution_payload({"unknown": True})
+        low_entry, low_reason, low_conf = parse_resolution_payload(
+            {**ok_payload, "confidence": 0.2}
+        )
+        bad_entry, bad_reason, _ = parse_resolution_payload(
+            {**ok_payload, "tag": "Kleidra (Honkai: Star Rail)"}
+        )
+        check(
+            "1.0.21 解析结果：unknown / 低 confidence / 非法标签都判失败",
+            unknown_entry is None
+            and "unknown" in unknown_reason
+            and low_entry is None
+            and low_conf == 0.2
+            and str(CHARACTER_RESOLVE_MIN_CONFIDENCE) in low_reason
+            and bad_entry is None
+            and bad_reason != "",
+            f"unknown={unknown_reason!r} low={low_reason!r} bad={bad_reason!r}",
+        )
+
+        check(
+            "1.0.21 解析入口 / 缓存函数存在，缓存 TTL 为 24 小时",
+            callable(_resolve_fn)
+            and callable(reset_resolve_cache)
+            and RESOLVE_CACHE_TTL_SECONDS == 24 * 60 * 60.0
+            and hasattr(
+                guard_handler.CharacterGuardHandler, "_resolve_outside_character"
+            )
+            and hasattr(guard_handler.CharacterGuardHandler, "_resolve_with_cache")
+            and hasattr(guard_handler.CharacterGuardHandler, "_resolved_for_injection")
+            and hasattr(guard_handler.CharacterGuardHandler, "_inject_resolved")
+            # 1.0.21 修正：缓存**读写在调用方**（`_resolve_with_cache`），因此
+            # character 侧必须真的提供可用的读 / 写 / 清空入口 —— 缓存写在被
+            # 用例替换掉的那一层里时，「第二次还要不要问模型」（C75）永远绕不过模型
+            and callable(resolve_cache_get)
+            and callable(resolve_cache_put),
+        )
+
+        async def _check_resolve_off() -> None:
+            from ..character import CharacterEntry as _Entry
+
+            cfg = ResolveCfg()
+            cfg.general.auto_resolve_characters = False
+            reset_resolve_cache()
+            instance = guard_handler.CharacterGuardHandler(None)
+            scope = guard_handler.UserNamingScope(names=["刻律德拉"])
+            off_result = await instance._resolve_outside_character(
+                config=cfg,
+                naming_scope=scope,
+                texts=[r"kleidra \(honkai: star rail\)"],
+                roster=[
+                    _Entry(
+                        name="花火",
+                        game="崩坏：星穹铁道 (Honkai: Star Rail)",
+                        aliases=["hanabi"],
+                        tag=r"hanabi \(honkai: star rail\)",
+                    )
+                ],
+            )
+            # 开关开着、但画面里的角色是**用户这次点过的**表内角色 →
+            # 既没有冲突可替换、也没有空缺要补入 → 同样一次模型都不问
+            cfg.general.auto_resolve_characters = True
+            idle_result = await instance._resolve_outside_character(
+                config=cfg,
+                naming_scope=guard_handler.UserNamingScope(
+                    names=["刻律德拉"],
+                    texts=["画花火吧，顺便看看这身"],
+                    sources={"刻律德拉": "画花火吧，顺便看看这身"},
+                ),
+                texts=[r"hanabi \(honkai: star rail\), 白发少女"],
+                roster=[
+                    _Entry(
+                        name="花火",
+                        game="崩坏：星穹铁道 (Honkai: Star Rail)",
+                        aliases=["hanabi"],
+                        tag=r"hanabi \(honkai: star rail\)",
+                    )
+                ],
+            )
+            check(
+                "1.0.21 auto_resolve_characters=false / 没有入口用得上 → 一次模型都不问",
+                off_result is None and idle_result is None,
+                f"off={off_result!r} idle={idle_result!r}",
+            )
+
+        asyncio.run(_check_resolve_off())
+    except Exception as e:  # noqa: BLE001
+        check("角色解析模块可调用", False, f"{type(e).__name__}: {e}")
 
     print("-" * 72)
     if _failures:

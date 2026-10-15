@@ -97,6 +97,28 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
 - C71（防误报）：用户消息里没有任何表外点名（只有「嗯」「行～」）→ 行为与 1.0.19
   完全一致（既有对账怎么跳过的、这次还怎么跳过）。
 
+1.0.21 起补上「删掉之后没有补上正确角色的标签」这半边（C72~C76），起因是用户反馈
+「这个角色的提示词没有进去」：1.0.20 的 `fix` 只把画面里那个过期的错误标签**删掉**，
+没有补上用户真正点名的角色。1.0.21 新增 `general.auto_resolve_characters`（默认开），
+用**已配置的模型**把表外角色解析成「正式名 + 作品名 + NAI 标签」，再走两个入口
+（**替换** / **补入**）。这几条用例用假解析函数（monkeypatch
+`character.resolve_character_via_llm`，见 :class:`FakeResolve`）跑，不需要真调模型：
+
+- C72：表外点名「刻律德拉」+ 画面含 `hanabi \(honkai: star rail\)` +
+  `consistency_check="fix"` + 解析成功 → 画面里的错误标签被**替换**成
+  `kleidra \(honkai: star rail\)`，并带上 natural 模式的中文说明；日志里的依据必须
+  写明**来源**（`依据=角色解析(LLM):刻律德拉 → Kleidra…`，而不是 `判定集合=…`），
+  且解析成功一律额外打一条 `建议加入角色表：…`（只打日志、不改配置文件）；
+- C73：解析返回 `unknown=true` → 退化为 1.0.20 的删除行为（不含 hanabi，也不补新标签）；
+- C74：解析抛超时 / 异常 → 不崩、同样按 1.0.20 行为处理；
+- C75：同一角色解析两次 → 第二次**不再调用模型**（计数器为 1），日志 `角色解析(缓存)`。
+  **缓存必须由调用方持有**（`handler._resolve_with_cache`：读 / 写都在被打桩的那一层
+  **之外**）—— 缓存留在 `character.resolve_character_via_llm` 里时，桩一装上去缓存就
+  一起没了，第二次照样问模型，这条用例正是为此守的；
+- C76（防回归）：角色**在角色表内**时**完全不做解析**（调用次数 0），行为同 1.0.20；
+  预判不满足只留一条 DEBUG `角色解析=跳过（<原因>）`（没有 `角色解析(LLM)` 成败行、
+  也没有 `角色解析(缓存)`）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -431,6 +453,97 @@ async def fire(cfg: CharPromptGuardConfig, params: dict) -> dict:
     return out
 
 
+class FakeResolve:
+    """上下文管理器：替换角色解析函数，模拟（或统计）模型调用（1.0.21）。
+
+    插件里唯一需要替换的是 ``character.resolve_character_via_llm``
+    （``handler`` 在模块级 ``from .character import resolve_character_via_llm``，
+    所以两个位置都要替换），因此用例不必起 LLM 运行时、也不会真的发请求：
+
+    - ``payload`` 是模型「返回」的 JSON 字典 —— 用
+      ``character.parse_resolution_payload`` 走**与插件完全同一条**校验链，
+      于是「非法标签 / unknown / confidence 太低」这些分支都被真实覆盖；
+    - ``error`` 非空时抛该异常（超时 / 网络故障的替身）；
+    - ``calls`` 记录每一次调用（原始角色名），用例据此断言调用次数。
+
+    退出 with 块时恢复原函数，并清掉解析缓存 —— 免得上一条用例的缓存把
+    下一条用例的「该不该问模型」判断带偏。
+    """
+
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.payload = payload if payload is not None else {"unknown": True}
+        self.error = error
+        self.calls: list[str] = []
+        self._original_character = None
+        self._original_handler = None
+
+    async def __call__(self, name: str, **kwargs):
+        """假解析函数：记录调用，再按 payload / error 返回。"""
+        from ..character import ResolvedCharacter, parse_resolution_payload
+
+        self.calls.append(name)
+        if self.error is not None:
+            raise self.error
+        entry, reason, confidence = parse_resolution_payload(self.payload)
+        if entry is None:
+            return ResolvedCharacter(
+                reason=reason, confidence=confidence, raw_name=name
+            )
+        return ResolvedCharacter(
+            entry=entry,
+            source="模型",
+            confidence=confidence,
+            raw_name=name,
+        )
+
+    def __enter__(self) -> Self:
+        from .. import character as character_module
+        from .. import handler as handler_module
+
+        self._original_character = character_module.resolve_character_via_llm
+        self._original_handler = handler_module.resolve_character_via_llm
+        character_module.resolve_character_via_llm = self  # type: ignore[assignment]
+        handler_module.resolve_character_via_llm = self  # type: ignore[assignment]
+        # 清缓存放在**替换之后**：这里清的是上一条用例留下的结果，
+        # 免得它把本条的「该不该问模型」判断带偏。
+        character_module.reset_resolve_cache()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        from .. import character as character_module
+        from .. import handler as handler_module
+
+        if self._original_character is not None:
+            character_module.resolve_character_via_llm = self._original_character
+        if self._original_handler is not None:
+            handler_module.resolve_character_via_llm = self._original_handler
+        character_module.reset_resolve_cache()
+        return False
+
+
+#: 表外角色「刻律德拉」的假解析结果（与需求里的字段一一对应）
+KLEIDRA_PAYLOAD = {
+    "unknown": False,
+    "name_cn": "刻律德拉",
+    "name_en": "Kleidra",
+    "game_cn": "崩坏：星穹铁道 (Honkai: Star Rail)",
+    "game_en": "Honkai: Star Rail",
+    "tag": r"kleidra \(honkai: star rail\)",
+    "confidence": 0.9,
+}
+TAG_KLEIDRA = r"kleidra \(honkai: star rail\)"
+#: 「刻律德拉」场景的画面描述（与 C68/C69 同一段外观描述）
+KLEIDRA_SCENE = (
+    "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
+    "头上戴着蓝白饰冠，一身蓝裙，手里握着长杖"
+)
+
+
 def natural_params(
     content: str, mode: str = "drawing", text: str = "我们来聊爱莉希雅吧"
 ) -> dict:
@@ -543,6 +656,12 @@ def action_getter_for(registry: dict[str, type] | None = None):
 
 async def run_cases() -> int:
     """跑全部用例。"""
+    # 1.0.21：先清掉角色解析的进程内缓存 —— 否则同一次进程里重跑时，
+    # C68/C69 这类**没配假解析函数**的用例会（按 10 分钟负缓存）跳过模型调用，
+    # 缓存状态就会影响「该不该问模型」的断言。
+    from ..character import reset_resolve_cache
+
+    reset_resolve_cache()
     print(f"框架根   : {NEO_ROOT}")
     print(f"插件目录 : {PLUGIN_DIR}")
     print(f"LLM 用例 : {'开' if RUN_LLM else '关（加 --llm 打开）'}")
@@ -3239,6 +3358,254 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C71 没有表外点名 → 行为与 1.0.19 一致（内容不变、无新告警）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C72 角色解析成功 → **替换**画面里的错误标签（1.0.21）──────────────
+    # 用户反馈：1.0.20 的 fix 把画面里的 hanabi 删掉了，却没有补上「刻律德拉」的标签
+    # → 用户侧看到的是「这个角色的提示词没有进去」。1.0.21 起先用已配置的模型解析出
+    # 正式名 + 作品名 + NAI 标签，再拿它**替换**（而不是只删除）：
+    #   `hanabi \(honkai: star rail\)` → `kleidra \(honkai: star rail\)`
+    # 并在 natural 模式补上中文说明（（画面角色：“刻律德拉”，出自游戏《…》））。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        with FakeResolve(KLEIDRA_PAYLOAD) as stub, FakeHistory(
+            [history_message("这身是「刻律德拉」？", 1.0)]
+        ), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": KLEIDRA_SCENE},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c72",
+                },
+            )
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "hanabi" not in c.lower()  # 错误标签没了
+            and "Hanabi" not in c
+            and "花火" not in c
+            and TAG_KLEIDRA in c  # ★ 正确角色的标签进来了
+            and "刻律德拉" in c  # natural 模式的中文说明
+            and "画面角色" in c
+            and "崩坏：星穹铁道" in c  # 作品名也在（追加模板里的 {game}）
+            and "银白色长发的少女站在镜头前" in c  # 外观描述原文保留
+            and "蓝白饰冠" in c
+            and "长杖" in c
+            and "角色解析" in records  # 解析日志
+            and "替换" in records  # 「一致性检查=冲突已修正（fix）：把画面里的…替换为…」
+            and "依据=角色解析(LLM)" in records
+            and stub.calls == ["刻律德拉"]  # 只问一次模型
+            and "建议加入角色表" in records  # 只打日志的「建议加入角色表」也在
+        )
+        check(
+            "C72 解析成功 → 用解析出的标签替换画面里的错误标签",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C72 解析成功 → 用解析出的标签替换画面里的错误标签",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C73 解析返回 unknown=true → 退化为 1.0.20 的删除行为（1.0.21）──────
+    # 模型不认识这个角色（或没把握）时必须**什么都不补**：不能拿别的角色顶上，
+    # 也不能凭空造标签。行为与 1.0.20 逐字一致 —— 删掉画面里的错误标签，
+    # 并且**不出现任何新标签**。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        with FakeResolve({"unknown": True}) as stub, FakeHistory(
+            [history_message("这身是「刻律德拉」？", 1.0)]
+        ), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": KLEIDRA_SCENE},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c73",
+                },
+            )
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "hanabi" not in c.lower()  # 旧标签被删
+            and "Hanabi" not in c
+            and "花火" not in c
+            and "Honkai" not in c
+            and "kleidra" not in c.lower()  # ★ 没有补任何新标签
+            and "刻律德拉" not in c  # 也没有中文说明（unknown → 不补）
+            and "画面角色" not in c
+            and "银白色长发的少女站在镜头前" in c  # 外观描述原文保留
+            and "长杖" in c
+            and "角色解析" in records
+            and "unknown" in records  # 失败原因写清楚
+            and "替换" not in records  # 没走替换分支
+            and "一致性检查=冲突已修正（fix）：删除画面里的「花火」标签" in records
+            and stub.calls == ["刻律德拉"]
+        )
+        check(
+            "C73 解析 unknown=true → 退化为 1.0.20 的删除（不补新标签）",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C73 解析 unknown=true → 退化为 1.0.20 的删除（不补新标签）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C74 解析超时/异常 → 不崩、同样按 1.0.20 的行为处理（1.0.21）────────
+    # 模型端挂起或网络故障时绝不能拦住生图：异常只记日志，内容按 1.0.20 处理
+    # （fix 删除错误标签），且**日志里必须能看到失败原因**，便于用户排查。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        with FakeResolve(error=TimeoutError("timed out")) as stub, FakeHistory(
+            [history_message("这身是「刻律德拉」？", 1.0)]
+        ), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": KLEIDRA_SCENE},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c74",
+                },
+            )
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "hanabi" not in c.lower()  # 不崩：按 1.0.20 的 fix 删掉错误标签
+            and "花火" not in c
+            and "kleidra" not in c.lower()
+            and "刻律德拉" not in c
+            and "银白色长发的少女站在镜头前" in c
+            and "角色解析" in records
+            and "TimeoutError" in records  # 失败原因（超时/异常）
+            and "替换" not in records
+            and stub.calls == ["刻律德拉"]
+        )
+        check(
+            "C74 解析超时/异常 → 不崩、按 1.0.20 行为处理",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C74 解析超时/异常 → 不崩、按 1.0.20 行为处理",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C75 同一角色解析两次 → 第二次命中缓存，不再调用模型（1.0.21）────────
+    # 同一句话里连续生两张图时不该重复问模型：解析结果进**进程内缓存**
+    # （成功 24 小时），第二次的日志是 `角色解析(缓存)`，调用计数器必须停在 1。
+    # 两次的内容也要求逐字一致 —— 缓存不能带来行为差异。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        history = [history_message("这身是「刻律德拉」？", 1.0)]
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": KLEIDRA_SCENE},
+            "message": FakeMessage("嗯"),
+            "stream_id": "s-c75",
+        }
+        with FakeResolve(KLEIDRA_PAYLOAD) as stub, FakeHistory(history):
+            with LogCapture() as first_logs:
+                first = await fire(cfg, params)
+            with LogCapture() as second_logs:
+                second = await fire(cfg, params)
+        c1 = first["args"]["content"]
+        c2 = second["args"]["content"]
+        first_text = first_logs.records_text()
+        second_text = second_logs.records_text()
+        ok = (
+            len(stub.calls) == 1  # ★ 第二次不再调用模型
+            and "角色解析(缓存)" in second_text  # 日志写明命中缓存
+            and "角色解析(缓存)" not in first_text  # 第一次是模型给的
+            and "来源=模型" in first_text
+            and c1 == c2  # 缓存不改变结果
+            and TAG_KLEIDRA in c2
+        )
+        check(
+            "C75 同一角色解析两次 → 第二次命中缓存（不再调用模型）",
+            ok,
+            f"解析调用 = {stub.calls!r}\n        content = {c2!r}\n"
+            f"        第一次日志（片段） = {first_text[-220:]!r}\n"
+            f"        第二次日志（片段） = {second_text[-220:]!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C75 同一角色解析两次 → 第二次命中缓存（不再调用模型）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C76（防回归）角色在角色表内 → **完全不做解析**（1.0.21）────────────
+    # 表内角色本来就有标准标签，没有任何理由去问模型：用户这次点过画面里那个角色
+    # （没有冲突可替换），画面里也有角色标签（没有空缺要补入）→ **一次模型都不问**，
+    # 行为与 1.0.20 完全一致（画面里的标签一字不改）。
+    # 解析 stub 在这里的作用是**计数器**：只要插件真的调用了模型，这条就会失败。
+    #
+    # 日志断言说明（1.0.21 修正）：预判不满足时会留一条 DEBUG
+    # `角色解析=跳过（<原因>）`（用户要能看出"为什么这次没解析"），所以不能再断言
+    # 「日志里不出现 角色解析」；改成断言**没有任何真的解析动作**（既没有
+    # `角色解析(LLM)` 的成败行、也没有 `角色解析(缓存)`），并额外要求那条跳过原因
+    # 确实打了出来 —— 语义与「完全不做解析」一致，且更严格。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        raw = r"hanabi \(honkai: star rail\), 银白色长发的少女站在镜头前"
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("画花火吧"),
+            "stream_id": "s-c76",
+        }
+        with FakeResolve(KLEIDRA_PAYLOAD) as stub, FakeHistory(
+            [history_message("画花火吧，顺便看看这身", 1.0)]
+        ), LogCapture() as logs:
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            c == raw  # 画面里的表内标签一字不改
+            and "kleidra" not in c.lower()
+            and "刻律德拉" not in c
+            and stub.calls == []  # ★ 表内角色完全不做解析
+            and "角色解析(LLM)" not in records  # 没有解析成功 / 失败行
+            and "角色解析(缓存)" not in records  # 也没有命中缓存
+            and "角色解析=跳过" in records  # ★ 只留一条「为什么跳过」
+            and "表外点名检查=正常" in logs.debugs()  # 走的是 1.0.20 那条判断
+        )
+        check(
+            "C76 角色在角色表内 → 完全不做解析（调用次数 0）",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C76 角色在角色表内 → 完全不做解析（调用次数 0）",
             False,
             f"{type(e).__name__}: {e}",
         )

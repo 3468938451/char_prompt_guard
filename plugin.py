@@ -41,6 +41,21 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
   的角色表内角色即为冲突 —— ``warn`` 只报不改、``fix`` **删除**画面里那个角色的
   名字 / 别名 / 标准标签（**保留外观描述原文**），``off`` 完全不检查。
   它与期望集合对账**互相独立**、可各自触发（跑在 :meth:`_finalize` 里、对账之后）。
+
+1.0.21 起补上「删掉之后没有补上正确角色的标签」这半边（用户反馈「这个角色的提示词
+没有进去」）：新增 ``general.auto_resolve_characters``（默认开）—— 用**已配置的模型**
+（同一套 ``llm_api``，模型沿用 ``general.translate_model``、超时沿用 ``llm_timeout``，
+不引入新依赖）把角色表之外的角色解析成「正式名 + 作品名 + NAI 标签」
+（:func:`character.resolve_character_via_llm`），再走两个入口：
+
+- **替换**：表外点名对账判成冲突 + ``consistency_check="fix"`` + 解析成功 →
+  用解析出的标签**替换**画面里的错误标签（而不是只删除）；
+- **补入**：画面里**没有任何角色标签**（例如描述只写了外观）+ 解析成功 →
+  按 ``natural`` / ``tags`` 模式把解析结果补进提示词最前面（复用既有注入格式）。
+
+解析结果严格校验（``unknown`` / JSON 坏 / 标签不符合规范 / ``confidence`` 低于 0.5
+一律判失败）并缓存（命中缓存不重复问模型）；失败时逐字退回 1.0.20 的行为
+（``warn`` 不变、``fix`` 只删除），**任何异常都不拦住生图**。
 """
 
 from __future__ import annotations
@@ -117,7 +132,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.20"
+    plugin_version: str = "1.0.21"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

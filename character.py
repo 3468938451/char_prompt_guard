@@ -1312,6 +1312,43 @@ def _strip_json_code_fence(raw_text: str) -> str:
     return text
 
 
+def _strip_json_object(raw_text: str) -> str:
+    """从模型输出里抽出**第一个完整的 JSON 对象**（``{`` 到配对的 ``}``）。
+
+    1.0.21 起角色解析要求模型「只输出 JSON」，但实测模型难免多嘴一句
+    （``好的，结果如下：{…}``）或包一层 markdown 代码块。这里先剥代码块，
+    再从第一个 ``{`` 开始按**大括号配对**截出对象本体（遵守字符串与转义，
+    免得 JSON 里的 ``}`` 提前收尾），拿不到配对的 ``}`` 时原样返回，
+    由 ``json.loads`` 报错 —— 调用方统一按「解析失败」降级。
+    """
+    text = _strip_json_code_fence(raw_text or "")
+    start = text.find("{")
+    if start < 0:
+        return text
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text
+
+
 def _is_deepseek_model_entry(model_entry: Any) -> bool:
     """判断模型条目是否指向 DeepSeek 提供商。"""
     if not isinstance(model_entry, dict):
@@ -1498,7 +1535,7 @@ async def extract_characters_via_llm(
             raw_text = await asyncio.wait_for(_run(), timeout=timeout)
         else:
             raw_text = await _run()
-        cleaned_text = _strip_json_code_fence(raw_text)
+        cleaned_text = _strip_json_object(raw_text)
         return _parse_extraction_payload(json.loads(cleaned_text))
     except TimeoutError:
         logger.warning(f"LLM 角色提取超时（{timeout:g}s），本次不补角色")
@@ -1506,3 +1543,458 @@ async def extract_characters_via_llm(
     except Exception as e:  # noqa: BLE001 —— 提取失败只记日志并返回 None（放行生图）
         logger.warning(f"LLM 角色提取失败: {e}")
         return None
+
+
+# ── 角色解析（LLM）：把「角色表之外」的角色解析成标准标签（1.0.21）──────
+#
+# 背景（用户反馈）：用户让 bot 画一个**不在角色表里**的角色（例如「刻律德拉」），
+# 1.0.20 的「表外点名对账」只能 `warn` 报警、或 `fix` **删掉**画面里那个错误的
+# 旧标签（``hanabi \\(honkai: star rail\\)``）—— 删掉之后**没有补上正确角色的标签**，
+# 用户侧表现为"这个角色的提示词没有进去"。
+#
+# 1.0.21 因此多问模型一次：让它给出「正式名 + 作品名 + NAI 标签」，
+# 用它**替换**（fix 场景）或**补入**（画面里没有任何角色标签时）：
+#
+#   · 复用与角色提取**同一套** ``llm_api``（模型沿用 ``general.translate_model``、
+#     超时沿用 ``general.llm_timeout``），不引入任何新依赖；
+#   · 严格校验：``unknown`` / JSON 坏 / 标签不符合规范 / ``confidence`` 低于
+#     :data:`CHARACTER_RESOLVE_MIN_CONFIDENCE` → 一律视为**解析失败**，
+#     退回 1.0.20 的行为（warn 不变 / fix 只删除）；
+#   · 同一角色名**不重复问模型** —— 「什么时候读缓存 / 什么时候写缓存」由**调用方**
+#     决定（``handler._resolve_with_cache``），本模块只提供缓存的存储与 TTL
+#     （``resolve_cache_get`` / ``resolve_cache_put`` / :func:`reset_resolve_cache`）；
+#   · 任何异常（超时 / 网络 / 解析）都只记 DEBUG/WARNING，**绝不拦住生图**。
+#
+# 缓存（1.0.21 修正）：**读写在调用方**（``handler._resolve_with_cache``），
+# 本模块只提供存储 + TTL / 上限常量 + :func:`reset_resolve_cache` 入口。
+# 为什么必须这样分层：解析函数是回归用例替换（打桩）的那一层
+# （``tests/check_logic.py`` 的 ``FakeResolve`` 同时替换 ``character`` 与
+# ``handler`` 里的 ``resolve_character_via_llm``），缓存若写在函数内部，
+# 用例里「第二次还要不要问模型」永远绕过缓存 —— C75 断言的就是这条。
+
+#: 进程内解析结果缓存的有效期（秒）：24 小时。
+#: 角色与作品名是**静态知识**，同一天里没必要反复问模型；重启进程即清空。
+RESOLVE_CACHE_TTL_SECONDS = 24 * 60 * 60.0
+
+#: 解析结果缓存的条数上限（超出即整表清空，避免无上限增长）
+RESOLVE_CACHE_LIMIT = 128
+
+#: 解析失败的**负缓存**有效期（秒）：比成功短得多。
+#: 超时 / 网络抖动是暂时的，不该让同一个角色 24 小时内都不再尝试。
+RESOLVE_FAILURE_TTL_SECONDS = 10 * 60.0
+
+#: 解析结果的 ``confidence`` 阈值（**建议值 0.5**）：低于它就当解析失败，
+#: 退回 1.0.20 的行为 —— 宁可少补一个标签，也不要按模型一半的把握把画面改错。
+CHARACTER_RESOLVE_MIN_CONFIDENCE = 0.5
+
+#: NAI 角色标签的规范：``小写英文名 \\(英文作品名\\)``。
+#:
+#: 允许的字符只有 小写字母 / 数字 / 空格 / ``_`` / ``-`` / ``:`` / ``'`` /
+#: **转义括号** ``\\(`` ``\\)``；括号**必须转义**（未转义的 ``(`` ``)``、
+#: 全角 ``（）``、以及 ``\\`` 之外的任何反斜杠写法一律判为非法）。
+TAG_ALLOWED_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789 _-:'\\()"
+)
+#: 标签里的「作品名」括号（转义写法）
+_TAG_GROUP_PATTERN = re.compile(r"\\\(([^()\\]*)\\\)")
+
+
+def validate_tag(tag: str) -> tuple[bool, str]:
+    """校验 NAI 角色标签是否符合规范（1.0.21）。
+
+    规范（与需求一致）：``小写英文名 \\(英文作品名\\)``
+
+    - 只能含**小写**字母 / 数字 / 空格 / ``_`` / ``-`` / ``:`` / ``'`` 与转义括号；
+    - **必须**带一对转义括号 ``\\(…\\)``，括号里是作品名（小写英文），不能为空；
+    - 大写字母、未转义括号、全角括号、其它标点、换行一律非法。
+
+    模型最常见的两种错法都会在这里被拦下：``Hanabi (Honkai: Star Rail)``
+    （大写 + 括号未转义）与 ``hanabi（honkai: star rail）``（全角括号）。
+
+    Returns:
+        ``(是否合法, 原因)``；原因会原样进 ``角色解析(LLM)失败：<原因>`` 日志。
+    """
+    text = (tag or "").strip()
+    if not text:
+        return False, "标签为空"
+    if len(text) > 120:
+        return False, f"标签过长（{len(text)} 字符）"
+    illegal = sorted({char for char in text if char not in TAG_ALLOWED_CHARS})
+    if illegal:
+        return False, f"标签含非法字符 {' '.join(repr(char) for char in illegal)}"
+    if "\\(" not in text or "\\)" not in text:
+        return False, "标签的括号必须转义为 \\( 与 \\)"
+    match = _TAG_GROUP_PATTERN.search(text)
+    if match is None:
+        return False, "标签里没有成对的转义括号（应为 角色名 \\(作品名\\)）"
+    if not match.group(1).strip():
+        return False, "标签里的作品名为空"
+    return True, ""
+
+
+def _normalize_game_field(name_cn: str, name_en: str) -> str:
+    """把 ``game_cn`` / ``game_en`` 合成一个作品名字段：``崩坏：星穹铁道 (Honkai: Star Rail)``。
+
+    与角色表第 2 列的既有写法一致（中文作品名 + 括号里的英文作品名）：
+    ``natural`` 模式的追加模板与 ``_drop_work_name_groups`` 的「作品名括号」清理
+    都按这个形状工作。只有一项时就用那一项。
+    """
+    cn = (name_cn or "").strip()
+    en = (name_en or "").strip()
+    if cn and en and cn != en:
+        return f"{cn} ({en})"
+    return cn or en
+
+
+def _tag_latin_part(tag: str) -> str:
+    """取标签里转义括号**之前**的部分（英文角色名），用于中文名缺失时兜底。"""
+    head = _TAG_GROUP_PATTERN.split((tag or "").strip())[0]
+    return head.strip()
+
+
+def parse_resolution_payload(
+    payload: Any,
+) -> tuple[CharacterEntry | None, str, float]:
+    """校验并转换模型返回的角色解析 JSON（1.0.21）。
+
+    期望结构::
+
+        {"unknown": false, "name_cn": "刻律德拉", "name_en": "Kleidra",
+         "game_cn": "崩坏：星穹铁道", "game_en": "Honkai: Star Rail",
+         "tag": "kleidra \\\\(honkai: star rail\\\\)", "confidence": 0.9}
+
+    校验规则（任何一条不满足都返回**失败原因**，由调用方退回 1.0.20 的行为）：
+
+    1. 顶层必须是对象；``unknown`` 为真 → ``模型表示不认识这个角色``；
+    2. ``tag`` 必须过 :func:`validate_tag`；
+    3. ``confidence`` 低于 :data:`CHARACTER_RESOLVE_MIN_CONFIDENCE` → 失败
+       （缺字段 / 非数字 / 空值按 1.0 处理：模型没给把握时不为难它）；
+    4. 名字与标签都取不到 → 失败。
+
+    中文名缺失时依次回落到 ``name_en`` → 标签里的英文名，**绝不编造**；
+    别名里带上中文名（有则），让后续「提示词里是不是已经有这个角色」的检测
+    也能认出中文写法。
+
+    Returns:
+        ``(条目或 None, 失败原因, confidence)``
+    """
+    if not isinstance(payload, dict):
+        return None, "返回的不是 JSON 对象", 0.0
+
+    unknown_raw = payload.get("unknown")
+    if isinstance(unknown_raw, str):
+        unknown = unknown_raw.strip().lower() in {"true", "1", "yes", "y"}
+    else:
+        unknown = bool(unknown_raw)
+    if unknown:
+        return None, "模型表示不认识这个角色（unknown=true）", 0.0
+
+    name_cn = str(payload.get("name_cn") or "").strip()
+    name_en = str(payload.get("name_en") or "").strip()
+    game_cn = str(payload.get("game_cn") or "").strip()
+    game_en = str(payload.get("game_en") or "").strip()
+    tag = str(payload.get("tag") or "").strip()
+
+    ok, reason = validate_tag(tag)
+    if not ok:
+        return None, reason, _as_confidence(payload.get("confidence"))
+
+    raw_confidence = payload.get("confidence")
+    confidence = _as_confidence(raw_confidence)
+    if confidence < CHARACTER_RESOLVE_MIN_CONFIDENCE:
+        return (
+            None,
+            f"confidence={confidence:g} 低于阈值 {CHARACTER_RESOLVE_MIN_CONFIDENCE:g}",
+            confidence,
+        )
+
+    latin = _tag_latin_part(tag)
+    name = name_cn or name_en or latin
+    if not name:
+        return None, "角色名为空", confidence
+    aliases: list[str] = []
+    for candidate in (name_cn, name_en, latin):
+        text = (candidate or "").strip()
+        # 中文名 / 英文名 / 标签里的英文名三者互为别名：去掉与正式名重复的
+        # （忽略大小写），以及已经收过的（同样忽略大小写 —— 实现按**原文**保留
+        # 第一次出现的写法，例如 ``Kleidra``，不会为了对齐大小写而改写）
+        if (
+            text
+            and text != name
+            and text.lower() != name.lower()
+            and not any(text.lower() == known.lower() for known in aliases)
+        ):
+            aliases.append(text)
+    return (
+        CharacterEntry(
+            name=name,
+            game=_normalize_game_field(game_cn, game_en),
+            aliases=aliases,
+            tag=tag,
+        ),
+        "",
+        confidence,
+    )
+
+
+def _as_confidence(raw: Any) -> float:
+    """把 ``confidence`` 读成 0~1 的浮点；缺字段 / 非数字时按 1.0 处理。
+
+    按 1.0 而不是 0：模型偶尔会漏掉这个字段，那不代表"没有把握"；
+    真正表示不确定的方式是 ``unknown=true`` 或直接不给标签。
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(1.0, max(0.0, value))
+
+
+#: 解析结果的来源标记（进日志与缓存）
+RESOLVE_SOURCE_MODEL = "模型"
+RESOLVE_SOURCE_CACHE = "缓存"
+
+
+@dataclass(frozen=True)
+class ResolvedCharacter:
+    """一次「角色解析」的结果（1.0.21）。
+
+    Attributes:
+        entry: 解析出的角色条目（``None`` 表示解析失败）
+        source: ``模型`` / ``缓存``（失败时为空串）
+        confidence: 模型自评的把握（0~1）
+        reason: 失败原因（成功时为空串）
+        raw_name: 被解析的原始角色名（用户点名的写法）
+    """
+
+    entry: CharacterEntry | None = None
+    source: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    raw_name: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """解析是否成功。"""
+        return self.entry is not None and self.entry.resolved_tag() != ""
+
+    def log_line(self) -> str:
+        """可读日志行（成功与失败两种形状）。"""
+        if not self.ok or self.entry is None:
+            return f"角色解析(LLM)失败：{self.reason or '未知原因'}"
+        game = self.entry.game or "未知作品"
+        return (
+            f"角色解析({self.source}): {self.raw_name or self.entry.name} → "
+            f"{self.entry.name} / {game}，标签 {self.entry.resolved_tag()}，"
+            f"confidence={self.confidence:g}，来源={self.source}"
+        )
+
+    def roster_line(self) -> str:
+        """「建议加入角色表」那一行的建议内容（可直接粘贴进配置）。
+
+        形如 ``刻律德拉 | 崩坏：星穹铁道 (Honkai: Star Rail) | kleidra,刻律德拉 | kleidra \\(honkai: star rail\\)``。
+        别名列优先给英文名（主模型常写英文），再带上中文名。
+        """
+        if self.entry is None:
+            return ""
+        aliases: list[str] = []
+        for candidate in (_tag_latin_part(self.entry.tag), self.entry.name):
+            text = (candidate or "").strip()
+            if text and not any(text.lower() == known.lower() for known in aliases):
+                aliases.append(text)
+        return (
+            f"{self.entry.name} | {self.entry.game} | {','.join(aliases)} | "
+            f"{self.entry.resolved_tag()}"
+        )
+
+
+#: 角色解析结果的进程内缓存：``归一化角色名 → (写入时间, 结果)``。
+#:
+#: 为什么缓存放在**调用方**（``handler._resolve_with_cache`` 负责**何时**读、何时写、
+#: 命中时怎么打日志），而存储与 TTL 放在本模块：见 :func:`reset_resolve_cache`
+#: 与 :func:`resolve_character_via_llm` 的说明 —— 解析函数是回归用例替换（打桩）
+#: 的那一层，缓存若写在它内部，用例里第二次生图照样会调模型（C75 断言只问一次）。
+_resolve_cache: dict[str, tuple[float, ResolvedCharacter]] = {}
+
+
+def reset_resolve_cache() -> None:
+    """清空角色解析结果的进程内缓存（**用例用**；运行期不需要手动调用）。
+
+    ``tests/check_logic.py`` 的 ``FakeResolve`` 进出 ``with`` 块各清一次，
+    免得一条用例的解析结果把下一条的「该不该问模型」判断带偏（C73/C74 都要求
+    自己那次真的去调一次模型）。缓存只有这一份，所以不存在"清了这处、漏了那处"。
+    """
+    _resolve_cache.clear()
+
+
+def resolve_cache_key(name: str) -> str:
+    """缓存键：走 :func:`normalize_prompt_text`（忽略大小写 / 反斜杠 / 下划线）。"""
+    return normalize_prompt_text(name) or (name or "").strip().lower()
+
+
+def resolve_cache_get(name: str, *, now: float | None = None) -> ResolvedCharacter | None:
+    """按角色名读缓存；未命中或已过期返回 ``None``（1.0.21）。
+
+    成功结果的缓存 24 小时（:data:`RESOLVE_CACHE_TTL_SECONDS`）、失败的负缓存
+    10 分钟（:data:`RESOLVE_FAILURE_TTL_SECONDS`）。**命中时把 ``source`` 改写成**
+    ``缓存`` 再返回：调用方直接打 ``result.log_line()``，日志里就是
+    ``角色解析(缓存): …``，不必自己记「这次是缓存还是模型」。
+    """
+    key = resolve_cache_key(name)
+    stamp_and_result = _resolve_cache.get(key)
+    if stamp_and_result is None:
+        return None
+    stamp, result = stamp_and_result
+    ttl = RESOLVE_CACHE_TTL_SECONDS if result.ok else RESOLVE_FAILURE_TTL_SECONDS
+    if ttl <= 0 or ((time.time() if now is None else float(now)) - stamp) >= ttl:
+        _resolve_cache.pop(key, None)
+        return None
+    return ResolvedCharacter(
+        entry=result.entry,
+        source=RESOLVE_SOURCE_CACHE,
+        confidence=result.confidence,
+        reason=result.reason,
+        raw_name=result.raw_name or name,
+    )
+
+
+def resolve_cache_put(
+    name: str, result: ResolvedCharacter, *, now: float | None = None
+) -> None:
+    """按角色名写缓存（成功 / 失败都写；超上限时整表清空，避免无上限增长）。"""
+    if len(_resolve_cache) >= RESOLVE_CACHE_LIMIT:
+        _resolve_cache.clear()
+    stamp = time.time() if now is None else float(now)
+    _resolve_cache[resolve_cache_key(name)] = (stamp, result)
+
+
+_RESOLVE_SYSTEM_PROMPT = """你是角色资料助手，服务于 NovelAI 生图提示词补全。
+
+任务：用户会给你一个**角色名**（可能是中文、日文罗马音、别称或玩家俗称）。
+请你判断它指的是哪一个**具体的**游戏 / 动漫 / 二次元角色，并给出它的正式名、
+出处作品名与 NovelAI（Danbooru）标准角色标签。
+
+输出格式（**只输出一个 JSON 对象**，不要 markdown 代码块，不要任何解释文字）：
+{"unknown": false, "name_cn": "角色中文名", "name_en": "角色英文名",
+ "game_cn": "作品中文名", "game_en": "作品英文名",
+ "tag": "角色英文名 \\\\(作品英文名\\\\)", "confidence": 0.9}
+
+字段说明：
+- unknown：布尔值。**你不认识这个角色、或没有把握确定它是谁时填 true**，
+  其余字段留空即可 —— 宁可不答，也不要猜。
+- name_cn / name_en：角色的中文名与英文（罗马音）名，采用该角色最通用的写法。
+- game_cn / game_en：出处作品的中文名与英文名；不确定的作品名留空。
+- tag：NovelAI / Danbooru 的**标准角色标签**，格式为 `角色英文名 \\(作品英文名\\)`。
+  硬性要求：**全部小写**，只用小写字母、数字、空格、下划线、连字符、
+  冒号与单引号；**括号必须转义**写成 `\\(` 与 `\\)`；
+  正确示例：`elysia \\(honkai impact 3rd\\)`、`hu tao \\(genshin impact\\)`、
+  `kleidra \\(honkai: star rail\\)`；
+  错误示例（一律不要）：`Elysia (Honkai Impact 3rd)`（大写且括号未转义）、
+  `elysia（honkai impact 3rd）`（全角括号）。
+  拼写没有把握时把 unknown 设为 true，**绝不编造标签**。
+- confidence：你对这次判断的把握，0 到 1 之间的小数。
+
+硬性规则：
+- 只输出 JSON，不要 markdown 代码块，不要前后缀说明；
+- 不确定就 unknown=true —— 猜错会让下游生图锁死成另一个角色，比不答更糟；
+- 只回答作品里**有名字的具体角色**；泛指（"一个女孩"）、现实人物、自创角色一律 unknown=true。"""
+
+
+_RESOLVE_USER_TEMPLATE = """角色名：{name}
+{context}
+请按要求输出 JSON。"""
+
+
+async def resolve_character_via_llm(
+    name: str,
+    *,
+    translate_model: str = "",
+    timeout: float = 0.0,
+    context_text: str = "",
+) -> ResolvedCharacter:
+    """用已配置的模型把「角色表之外」的角色解析成标准标签（1.0.21）。
+
+    与 :func:`extract_characters_via_llm` **共用同一套** ``llm_api``、同一个模型
+    （``general.translate_model``，留空回退 ``UTILS_SMALL``）与同一个超时
+    （``general.llm_timeout``）；DeepSeek 的请求级兼容（关 thinking）也走
+    :func:`_prepare_model_set`，因此不引入任何新依赖。
+
+    **本函数只做「纯解析」：不读缓存、不写缓存、也不打成功日志**（1.0.21 修正）。
+    解析结果的**调用方缓存**在 :meth:`handler.CharacterGuardHandler._resolve_with_cache`
+    —— 「这一次要不要问模型」是决策，属于调用方。把缓存留在本函数里时，
+    回归用例（``tests/check_logic.py`` 的 C75：同一个角色连问两次）替换掉本函数，
+    缓存就一起被替换掉了，第二次照样会调模型，等于没有缓存；缓存上移之后，
+    调用方在打桩之下也能命中缓存并打 ``角色解析(缓存)``。
+    缓存用到的 TTL / 上限常量仍在本模块（:data:`RESOLVE_CACHE_TTL_SECONDS` /
+    :data:`RESOLVE_FAILURE_TTL_SECONDS` / :data:`RESOLVE_CACHE_LIMIT`），
+    清空入口是 :func:`reset_resolve_cache`。
+
+    失败（``unknown=true`` / JSON 坏 / 标签非法 / confidence 低于阈值 /
+    超时 / 任何异常）同样返回 :class:`ResolvedCharacter`，只是 ``entry is None``
+    —— **本函数不抛异常**，调用方据此退回 1.0.20 的行为。
+
+    Args:
+        name: 用户点名的角色名（表外名字的原始写法）
+        translate_model: 解析用模型名；空字符串回退 ``UTILS_SMALL``
+        timeout: 超时秒数；``<=0`` 表示不限时
+        context_text: 可选的对话上文片段（提供线索，帮助模型确认是哪一个角色）
+
+    Returns:
+        :class:`ResolvedCharacter`（``ok`` 为假表示解析失败，``reason`` 写明原因）
+    """
+    raw_name = (name or "").strip()
+    if not raw_name:
+        return ResolvedCharacter(reason="角色名为空")
+
+    async def _run() -> str:
+        request = llm_api.create_llm_request(
+            model_set=_prepare_model_set(translate_model),
+            request_name="char_prompt_guard_resolve",
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_RESOLVE_SYSTEM_PROMPT)))
+        context = (context_text or "").strip()
+        request.add_payload(
+            LLMPayload(
+                ROLE.USER,
+                Text(
+                    _RESOLVE_USER_TEMPLATE.format(
+                        name=raw_name,
+                        context=f"（对话线索，仅供参考）：{context[:200]}\n" if context else "",
+                    )
+                ),
+            )
+        )
+        response = await request.send(stream=False)
+        return await _resolve_response_text(response)
+
+    try:
+        if timeout and timeout > 0:
+            raw_text = await asyncio.wait_for(_run(), timeout=timeout)
+        else:
+            raw_text = await _run()
+    except TimeoutError:
+        # 失败只**返回**带原因的结果（不抛异常、不打日志）：日志与缓存都在调用方，
+        # 免得同一件事在两层各打一条、或者缓存被"打桩打掉"（见 docstring）。
+        return ResolvedCharacter(reason=f"模型超时（{timeout:g}s）", raw_name=raw_name)
+    except Exception as e:  # noqa: BLE001 —— 解析失败只返回失败结果（放行生图）
+        return ResolvedCharacter(
+            reason=f"调用失败({type(e).__name__}: {e})", raw_name=raw_name
+        )
+
+    try:
+        payload = json.loads(_strip_json_object(raw_text))
+    except Exception as e:  # noqa: BLE001 —— JSON 坏 = 解析失败
+        return ResolvedCharacter(
+            reason=f"JSON 解析失败({type(e).__name__}: {e})", raw_name=raw_name
+        )
+
+    entry, reason, confidence = parse_resolution_payload(payload)
+    if entry is None:
+        return ResolvedCharacter(reason=reason, confidence=confidence, raw_name=raw_name)
+
+    return ResolvedCharacter(
+        entry=entry,
+        source=RESOLVE_SOURCE_MODEL,
+        confidence=confidence,
+        raw_name=raw_name,
+    )
