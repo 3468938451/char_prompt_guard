@@ -18,6 +18,15 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
 命中「触发词 → 角色表内角色」的明确对应就直接用作判定依据，并把这次确认写回
 记忆库（``memory.write_back``）。关闭（``memory.enabled = false``）时**完全不发
 任何请求**；不可用时静默降级 —— 判定链与 1.0.17 逐字一致。
+
+1.0.19 起针对一次真实事故补上两处对账（都不新增配置项）：
+
+- 参数说明的追加句（:data:`tag_hint.HINT_SUFFIX`）再补一句：标签必须与**本次画面
+  描述的角色一致**，不要照搬备忘 / 历史记录 / 上一张图的标签；
+- 二次一致性检测（``general.consistency_check``）的对账基准从「判定集合」扩成
+  **期望集合**（判定集合 + 主题跟踪主题 + 记忆库确认结果），并且**描述里已经点名
+  角色表内角色时**也会额外做一次「对账用」记忆库查询（只用于对账，不改判定、
+  不写回）。细节见 :mod:`handler` 模块顶部与 :class:`handler.ExpectationSet`。
 """
 
 from __future__ import annotations
@@ -94,7 +103,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.18"
+    plugin_version: str = "1.0.19"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

@@ -1,4 +1,4 @@
-"""外部记忆库关联（Booku Memory，1.0.18）。
+"""外部记忆库关联（Booku Memory，1.0.18 / 1.0.19）。
 
 判定链**不确定**时（主题跟踪的 ``split`` / ``unavailable`` / ``low_confidence`` /
 ``empty``），去外部记忆库（`Booku Memory <http://localhost:8000/booku-memory>`_）
@@ -20,6 +20,13 @@
   ``memory.write_back = true`` 时，POST 一条记忆（``title`` 形如
   ``角色指向：本尊 → 花火``），把这次确认「记住」；每次写入都打 INFO 日志
   （含返回的 ``id`` 或失败原因）。
+
+1.0.19 起多一种**用途**（不是新的配置项）：画面描述里已经点名了角色表内角色时，
+调用方可以再做一次 :data:`RECONCILE_UNCERTAINTY`（``"reconcile"``）的
+「**对账用查询**」—— 关键词优先用描述里那个角色的名字 / 别名 + 自我指代词，
+结果**只**用于二次一致性检测（``consistency_check``）的对账，
+**不参与判定链、也绝不写回**（调用方传 ``write_back=False``）；
+失败 / 超时 / 结构不符照旧静默降级。
 
 安全与降级
 ----------
@@ -152,6 +159,14 @@ CORE_TAG = "角色指向"
 WRITE_STATUS = "active"
 #: 写入记忆内容里的来源标注
 WRITE_SOURCE = "char_prompt_guard 自动确认"
+
+#: 1.0.19：**对账用查询**的触发类型（``lookup(uncertainty=…)`` 的取值之一）。
+#:
+#: 与 ``split`` / ``unavailable`` / ``low_confidence`` / ``empty`` 不同，它不是
+#: 「判定不确定」，而是「画面描述里已经点名了角色表内角色，需要与上下文 / 记忆对账」
+#: （见 ``handler._memory_reconcile``）。这种查询**只用于二次一致性检测**，
+#: 结果不参与判定链、**不写回**（``write_back=False``），失败照旧静默降级。
+RECONCILE_UNCERTAINTY = "reconcile"
 
 
 # ── 结果类型 ──────────────────────────────────────────────────────────
@@ -750,7 +765,16 @@ def attribute_items(
 
     判定口径（宁少勿多）：同一条记忆的 ``title + content`` 里**同时**出现
     ``trigger_word`` 与某个角色表内关键词，才算一次明确对应；一条记忆里出现多个
-    角色时**整条作废**（歧义 → 不猜），由调用方退回 1.0.17 的原链路。
+    **角色**时**整条作废**（歧义 → 不猜），由调用方退回 1.0.17 的原链路。
+
+    .. note::
+       1.0.19 起「多个角色」按 ``name_lookup`` **解析出的角色**去重，而不是按命中的
+       字符串个数：一个角色在角色表里同时写了 ``爱莉希雅``（名字）与 ``爱莉``（别名）
+       时，记忆里出现 ``爱莉希雅`` 会**同时**命中这两个关键词 —— 旧口径会把这种
+       「同一个角色的名字 + 名字的子串」误判成两个候选、整条作废，于是中文全名的
+       记忆**永远确认不了**（1.0.19 的「对账用查询」正要用它）。现在先把命中的关键词
+       逐个交给 ``name_lookup`` 解析成角色，再按角色去重，仍然只有「恰好一个角色」
+       才算明确对应；解析不出来的关键词一律忽略。
 
     Args:
         items: 命中的记忆条目
@@ -760,7 +784,7 @@ def attribute_items(
             只传候选名会让 ``_roster_hits`` 一个都命中不到，记忆**永远判成 miss**
             （实测 C60 就是这么失败的）
         name_lookup: 关键词 → :class:`MemoryCharacter`（角色的名字 / 别名 / 标签
-            任一命中即可）；返回 ``None`` 表示对不上，该条跳过
+            任一命中即可）；返回 ``None`` 表示对不上，该关键词忽略
     """
     if not trigger_word:
         return []
@@ -769,14 +793,21 @@ def attribute_items(
         text = f"{item.title}\n{item.content}"
         if trigger_word not in text:
             continue
-        hits = _roster_hits(text, roster_names)
-        if len(hits) != 1:
-            continue
-        character = name_lookup(hits[0])
-        if character is None:
+        characters: list[MemoryCharacter] = []
+        for token in _roster_hits(text, roster_names):
+            character = name_lookup(token)
+            if character is None:
+                continue
+            if any(
+                (known.name, known.tag) == (character.name, character.tag)
+                for known in characters
+            ):
+                continue
+            characters.append(character)
+        if len(characters) != 1:
             continue
         found.append(
-            MemoryAttribution(trigger=trigger_word, character=character, item=item)
+            MemoryAttribution(trigger=trigger_word, character=characters[0], item=item)
         )
     return found
 
@@ -853,16 +884,19 @@ async def lookup(
     roster_names: list[str] | None = None,
     signal_label: str = "",
     name_lookup: Callable[[str], MemoryCharacter | None],
+    write_back: bool | None = None,
 ) -> MemoryLookup:
-    """判定不确定时去记忆库做一次「再确认」，命中就**顺手写回**（记住）。
+    """去记忆库做一次检索 + 对账；命中判定用途时可**顺手写回**（记住）。
 
     流程：开关与地址校验 → 关键词构造（取不到就不请求）→ 检索 → 对账
     「触发词 → 角色表内角色」→ 命中则（``write_back`` 时）POST 写回。
 
     Args:
         config: 插件配置（读 ``[memory]`` 节）
-        uncertainty: ``split`` / ``unavailable`` / ``low_confidence`` / ``empty``
-        reason: 不确定的具体原因（进关键词与日志）
+        uncertainty: 本次查询的触发类型 —— ``split`` / ``unavailable`` /
+            ``low_confidence`` / ``empty``（判定不确定），或
+            :data:`RECONCILE_UNCERTAINTY`（1.0.19 的**对账用**查询）
+        reason: 不确定 / 对账的具体原因（进关键词与日志）
         description: 本次的画面描述
         candidate_names: **当前上下文里出现过的**候选名 / 别名（只参与关键词构造）
         roster_names: **完整角色表**里所有可匹配的名字 / 别名 / 标准标签
@@ -872,6 +906,10 @@ async def lookup(
             若不在本次上下文候选里就永远判成 miss**（实测 C60 的失败原因）
         signal_label: 主题跟踪最近一次信号的可读描述
         name_lookup: 关键词 → 角色；返回 ``None`` 表示对不上
+        write_back: 覆盖 ``memory.write_back`` 的**本次调用**语义
+            （``None`` = 用配置值）。1.0.19 的「对账用查询」传 ``False`` ——
+            它只用于二次一致性检测，**绝不写回**（写回的前提仍是「本次判定确实
+            依赖了记忆库」，对账查询不改变判定）
 
     Returns:
         :class:`MemoryLookup`；**任何失败都返回 ``status != "hit"`` 的结果**，
@@ -970,7 +1008,10 @@ async def lookup(
         references=format_references(items, limit=client.limit),
     )
 
-    if client.write_back:
+    # 写回语义（1.0.19）：默认沿用 ``memory.write_back``；调用方传了就用调用方的
+    # —— 「对账用查询」（RECONCILE_UNCERTAINTY）传 False，它不参与判定，自然不该写回。
+    allow_write_back = client.write_back if write_back is None else bool(write_back)
+    if allow_write_back:
         lookup_result.write_error = await _write_back(
             client,
             lookup_result,
@@ -1003,6 +1044,7 @@ __all__ = [
     "FAILURE_COOLDOWN_SECONDS",
     "KEYWORD_MAX_CHARS",
     "LIMIT_MAX",
+    "RECONCILE_UNCERTAINTY",
     "SNIPPET_MAX_CHARS",
     "SPEAKER_TRIGGER_WORDS",
     "WRITE_SOURCE",

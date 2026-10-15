@@ -322,6 +322,19 @@ def main() -> int:
             and tag_hint.HINT_MARKER in tag_hint.HINT_SUFFIX,
             f"HINT_SUFFIX = {tag_hint.HINT_SUFFIX!r}",
         )
+        # 1.0.19：追加句在原句之后**再补一句** —— 标签必须与本次画面的角色一致，
+        # 不要照搬备忘 / 历史记录 / 上一张图的标签（实测事故：主模型照搬了备忘里
+        # 过期的固定标签 Hanabi，而这次画的是爱莉希雅）。原句一字不动。
+        check(
+            "1.0.19 追加句要求「标签与本次画面一致、不要照搬备忘」",
+            "不要照搬" in tag_hint.HINT_SUFFIX
+            and "本次画面描述的角色一致" in tag_hint.HINT_SUFFIX
+            and "备忘" in tag_hint.HINT_SUFFIX
+            and "历史记录" in tag_hint.HINT_SUFFIX
+            and "elysia \\(honkai impact 3rd\\)" in tag_hint.HINT_SUFFIX
+            and "爱莉希雅" in tag_hint.HINT_SUFFIX,
+            f"HINT_SUFFIX = {tag_hint.HINT_SUFFIX!r}",
+        )
         check(
             "追加句与原说明用换行分隔（只追加、不覆盖）",
             tag_hint.HINT_SEPARATOR == "\n",

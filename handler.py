@@ -50,6 +50,26 @@
 写回本身在 :mod:`memory`；测试用可替换的传输层
 （``memory.set_transport`` 或直接 monkeypatch ``memory._http_get_json`` /
 ``memory._http_post_json``）注入假记忆库。
+
+**1.0.19 的两处修补（一次真实事故）**：调用方（KFC）这次画的是**爱莉希雅**
+（粉长发 / 蓝眼 / 尖耳 / 粉白短裙），却把**花火的标签** ``Hanabi (Honkai: Star Rail)``
+写进了画面描述 —— 因为它的**备忘**里存着过期的固定规则「标签必须是 Hanabi 挂最前头」
+（1.0.17 起参数说明要求它写标准标签，它照做了，但照搬的是备忘里的错误标签）。
+1.0.18 的判定链看到「描述里已有角色表内角色」就放行（描述点名优先级最高，
+且这种情况下**根本不查记忆库**），于是**没有任何对账**。1.0.19 补上：
+
+- **一致性检测扩展为「期望集合」对账**（:meth:`CharacterGuardHandler._apply_consistency_check`）：
+  期望集合 = 判定集合 ∪ **主题跟踪给出的主题**（``track.usable`` 时）∪ **记忆库确认结果**
+  （明确对应时）。提示词里的角色表内角色**不在**期望集合里 → 视为冲突：
+  ``warn`` 只打 WARNING、内容不改；``fix`` 仅在「期望集合恰好 1 人、画面里冲突的角色
+  恰好 1 个」时把画面里那个角色的名字 / 别名 / 标签替换成期望角色的（复用
+  :func:`character.replace_character_reference`），多角色 / 歧义 → 退回 warn；
+- **描述已点名时也做一次「对账用」记忆库查询**
+  （:meth:`CharacterGuardHandler._memory_reconcile`）：``consistency_check != "off"``
+  且 ``memory.enabled`` 且角色表非空、且描述里出现了角色表内角色时，用**描述里那个
+  角色的名字 / 别名 + 自我指代词**做关键词查一次（``limit`` 用配置值），结果
+  **只**喂给上面那条对账，**不参与判定链、不替换描述点名的角色、不写回**；
+  失败 / 超时 / 结构不符照旧静默降级。
 """
 
 from __future__ import annotations
@@ -226,6 +246,9 @@ class CandidateResult:
             见 :meth:`monitor.SubjectTrack.naming`）
         basis: 判定依据的可读文案（进日志与 WARNING）
         memory: 本次「记忆库再确认」的结果（1.0.18；没查记忆库时是 ``None``）
+        track: 本次主题跟踪的**完整结果**（1.0.19；``monitor.enabled = false`` 或
+            跟踪器异常时为 ``None``）。二次一致性检测要用它构造「期望集合」
+            （``track.usable`` 时把主题也算作期望），所以不能只留 ``naming``
     """
 
     candidates: list[CharacterEntry] = field(default_factory=list)
@@ -235,6 +258,7 @@ class CandidateResult:
     naming: NamingDecision = field(default_factory=NamingDecision)
     basis: str = ""
     memory: memory_api.MemoryLookup | None = None
+    track: SubjectTrack | None = None
 
 
 _BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
@@ -829,7 +853,9 @@ def _roster_match_names(roster: list[CharacterEntry]) -> list[str]:
     记忆库明明检索到「角色指向：本尊 → 花火」，status 却是 miss）。
 
     匹配口径本身不变（见 :func:`memory.attribute_items`）：同一条记忆里必须**同时**
-    出现触发词、且**恰好一个**角色表内角色；出现多个 → 整条作废（歧义不猜）。
+    出现触发词、且**恰好一个**角色表内角色；出现多个**角色** → 整条作废（歧义不猜）。
+    1.0.19 起「多个角色」按解析出的角色去重 —— 名字与它自己的别名子串（``爱莉希雅`` /
+    ``爱莉``）只算一个，否则中文全名的记忆永远确认不了（详见 ``memory.attribute_items``）。
     """
     names: list[str] = []
     seen: set[str] = set()
@@ -895,6 +921,123 @@ class MemoryContext:
     lookup: memory_api.MemoryLookup
     mentioned: int = 0
     reason: str = ""
+
+
+# ── 二次一致性检测的「期望集合」（1.0.19）────────────────────────────
+#
+# 1.0.10 起的一致性检测只把「判定集合」当基准：提示词里出现判定集合之外的角色表内
+# 角色才告警。真实事故里判定集合恰好就是**描述里那个（错的）角色**（主题跟踪
+# 不可用 → 判定集合为空；描述点名优先 → 直接放行），于是「画面 = 判定」永远自洽，
+# 一次告警都不会有。1.0.19 把基准扩成**期望集合**：判定集合 + 主题跟踪给出的主题
+# （``track.usable`` 时）+ 记忆库确认结果（明确对应时）——「这次该画谁」的每一份
+# 证据都参与对账，画面里的角色只要落在期望集合之外就是冲突。
+
+
+def _entry_label(entry: CharacterEntry) -> str:
+    """角色在日志里的可读标签：``花火（hanabi \\(honkai: star rail\\)）``。
+
+    没有标准标签时只写名字（或标签兜底），绝不编造游戏名。
+    """
+    name = entry.name or entry.tag or "?"
+    tag = entry.resolved_tag()
+    return f"{name}（{tag}）" if tag and tag != name else name
+
+
+def _entry_names(entries: list[CharacterEntry]) -> str:
+    """角色名列表：``花火、爱莉希雅``（没有名字时用标签兜底）。"""
+    return "、".join(entry.name or entry.tag or "?" for entry in entries)
+
+
+@dataclass(frozen=True)
+class ExpectationSet:
+    """一致性检测的对账**期望集合**（1.0.19）。
+
+    Attributes:
+        entries: 期望出现的角色（按来源顺序去重：判定集合 → 主题跟踪 → 记忆库确认）
+        reasons: 每一份来源的可读说明（进 WARNING，用户据此核对「凭什么说该画她」）
+    """
+
+    entries: list[CharacterEntry] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+
+    def keys(self) -> set[str]:
+        """期望集合的身份键（``entry_key``，与判定链同一口径）。"""
+        return {entry_key(entry) for entry in self.entries}
+
+    def names(self) -> str:
+        """期望角色的可读列表。"""
+        return _entry_names(self.entries)
+
+    def reason_text(self) -> str:
+        """来源说明：``判定集合=花火；主题跟踪=花火；记忆库确认:本尊 → 爱莉希雅（mem-1）``。"""
+        return "；".join(self.reasons) or "无"
+
+    def __bool__(self) -> bool:
+        """非空（至少有一份证据）时为真。"""
+        return bool(self.entries)
+
+
+def build_expectation_set(
+    *,
+    decided: list[CharacterEntry] | None = None,
+    track: SubjectTrack | None = None,
+    memory: memory_api.MemoryLookup | None = None,
+    roster: list[CharacterEntry] | None = None,
+) -> ExpectationSet:
+    """构造对账期望集合（1.0.19）。
+
+    三份证据，顺序与「判定优先级」一致（描述点名的结果本来就在 ``decided`` 里）：
+
+    1. **判定集合** ``decided`` —— 原样保留（1.0.10 起的老口径）；
+    2. **主题跟踪** —— 只在 ``track.usable``（``status == "ok"`` 且主题非空）时算数：
+       ``unavailable``（本尊身份取不到 / 代词无先行词）与 ``low_confidence``
+       （置信度不足）都**不算**证据 —— 它们恰恰是「没有结论」，拿它们对账会把
+       画面里正确的角色误判成冲突（1.0.19 特意划的边界）；
+    3. **记忆库确认结果** —— 只在 ``lookup.hit``（「触发词 → 恰好一个角色表内角色」
+       的明确对应）时算数；记忆条目里只是顺带提到某个角色（``miss``）不算，
+       避免把模糊检索结果当成「该画她」的依据。
+
+    记忆库里的角色名会先按「名字 → 别名 → 标签」在角色表里定位（:func:`find_roster_identity`），
+    定位不到时退回记忆库自己给的字段 —— 与 :meth:`CharacterGuardHandler._memory_verdict`
+    同一口径，保证日志里的名字与注入时用的名字一致。
+
+    返回空集合（``entries`` 为空）表示**没有任何可对账的依据**，调用方应跳过检查：
+    那种情况下提示词里的角色是描述自己写的，报警只会是噪音。
+    """
+    entries: list[CharacterEntry] = []
+    reasons: list[str] = []
+
+    def add(entry: CharacterEntry | None) -> None:
+        if entry is None:
+            return
+        key = entry_key(entry)
+        if any(entry_key(known) == key for known in entries):
+            return
+        entries.append(entry)
+
+    known_decided = list(decided or [])
+    for entry in known_decided:
+        add(entry)
+    if known_decided:
+        reasons.append(f"判定集合={_entry_names(known_decided)}")
+
+    if track is not None and track.usable and track.entries:
+        for entry in track.entries:
+            add(entry)
+        reasons.append(f"主题跟踪={track.subject_names()}")
+
+    if memory is not None and memory.hit and memory.characters:
+        confirmed: list[CharacterEntry] = []
+        for character in memory.characters:
+            entry = find_roster_identity(character.name or character.tag, roster or [])
+            if entry is None:
+                entry = _memory_character_entry(character)
+            add(entry)
+            confirmed.append(entry)
+        if confirmed:
+            reasons.append(memory.confirm_log())
+
+    return ExpectationSet(entries=entries, reasons=reasons)
 
 
 class CharacterGuardHandler(BaseEventHandler):
@@ -1006,9 +1149,10 @@ class CharacterGuardHandler(BaseEventHandler):
         # 这里放在 _collect_candidates **之前**是有意的：命中时省掉一次 LLM 调用
         # （确定性记忆比模型猜测更可信），命中不了时 _collect_candidates 会照旧
         # 把命中片段的 title + snippet 作为参考材料喂给 LLM。
-        description_has_character = any(
-            character_in_texts(entry, [content]) for entry in roster
-        )
+        description_characters = [
+            entry for entry in roster if character_in_texts(entry, [content])
+        ]
+        description_has_character = bool(description_characters)
         memory_context = await self._memory_lookup(
             params=params,
             config=config,
@@ -1018,6 +1162,18 @@ class CharacterGuardHandler(BaseEventHandler):
         )
         memory_lookup = memory_context.lookup if memory_context is not None else None
         memory_verdict = self._memory_verdict(memory_context, roster)
+        # 1.0.19：描述里**已经点名**角色表内角色时，另做一次「**对账用**」的记忆库
+        # 查询（与上面那条「不确定才查」互斥：_memory_lookup 在描述点名时直接返回
+        # None）。它的结果只喂给 _apply_consistency_check 的对账，
+        # **不进判定链、不替换描述点名的角色、不写回**（write_back=False）。
+        reconcile_lookup: memory_api.MemoryLookup | None = None
+        if description_has_character:
+            reconcile_lookup = await self._memory_reconcile(
+                config=config,
+                roster=roster,
+                content=content,
+                described=description_characters,
+            )
         if memory_verdict is not None:
             # 记忆库给了明确结论 —— 直接走既有注入路径（不额外问 LLM）
             result = memory_verdict
@@ -1068,6 +1224,8 @@ class CharacterGuardHandler(BaseEventHandler):
                     roster=roster,
                     config=config,
                     basis=result.basis,
+                    track=result.track,
+                    memory=reconcile_lookup,
                 )
             target_characters = candidates[:1]
         else:
@@ -1093,6 +1251,8 @@ class CharacterGuardHandler(BaseEventHandler):
                 roster=roster,
                 config=config,
                 basis=result.basis,
+                track=result.track,
+                memory=reconcile_lookup,
             )
 
         new_content = self._apply(
@@ -1114,6 +1274,8 @@ class CharacterGuardHandler(BaseEventHandler):
                 roster=roster,
                 config=config,
                 basis=result.basis,
+                track=result.track,
+                memory=reconcile_lookup,
             )
 
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
@@ -1134,6 +1296,8 @@ class CharacterGuardHandler(BaseEventHandler):
             roster=roster,
             config=config,
             basis=result.basis,
+            track=result.track,
+            memory=reconcile_lookup,
         )
 
     # ── 记忆库再确认（1.0.18）─────────────────────────────────────
@@ -1152,7 +1316,9 @@ class CharacterGuardHandler(BaseEventHandler):
         触发条件（任一，见 :func:`memory_uncertainty`）：主题跟踪的 ``split`` /
         ``unavailable`` / ``low_confidence`` / ``empty``。另外还要求
         「画面描述里没有角色表内角色」—— 描述已经点名时判定并不不确定，
-        没必要多一次网络请求（也避免记忆库的旧结论压过描述）。
+        没必要在这里多查一次（也避免记忆库的旧结论压过描述）。
+        **1.0.19 起**这种情况改由 :meth:`_memory_reconcile` 做一次**对账用**查询
+        （用途完全不同：只喂给二次一致性检测，不进判定链、不写回）。
 
         **本函数不抛异常**：记忆库的任何问题都只让 ``lookup.hit`` 为假，
         由调用方走 1.0.17 的原链路。
@@ -1215,6 +1381,83 @@ class CharacterGuardHandler(BaseEventHandler):
         except Exception as e:  # noqa: BLE001 —— 记忆库是「多一份证据」，不许拦住生图
             logger.debug(
                 f"记忆库不可用，跳过（记忆库再确认失败: {type(e).__name__}: {e}）"
+            )
+            return None
+
+    async def _memory_reconcile(
+        self,
+        *,
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        content: str,
+        described: list[CharacterEntry],
+    ) -> memory_api.MemoryLookup | None:
+        """**对账用**的记忆库查询（1.0.19）：描述里已经点名角色时才能跑。
+
+        背景（真实事故）：调用方把**过期备忘**里的固定标签（``Hanabi``）写进了画面
+        描述，而这次真正要画的是爱莉希雅。1.0.18 的判定链一见「描述里有角色表内
+        角色」就放行，连记忆库都不查，于是没有任何对账。所以这里补一次查询 ——
+        关键词优先用**描述里那个角色的名字 / 别名**（``candidate_names``，帮助检索到
+        「这次说的人」相关的记忆）加**自我指代词**（``memory.build_keyword`` 的
+        ``_PRIMARY_KEYWORDS`` 一定会带上 ``本尊 / 扮演 / 口吻``；触发词取不到时
+        对账用的触发词回落到 ``本尊``），``limit`` 用 ``memory.limit`` 配置值。
+
+        触发条件（全部满足才查）：``memory.enabled``、角色表非空、
+        ``general.consistency_check != "off"``、描述里确实有角色表内角色。
+        ``off`` 时**一次请求都不发** —— 「完全不检查」应当包含不去查记忆库。
+
+        结果**只**用于 :meth:`_apply_consistency_check` 的期望集合：
+
+        - **不参与判定**（绝不替换 / 覆盖描述点名的角色，除非 ``fix`` 且满足
+          「期望集合恰好 1 人 + 画面里冲突角色恰好 1 个」的唯一性条件）；
+        - **不写回**（``write_back=False``）—— 写回语义仍是「本次判定确实依赖了
+          记忆库」，对账查询不改变判定；
+        - 失败 / 超时 / 非 200 / JSON 坏 / 结构不符 → 照旧静默降级（DEBUG
+          ``记忆库不可用，跳过（…）``，沿用 1.0.18 的失败退避），**绝不拦住生图**。
+
+        **本函数不抛异常**（与 :meth:`_memory_lookup` 一样，外层再包一层兜底）。
+        """
+        if not described or not roster:
+            return None
+        mode = str(getattr(config.general, "consistency_check", "") or "").strip().lower()
+        if mode == "off":
+            # consistency_check=off：完全不检查，含不去查记忆库（不发任何请求）
+            return None
+        if not memory_api.memory_enabled(config):
+            return None
+        try:
+            # 关键词用的候选名：描述里那个角色的名字 / 别名（宁少勿多，不带标签 ——
+            # 标签又长又含转义符，塞进 60 字的关键词预算里只会挤掉更有用的词）。
+            candidate_names: list[str] = []
+            for entry in described:
+                for keyword in entry.keywords():
+                    if keyword and keyword not in candidate_names:
+                        candidate_names.append(keyword)
+            described_names = _entry_names(described)
+            reason = f"描述点名对账（画面里是：{described_names}）"
+            result = await memory_api.lookup(
+                config,
+                uncertainty=memory_api.RECONCILE_UNCERTAINTY,
+                reason=reason,
+                description=content,
+                # 关键词优先用描述里那个角色的名字 / 别名 + 自我指代词
+                candidate_names=candidate_names,
+                # 对账仍用**完整角色表**（与 _memory_lookup 同一口径）：
+                # 记忆里指向的角色往往不在本次上下文候选里
+                roster_names=_roster_match_names(roster),
+                signal_label=reason,
+                name_lookup=_memory_name_lookup(roster),
+                # 对账查询绝不写回：它不参与判定，写回语义留给「不确定再确认」那条路径
+                write_back=False,
+            )
+            logger.debug(
+                f"记忆库对账查询（画面点名={described_names}）: status={result.status}"
+                f"{f'，{result.reason}' if result.reason else ''}"
+            )
+            return result
+        except Exception as e:  # noqa: BLE001 —— 对账只是「多一份证据」，不许拦住生图
+            logger.debug(
+                f"记忆库不可用，跳过（记忆库对账查询失败: {type(e).__name__}: {e}）"
             )
             return None
 
@@ -1479,6 +1722,7 @@ class CharacterGuardHandler(BaseEventHandler):
                         naming=naming,
                         basis=track.basis,
                         memory=memory_lookup,
+                        track=track,
                     )
 
         if not monitor_on:
@@ -1653,6 +1897,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 naming=naming,
                 basis=basis,
                 memory=memory_lookup,
+                track=track,
             )
 
         # ⑤ 汇总。优先级：主题跟踪（1.0.14）/ 用户点名·粘性（1.0.13）有确定结论时以它
@@ -1765,6 +2010,7 @@ class CharacterGuardHandler(BaseEventHandler):
             naming=naming,
             basis=basis,
             memory=memory_lookup,
+            track=track,
         )
 
     @staticmethod
@@ -1999,8 +2245,15 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         config: CharPromptGuardConfig,
         basis: str,
+        track: SubjectTrack | None = None,
+        memory: memory_api.MemoryLookup | None = None,
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """统一的收尾：跑二次一致性检测，内容有变化才回写 args。"""
+        """统一的收尾：跑二次一致性检测，内容有变化才回写 args。
+
+        ``track``（本次主题跟踪的完整结果）与 ``memory``（1.0.19 描述点名时的
+        **对账用**记忆库查询结果）都只是给一致性检测提供「期望集合」的证据，
+        不参与其它任何判断。
+        """
         checked = self._apply_consistency_check(
             content=final_content,
             spec=spec,
@@ -2009,6 +2262,8 @@ class CharacterGuardHandler(BaseEventHandler):
             decided=decided,
             config=config,
             basis=basis,
+            track=track,
+            memory=memory,
         )
         if checked != original:
             args[spec.prompt_arg] = checked
@@ -2025,20 +2280,26 @@ class CharacterGuardHandler(BaseEventHandler):
         decided: list[CharacterEntry],
         config: CharPromptGuardConfig,
         basis: str,
+        track: SubjectTrack | None = None,
+        memory: memory_api.MemoryLookup | None = None,
     ) -> str:
-        """二次一致性检测：对账「最终提示词里的角色表内角色」vs「判定集合」。
+        """二次一致性检测：对账「最终提示词里的角色表内角色」vs「**期望集合**」。
 
-        - ``off``：不检查；
-        - ``warn``（默认）：提示词里出现判定集合之外的**角色表内**角色时打一条
-          WARNING（含两个角色名与判定依据），内容不改；
-        - ``fix``：仅当冲突是「用户点名的角色 vs 画面里另一个角色」且双方都能
-          唯一定位（判定集合恰好 1 人、冲突角色恰好 1 个）时，把画面里那个错误
-          角色的名字/别名/标签替换成正确角色的（**替换范围仅限角色表里已知的
-          字符串**），替换后按需补正确角色的标准标签；出现歧义或多角色无法定位
-          → 自动退回 warn 行为并记 WARNING。
+        - ``off``：不检查（也**不去查记忆库** —— 见 :meth:`_memory_reconcile`）；
+        - ``warn``（默认）：提示词里出现期望集合之外的**角色表内**角色时打一条
+          WARNING（同时写出画面那一侧与上下文 / 记忆那一侧的角色名与依据），内容不改；
+        - ``fix``：仅当冲突是「画面里的角色 vs 期望角色」且双方都能唯一定位
+          （期望集合恰好 1 人、冲突角色恰好 1 个）时，把画面里那个错误角色的
+          名字/别名/标签替换成期望角色的（**替换范围仅限角色表里已知的字符串**），
+          替换后按需补期望角色的标准标签；出现歧义或多角色无法定位 → 自动退回
+          warn 行为并记 WARNING。
 
-        本次没有判定出任何角色（判定集合为空）时直接跳过：那种情况下提示词里的
-        角色是描述自己写的，没有依据可对账，也不该报警。
+        **1.0.19 起**对账基准从「判定集合」扩成 :class:`ExpectationSet`
+        （判定集合 + 主题跟踪主题 + 记忆库确认结果，见 :func:`build_expectation_set`）。
+        原因：真实事故里判定集合恰好就是描述里那个**错的**角色（或干脆为空），
+        「画面 = 判定」永远自洽，一次告警都没有。期望集合任意一份证据成立即可报冲突；
+        **期望集合为空**（谁都没结论）时仍然跳过 —— 那种情况下提示词里的角色是描述
+        自己写的，没有依据可对账，报警只会是噪音。
         """
         mode = str(config.general.consistency_check or "").strip().lower()
         if mode == "off" or not roster:
@@ -2048,52 +2309,62 @@ class CharacterGuardHandler(BaseEventHandler):
                 f"general.consistency_check={mode!r} 不是合法取值（off/warn/fix），按 warn 处理"
             )
             mode = "warn"
-        if not decided:
+
+        expected = build_expectation_set(
+            decided=decided, track=track, memory=memory, roster=roster
+        )
+        if not expected:
+            logger.debug(
+                "一致性检查=跳过（没有可对账的期望集合：本次判定为空，"
+                "主题跟踪与记忆库也没有明确指向）"
+            )
             return content
 
         texts = self._detection_texts(content, spec, args)
-        decided_keys = {entry_key(entry) for entry in decided}
+        expected_keys = expected.keys()
         extras = [
             entry
             for entry in roster
-            if entry_key(entry) not in decided_keys and character_in_texts(entry, texts)
+            if entry_key(entry) not in expected_keys and character_in_texts(entry, texts)
         ]
-        decided_names = "、".join(entry.name or entry.tag or "?" for entry in decided)
         if not extras:
             logger.debug(
-                f"一致性检查=正常（提示词里的角色表内角色都在判定集合内：{decided_names}）"
+                f"一致性检查=正常（提示词里的角色表内角色都在期望集合内：{expected.names()}）"
             )
             return content
 
-        extra_names = "、".join(entry.name or entry.tag or "?" for entry in extras)
+        # 两侧角色名与依据都要写清楚：用户核对「到底谁跟谁冲突、凭什么」全靠这一行
+        detail = (
+            f"画面标签={'、'.join(_entry_label(entry) for entry in extras)}，"
+            f"但上下文/记忆指向={expected.names()}（依据={expected.reason_text()}）"
+        )
+        suffix = f"；{basis}" if basis else ""
+
         if mode != "fix":
-            logger.warning(
-                "一致性检查=冲突（warn 不改内容）：提示词里出现了判定集合之外的角色表内角色"
-                f"「{extra_names}」，判定集合=「{decided_names}」，依据={basis}"
-            )
+            logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suffix}")
             return content
 
-        if len(decided) != 1 or len(extras) != 1:
+        if len(expected.entries) != 1 or len(extras) != 1:
             logger.warning(
                 "一致性检查=冲突但无法唯一定位"
-                f"（判定集合 {len(decided)} 个 / 冲突角色 {len(extras)} 个），"
-                f"退回 warn 行为、不改内容：冲突「{extra_names}」vs 判定「{decided_names}」，依据={basis}"
+                f"（期望集合 {len(expected.entries)} 个 / 冲突角色 {len(extras)} 个），"
+                f"退回 warn 行为、不改内容：{detail}{suffix}"
             )
             return content
 
-        wrong, right = extras[0], decided[0]
+        wrong, right = extras[0], expected.entries[0]
         replaced, hits = replace_character_reference(content, wrong, right)
         if hits <= 0:
             logger.warning(
                 f"一致性检查=冲突但未能定位可替换文本（角色表里没有「{wrong.name}」的字面写法），"
-                f"退回 warn 行为、不改内容：判定「{right.name}」，依据={basis}"
+                f"退回 warn 行为、不改内容：{detail}{suffix}"
             )
             return content
 
         logger.warning(
             "一致性检查=冲突已修正（fix）：把画面里的"
             f"「{wrong.name or wrong.tag}」替换为「{right.name or right.tag}」"
-            f"（替换 {hits} 处），依据={basis}"
+            f"（替换 {hits} 处），依据={expected.reason_text()}{suffix}"
         )
         # 替换后按需补正确角色的标准标签（沿用 tag_completion 逻辑）
         tags = self._completion_tags(replaced, [right], config)

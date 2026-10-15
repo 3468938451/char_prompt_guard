@@ -57,6 +57,26 @@ C59 连续调用只追加一次（幂等），并且卸载时能把说明**还�
 都没有、判定行为同 1.0.17。**C1~C59 的 ``make_config`` 因此默认把记忆库关掉**，
 免得本机恰好开着 Booku Memory 时旧用例被影响。
 
+1.0.19 起修一次**真实事故**（C64~C67）：调用方这次画的是**爱莉希雅**（粉长发 /
+蓝眼 / 尖耳 / 粉白短裙），却把**花火的标签** ``Hanabi (Honkai: Star Rail)`` 写进了
+画面描述 —— 因为它的**备忘**里存着过期的固定规则「标签必须是 Hanabi 挂最前头」。
+1.0.18 的判定链一见「描述里有角色表内角色」就放行（描述点名优先级最高，且这种
+情况下**根本不查记忆库**），于是没有任何对账。1.0.19 补两件事：
+
+1. 二次一致性检测的对账基准从「判定集合」扩成**期望集合**（判定集合 + 主题跟踪
+   主题 + 记忆库确认结果）：提示词里的角色表内角色不在期望集合里 → 冲突，
+   ``warn`` 只报不改、``fix`` 仅在「期望集合恰好 1 人 + 画面里冲突角色恰好 1 个」时
+   替换（见 C64/C65 与既有 C38/C39）；
+2. **描述已点名时**额外做一次「**对账用**」记忆库查询（关键词 = 描述里那个角色的
+   名字 / 别名 + 自我指代词；只用于上面那条对账，**不改判定、不写回**）。
+
+C64 描述里写着花火、记忆库明确写着「本尊 → 爱莉希雅」→ ``warn`` 打
+``一致性检查=冲突``（两侧角色名与依据都在里面）、**内容一字不改**；
+C65 同一场景换成 ``fix`` → 画面里的 ``hanabi`` 被替换成 ``elysia \(honkai impact 3rd\)``；
+C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触发词对应」的无关条目 →
+**不算证据、不报冲突**，内容与关掉记忆库时逐字一致；C67 对账查询超时 → 不崩、
+内容不变、日志里能看到 ``记忆库不可用``。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -161,6 +181,7 @@ def make_config(
     1.0.18 起 ``[memory]``（外部记忆库）**默认在这里关掉**：C1~C59 是 1.0.17 及
     以前的行为回归，它们不该因为「本机恰好开着 Booku Memory」而变红；需要记忆库
     的用例（C60~C63）显式传 ``memory=True`` 并配 :class:`FakeMemory` 假传输层。
+    1.0.19 的 C64~C67 同理（也都是 ``memory=True`` + :class:`FakeMemory`）。
     （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
     """
     cfg = CharPromptGuardConfig()
@@ -2716,6 +2737,250 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C63 memory.enabled=False → 零 HTTP 调用、判定同 1.0.17",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C64 描述点名 vs 记忆库对账：warn 只报不改（1.0.19）──────────────────
+    # 真实事故原文：调用方这次画的是**爱莉希雅**（粉长发 / 蓝眼 / 尖耳 / 粉白短裙），
+    # 写进画面描述的却是它**过期备忘**里的固定标签 `Hanabi (Honkai: Star Rail)`。
+    # 上下文（触发前那句「…你找找有没有那种有亲切感的壳子啊…」）里只有代词「你」、
+    # 没有先行词 → 主题跟踪 status=unavailable、判定集合为空；1.0.18 一见描述里有
+    # 角色表内角色就放行，连记忆库都不查 —— 于是没有任何对账。
+    # 1.0.19：描述点名时额外做一次**对账用**查询，记忆里明确写着「本尊 → 爱莉希雅」
+    # → 期望集合 = {爱莉希雅}，画面里的「花火」落在期望集合之外 → warn 记一条
+    # `一致性检查=冲突`（两侧角色名与依据都在里面），**内容一字不改**；
+    # 这次查询只用于对账，**绝不写回**（POST 次数必须是 0）。
+    try:
+        cfg = make_config(roster=RS3, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        raw = "Hanabi (Honkai: Star Rail) 粉长发、尖耳朵、粉白短裙的少女"
+        memory_items = [
+            {
+                "id": "mem-elysia-1",
+                "title": "角色指向：本尊 → 爱莉希雅",
+                "content_snippet": (
+                    "用户想要「有亲切感的壳子」，本尊指向角色表里的「爱莉希雅」"
+                    "（崩坏三 (Honkai Impact 3rd)）。"
+                ),
+                "metadata": {
+                    "bucket": "memory",
+                    "memory_type": "knowledge",
+                    "status": "active",
+                },
+            }
+        ]
+        history = [
+            history_message("唔，你找找有没有那种有亲切感的壳子啊，穿着拍一张～", 1.0)
+        ]
+        with (
+            FakeMemory(memory_items) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("行～"),
+                    "stream_id": "s-c64",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        ok = (
+            c == raw  # warn 不改内容
+            and "一致性检查=冲突" in warns
+            and "花火" in warns  # 画面那一侧
+            and "hanabi" in warns  # …连标准标签一起写出来
+            and "爱莉希雅" in warns  # 上下文 / 记忆那一侧
+            and "记忆库确认" in warns  # 依据写清是记忆库确认
+            and "无先行词" in warns  # 判定依据（主题跟踪不可用）也在
+            and len(mem.get) == 1  # 只做一次对账查询
+            and not mem.post  # 对账查询绝不写回
+        )
+        check(
+            "C64 描述点名 vs 记忆库对账：warn 报冲突、内容不改",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n"
+            f"        GET = {mem.get!r}\n        POST = {mem.post!r}\n"
+            f"        日志 = {logs.records_text()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C64 描述点名 vs 记忆库对账：warn 报冲突、内容不改",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C65 同一场景 consistency_check=fix：把画面里的错误角色换成期望角色（1.0.19）──
+    # 期望集合恰好 1 人（爱莉希雅）、画面里冲突的角色恰好 1 个（花火）→ 唯一可定位，
+    # 走 replace_character_reference：`Hanabi` → `爱莉希雅`，并按 tag_completion
+    # 补上期望角色的标准标签 `elysia \(honkai impact 3rd\)`。
+    try:
+        cfg = make_config(roster=RS3, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        raw = "Hanabi (Honkai: Star Rail) 粉长发、尖耳朵、粉白短裙的少女"
+        memory_items = [
+            {
+                "id": "mem-elysia-1",
+                "title": "角色指向：本尊 → 爱莉希雅",
+                "content_snippet": (
+                    "用户想要「有亲切感的壳子」，本尊指向角色表里的「爱莉希雅」。"
+                ),
+                "metadata": {"bucket": "memory", "memory_type": "knowledge"},
+            }
+        ]
+        history = [
+            history_message("唔，你找找有没有那种有亲切感的壳子啊，穿着拍一张～", 1.0)
+        ]
+        with (
+            FakeMemory(memory_items) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("行～"),
+                    "stream_id": "s-c65",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        ok = (
+            "hanabi" not in c.lower()  # 错的标签没了
+            and "花火" not in c
+            and ("elysia" in c.lower() or "爱莉希雅" in c)  # 换成期望角色
+            and "一致性检查=冲突已修正" in warns
+            and "爱莉希雅" in warns
+            and len(mem.get) == 1
+            and not mem.post  # 对账查询绝不写回
+        )
+        check(
+            "C65 同场景 fix：画面里的花火被替换为爱莉希雅",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n        POST = {mem.post!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C65 同场景 fix：画面里的花火被替换为爱莉希雅",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C66（防回归）描述点名 + 记忆库没有冲突信息 → 不算证据、不报冲突（1.0.19）──
+    # 记忆库里只有一条**顺带提到**爱莉希雅、却没有「触发词 → 角色」明确对应的闲聊
+    # （没有 本尊 / 扮演 / 口吻 这类触发词）→ attribute_items 判 miss → 期望集合为空
+    # → 一致性检查跳过。内容必须与「关掉记忆库」（= 1.0.18 行为）**逐字一致**。
+    # 这条守的是 1.0.19 最容易踩的坑：把模糊检索结果当成「该画她」的依据，
+    # 于是把正常的描述点名误判成冲突。
+    try:
+        raw = "Hanabi (Honkai: Star Rail) 粉长发、尖耳朵、粉白短裙的少女"
+        history = [
+            history_message("唔，你找找有没有那种有亲切感的壳子啊，穿着拍一张～", 1.0)
+        ]
+        unrelated_items = [
+            {
+                "id": "mem-chat-1",
+                "title": "日常闲聊",
+                "content_snippet": "聊到过爱莉希雅，用户说想要有亲切感的壳子。",
+                "metadata": {"bucket": "memory", "memory_type": "knowledge"},
+            }
+        ]
+
+        def scenario_cfg(memory: bool) -> CharPromptGuardConfig:
+            cfg = make_config(roster=RS3, memory=memory)
+            cfg.general.history_cache_ttl = 0.0
+            cfg.general.consistency_check = "warn"
+            return cfg
+
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("行～"),
+            "stream_id": "s-c66",
+        }
+        with FakeHistory(history):
+            gold = (await fire(scenario_cfg(False), params))["args"]["content"]
+        with (
+            FakeMemory(unrelated_items) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(scenario_cfg(True), params)
+        c = out["args"]["content"]
+        all_text = logs.records_text()
+        ok = (
+            c == raw
+            and c == gold  # 与关掉记忆库（1.0.18 行为）逐字一致
+            and "一致性检查=冲突" not in all_text
+            and "一致性检查=跳过" in logs.debugs()  # 没有可对账的期望集合
+            and len(mem.get) == 1  # 查询照发（关键词抓的是画面里那个角色）
+            and not mem.post
+        )
+        check(
+            "C66 描述点名 + 记忆库无明确对应 → 不误报冲突（与 1.0.18 逐字一致）",
+            ok,
+            f"content = {c!r}\n        gold = {gold!r}\n"
+            f"        GET = {mem.get!r}\n        日志 = {all_text!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C66 描述点名 + 记忆库无明确对应 → 不误报冲突（与 1.0.18 逐字一致）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C67 描述点名 + 记忆库查询超时 → 不崩、内容不变、日志说明不可用（1.0.19）──
+    try:
+        cfg = make_config(roster=RS3, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        raw = "Hanabi (Honkai: Star Rail) 粉长发、尖耳朵、粉白短裙的少女"
+        history = [
+            history_message("唔，你找找有没有那种有亲切感的壳子啊，穿着拍一张～", 1.0)
+        ]
+        with (
+            FakeMemory(error=TimeoutError("timed out")) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("行～"),
+                    "stream_id": "s-c67",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == raw  # 不崩、内容不变
+            and "记忆库不可用" in debugs
+            and "一致性检查=冲突" not in logs.records_text()
+            and len(mem.get) == 1  # 只试一次，失败即静默降级
+            and not mem.post
+        )
+        check(
+            "C67 对账查询超时 → 不崩、内容不变、静默降级",
+            ok,
+            f"content = {c!r}\n        GET = {mem.get!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C67 对账查询超时 → 不崩、内容不变、静默降级",
             False,
             f"{type(e).__name__}: {e}",
         )
