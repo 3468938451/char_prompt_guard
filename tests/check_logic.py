@@ -46,6 +46,17 @@ LLM 没结论就不补（C55）。两者分别出现在不同消息里时行为�
 C57 关掉开关后说明**一字不改**；C58 空注册表**不抛异常**、返回「未注入」标记；
 C59 连续调用只追加一次（幂等），并且卸载时能把说明**还原**成原文。
 
+1.0.18 起关联**外部记忆库**（Booku Memory，``[memory]`` 节，C60~C63）：判定
+**不确定**时（主题跟踪的 split / unavailable / low_confidence / empty）去检索相关
+信息做「再确认」，命中「触发词 → 角色表内角色」的明确对应就直接用作判定依据，
+并把这次确认写回记忆库。测试方式是**注入假传输层**（:class:`FakeMemory` 替换
+``memory._http_get_json`` / ``memory._http_post_json``，结构与实测的 Booku Memory
+一致）：C60 拆单 + 命中「本尊 → 花火」→ 直接补花火（且不再问 LLM）；C61 记忆库超时
+→ 不崩、内容与关掉记忆库时逐字一致；C62 ``write_back`` 开 → 恰好一次 POST（标题 /
+正文 / core_tags 全对），关 → 零次；C63 ``memory.enabled = false`` → 一次 HTTP 调用
+都没有、判定行为同 1.0.17。**C1~C59 的 ``make_config`` 因此默认把记忆库关掉**，
+免得本机恰好开着 Booku Memory 时旧用例被影响。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -64,6 +75,7 @@ import logging
 import os
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Annotated, Self
 
@@ -142,8 +154,15 @@ def make_config(
     multi_enabled: bool = True,
     max_characters: int = 6,
     general_enabled: bool = True,
+    memory: bool = False,
 ) -> CharPromptGuardConfig:
-    """按用例参数构造配置。"""
+    """按用例参数构造配置。
+
+    1.0.18 起 ``[memory]``（外部记忆库）**默认在这里关掉**：C1~C59 是 1.0.17 及
+    以前的行为回归，它们不该因为「本机恰好开着 Booku Memory」而变红；需要记忆库
+    的用例（C60~C63）显式传 ``memory=True`` 并配 :class:`FakeMemory` 假传输层。
+    （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
+    """
     cfg = CharPromptGuardConfig()
     cfg.general.enabled = general_enabled
     cfg.general.apply_modes = apply_modes
@@ -152,6 +171,7 @@ def make_config(
     cfg.targets.list = targets
     cfg.multi.enabled = multi_enabled
     cfg.multi.max_characters = max_characters
+    cfg.memory.enabled = memory
     return cfg
 
 
@@ -222,6 +242,89 @@ class FakeHistory:
         return False
 
 
+class FakeMemory:
+    """上下文管理器：用假传输层替换记忆库的 HTTP 调用（1.0.18）。
+
+    插件侧唯一需要替换的就是 ``memory._http_get_json`` / ``memory._http_post_json``
+    这两个模块级函数（:meth:`memory.MemoryClient.search` / ``write`` 都把它们包在
+    ``asyncio.to_thread`` 里执行），所以这里 monkeypatch 掉它们，并记录每一次调用：
+
+    - ``get`` / ``post`` 是调用记录（URL 字符串），用例据此断言
+      「发了几次请求 / 带了哪些关键词 / 写回时的 JSON 体是什么」；
+    - ``items`` 是 ``GET /api/memories`` 的返回条目（结构对齐实测的 Booku Memory：
+      ``{"id", "title", "content_snippet", "metadata": {...}}``）；
+    - ``error`` 非空时两个传输函数都抛 ``TimeoutError``（超时的替身），
+      用来验「记忆库不可用 → 静默降级」；
+    - ``post_error`` 单独控制写入失败。
+
+    退出 with 块时恢复原函数，并把「失败退避」状态清干净（``memory.reset_state``），
+    免得一条用例的失败退避影响下一条。
+    """
+
+    def __init__(
+        self,
+        items: list[dict] | None = None,
+        *,
+        error: BaseException | None = None,
+        post_error: BaseException | None = None,
+        post_response: dict | None = None,
+    ) -> None:
+        self.items = list(items or [])
+        self.error = error
+        self.post_error = post_error
+        self.post_response = (
+            post_response if post_response is not None else {"id": "mem-new-1"}
+        )
+        self.get: list[str] = []
+        self.post: list[tuple[str, dict]] = []
+        self._original_get = None
+        self._original_post = None
+
+    def __enter__(self) -> Self:
+        from .. import memory as memory_module
+
+        self._original_get = memory_module._http_get_json
+        self._original_post = memory_module._http_post_json
+        memory_module.reset_state()
+
+        def fake_get(url: str, timeout: float):
+            self.get.append(url)
+            if self.error is not None:
+                raise self.error
+            return {
+                "action": "list_memory_entries",
+                "total": len(self.items),
+                "items": self.items,
+            }
+
+        def fake_post(url: str, payload: dict, timeout: float):
+            self.post.append((url, dict(payload)))
+            if self.post_error is not None:
+                raise self.post_error
+            return dict(self.post_response)
+
+        memory_module._http_get_json = fake_get
+        memory_module._http_post_json = fake_post
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        from .. import memory as memory_module
+
+        if self._original_get is not None:
+            memory_module._http_get_json = self._original_get
+        if self._original_post is not None:
+            memory_module._http_post_json = self._original_post
+        memory_module.reset_state()
+        return False
+
+    def keyword(self) -> str:
+        """最近一次 GET 里带的 ``keyword`` 参数（没发过请求时为空串）。"""
+        if not self.get:
+            return ""
+        query = urllib.parse.urlsplit(self.get[-1]).query
+        return urllib.parse.parse_qs(query).get("keyword", [""])[0]
+
+
 class _ListHandler(logging.Handler):
     """把日志记录收进列表。"""
 
@@ -272,6 +375,10 @@ class LogCapture:
             for record in self.handler.records
             if record.levelno >= logging.WARNING
         )
+
+    def records_text(self) -> str:
+        """全部级别的记录（1.0.18 的「记忆库已记住 / 记忆库确认」是 INFO）。"""
+        return "\n".join(record.getMessage() for record in self.handler.records)
 
 
 async def fire(cfg: CharPromptGuardConfig, params: dict) -> dict:
@@ -2263,6 +2370,352 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C59 注入幂等（只追加一次）且卸载可还原",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C60 记忆库再确认：不确定（拆单）+ 命中「本尊 → 花火」→ 直接补花火（1.0.18）──
+    # 与 C54 完全同一个「拆单」场景（同一条消息里既有「本尊」又有「爱莉」），
+    # 区别只在**本机记忆库里已经记过这件事**：检索命中一条标题含「本尊 → 花火」的
+    # 记忆 → 判定链直接采用（日志 `记忆库确认:本尊 → 花火（mem-xxxx）`），
+    # 不必再问 LLM（下面是调用计数器，断言 LLM 一次都没被调用）。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.description_first = False
+        cfg.multi.llm_mode = "fallback"
+        raw = "清晨室内明亮柔和的光线。白发少女刚起床，站在镜头前，粉色眼睛看向镜头"
+        calls = {"n": 0}
+
+        async def fake_extract(**kwargs):
+            calls["n"] += 1
+            return CharacterExtraction(characters=[], multi=False)
+
+        memory_items = [
+            {
+                "id": "mem-hanabi-1",
+                "title": "角色指向：本尊 → 花火",
+                "content_snippet": "用户以「本尊」指向角色表里的「花火」。",
+                "metadata": {
+                    "bucket": "memory",
+                    "memory_type": "knowledge",
+                    "status": "active",
+                },
+            }
+        ]
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+            with (
+                FakeMemory(memory_items) as mem,
+                FakeHistory(history),
+                LogCapture() as logs,
+            ):
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("嗯～"),
+                        "stream_id": "s-c60",
+                    },
+                )
+        finally:
+            handler_module.extract_characters_via_llm = original
+        c = out["args"]["content"]
+        logs_text = logs.debugs() + "\n" + logs.records_text()
+        keyword = mem.keyword()
+        ok = (
+            "花火" in c
+            and "爱莉希雅" not in c
+            and c.startswith(raw)
+            and "记忆库" in logs_text
+            and "mem-hanabi-1" in logs_text
+            and calls["n"] == 0  # 记忆库给了明确对应，不必再问 LLM
+            and len(mem.get) == 1  # 只检索一次
+            and "本尊" in keyword  # 关键词里带上了触发词
+            and len(keyword) <= 60  # 关键词长度受控
+            and len(mem.post) == 1  # 命中即写回（write_back 默认开）
+        )
+        check(
+            "C60 记忆库再确认（拆单 + 命中「本尊 → 花火」）→ 直接补花火",
+            ok,
+            f"content = {c!r}\n        keyword = {keyword!r}\n"
+            f"        GET = {mem.get!r}\n        POST = {mem.post!r}\n"
+            f"        LLM 调用次数 = {calls['n']}\n        日志 = {logs_text!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C60 记忆库再确认（拆单 + 命中「本尊 → 花火」）→ 直接补花火",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C61 记忆库不可用（超时/异常）→ 静默降级回 1.0.17 原路径（1.0.18）──────
+    # 与 C54 同一个场景、同一个假 LLM 结论，只是把记忆库换成「一请求就超时」：
+    # 必须不崩、按 1.0.17 的拆单链路（LLM 按画面判定）补出花火，并且**内容与
+    # 关闭记忆库时逐字一致**；日志里要能看出是记忆库不可用被跳过。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        async def fake_extract(**kwargs):
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
+                ],
+                multi=False,
+            )
+
+        def scenario_cfg(memory: bool) -> CharPromptGuardConfig:
+            cfg = make_config(roster=RS3, use_llm=True, memory=memory)
+            cfg.general.history_cache_ttl = 0.0
+            cfg.general.description_first = False
+            cfg.multi.llm_mode = "fallback"
+            return cfg
+
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {
+                "content": "清晨室内明亮柔和的光线。白发少女刚起床，站在镜头前，粉色眼睛看向镜头"
+            },
+            "message": FakeMessage("嗯～"),
+            "stream_id": "s-c61",
+        }
+        history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            # 基线：完全关掉记忆库（1.0.17 的行为）
+            with FakeHistory(history):
+                gold = (await fire(scenario_cfg(False), params))["args"]["content"]
+            # 记忆库开着但一请求就超时
+            with (
+                FakeMemory(error=TimeoutError("timed out")) as mem,
+                FakeHistory(history),
+                LogCapture() as logs,
+            ):
+                out = await fire(scenario_cfg(True), params)
+        finally:
+            handler_module.extract_characters_via_llm = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            c == gold
+            and "花火" in c
+            and "记忆库不可用" in debugs
+            and "拆单" in debugs
+            and len(mem.get) == 1
+            and not mem.post  # 没命中就不该写回
+        )
+        check(
+            "C61 记忆库不可用 → 不崩、静默降级（内容与 1.0.17 一致）",
+            ok,
+            f"gold  = {gold!r}\n        content = {c!r}\n"
+            f"        GET = {mem.get!r} POST = {mem.post!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C61 记忆库不可用 → 不崩、静默降级（内容与 1.0.17 一致）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C62 写回（记住）：write_back 开 → 恰好一次 POST；关 → 一次都没有（1.0.18）──
+    # 写回内容按需求钉死：title 含触发词与角色名、content 含角色与标准标签、
+    # core_tags 同时含「角色指向」/ 触发词 / 角色名；bucket 与 memory_type 用配置值。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterExtraction
+
+        memory_items = [
+            {
+                "id": "mem-hanabi-2",
+                "title": "角色指向：本尊 → 花火",
+                "content_snippet": "用户以「本尊」指向角色表里的「花火」（崩坏：星穹铁道）。",
+                "metadata": {"bucket": "memory", "memory_type": "knowledge"},
+            }
+        ]
+
+        async def fake_extract(**kwargs):
+            return CharacterExtraction(characters=[], multi=False)
+
+        def scenario_cfg(write_back: bool) -> CharPromptGuardConfig:
+            cfg = make_config(roster=RS3, use_llm=True, memory=True)
+            cfg.general.history_cache_ttl = 0.0
+            cfg.general.description_first = False
+            cfg.multi.llm_mode = "fallback"
+            cfg.memory.write_back = write_back
+            cfg.memory.bucket = "memory"
+            cfg.memory.memory_type = "knowledge"
+            return cfg
+
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": "清晨室内明亮柔和的光线。白发少女刚起床"},
+            "message": FakeMessage("嗯～"),
+            "stream_id": "s-c62",
+        }
+        history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            with (
+                FakeMemory(memory_items) as on,
+                FakeHistory(history),
+                LogCapture() as logs,
+            ):
+                out_on = await fire(scenario_cfg(True), params)
+            with FakeMemory(memory_items) as off, FakeHistory(history):
+                out_off = await fire(scenario_cfg(False), params)
+        finally:
+            handler_module.extract_characters_via_llm = original
+
+        body = on.post[0][1] if on.post else {}
+        tags = body.get("core_tags") or []
+        ok = (
+            len(on.post) == 1
+            and on.post[0][0].endswith("/api/memories")
+            and "本尊" in str(body.get("title") or "")
+            and "花火" in str(body.get("title") or "")
+            and "花火" in str(body.get("content") or "")
+            and TAG_HANABI in str(body.get("content") or "")
+            and "角色指向" in tags
+            and "本尊" in tags
+            and "花火" in tags
+            and body.get("bucket") == "memory"
+            and body.get("memory_type") == "knowledge"
+            and body.get("status") == "active"
+            and "记忆库已记住" in logs.records_text()
+            and not off.post  # write_back=False：一次 POST 都没有
+            and "花火" in out_on["args"]["content"]
+            and "花火" in out_off["args"]["content"]  # 开关只影响写回，不影响判定
+        )
+        check(
+            "C62 写回记忆库：write_back 开→一次 POST（含标题/正文/标签），关→零次",
+            ok,
+            f"POST = {on.post!r}\n        write_back=False 的 POST = {off.post!r}\n"
+            f"        content = {body.get('content')!r}\n"
+            f"        日志 = {logs.records_text()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C62 写回记忆库：write_back 开→一次 POST（含标题/正文/标签），关→零次",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C63 memory.enabled=False → 完全没有 HTTP 调用，判定同 1.0.17（1.0.18）──
+    # 三个层面一起断言：
+    #   ① 假传输层（GET/POST）一次都没被调用；
+    #   ② 内容与本项目 1.0.17 的实现（同一场景用假 LLM 跑）逐字一致；
+    #   ③ 顺手钉住「记忆库里的词表没有和判定链漂移」（memory 只加不减）。
+    try:
+        from .. import handler as handler_module
+        from .. import memory as memory_module
+        from ..character import (
+            SELF_REFERENCE_WORDS,
+            CharacterEntry,
+            CharacterExtraction,
+        )
+
+        async def fake_extract(**kwargs):
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
+                ],
+                multi=False,
+            )
+
+        # ① 关掉记忆库时，连一次请求都不该发出去 —— FakeMemory 里配了 error，
+        #    插件若真的发请求，这条用例会以异常的形式直接失败。
+        def scenario_cfg(memory: bool) -> CharPromptGuardConfig:
+            cfg = make_config(roster=RS3, use_llm=True, memory=memory)
+            cfg.general.history_cache_ttl = 0.0
+            cfg.general.description_first = False
+            cfg.multi.llm_mode = "fallback"
+            return cfg
+
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": "清晨室内明亮柔和的光线。白发少女刚起床"},
+            "message": FakeMessage("嗯～"),
+            "stream_id": "s-c63",
+        }
+        history = [history_message("本尊看看，然后穿着爱莉来看看～", 1.0)]
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            # 记忆库关闭：零请求（FakeMemory 的 error 就是哨兵），日志里也不该出现「记忆库」
+            with (
+                FakeMemory(error=AssertionError("不该被调用")) as mem,
+                FakeHistory(history),
+                LogCapture() as logs,
+            ):
+                out = await fire(scenario_cfg(False), params)
+            # ② 对照组：同一个场景、记忆库开着但一请求就超时 —— 内容必须逐字一致
+            with (
+                FakeMemory(error=TimeoutError("timed out")) as mem_on,
+                FakeHistory(history),
+                LogCapture() as logs_on,
+            ):
+                out_on = await fire(scenario_cfg(True), params)
+        finally:
+            handler_module.extract_characters_via_llm = original
+
+        c = out["args"]["content"]
+        # 词表漂移检查：memory 模块刻意不 import character / monitor（避免循环依赖），
+        # 自我指代词表是与它们各抄一份的 —— 这条断言保证「只加不减、顺序一致」。
+        drift = [
+            word
+            for word in SELF_REFERENCE_WORDS
+            if word not in memory_module.SPEAKER_TRIGGER_WORDS
+        ]
+        head_mismatch = [
+            (index, word)
+            for index, word in enumerate(SELF_REFERENCE_WORDS)
+            if index >= len(memory_module.SPEAKER_TRIGGER_WORDS)
+            or memory_module.SPEAKER_TRIGGER_WORDS[index] != word
+        ]
+        ok = (
+            not mem.get
+            and not mem.post
+            and "记忆库" not in logs.records_text()
+            and "花火" in c
+            and "本尊" not in c
+            and "拆单" in logs.debugs()
+            and out_on["args"]["content"] == c  # 不可用时逐字退回原路径
+            and "记忆库不可用" in logs_on.debugs()
+            and len(mem_on.get) == 1
+            and not drift
+            and not head_mismatch
+            and "本尊" in memory_module.SPEAKER_TRIGGER_WORDS
+        )
+        check(
+            "C63 memory.enabled=False → 零 HTTP 调用、判定同 1.0.17",
+            ok,
+            f"GET = {mem.get!r} POST = {mem.post!r}\n        content = {c!r}\n"
+            f"        对照组（记忆库超时）content = {out_on['args']['content']!r}\n"
+            f"        漂移的自我指代词 = {drift!r} 顺序不符 = {head_mismatch!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C63 memory.enabled=False → 零 HTTP 调用、判定同 1.0.17",
             False,
             f"{type(e).__name__}: {e}",
         )

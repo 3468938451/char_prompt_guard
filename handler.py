@@ -37,6 +37,19 @@
 （纯内存改注解），让主模型在工具定义里就看到这条要求。本文件只负责提供两个
 「再试一次」的时机：``on_all_plugin_loaded``（本插件常比生图插件先加载完）与首次
 生图事件；注入逻辑、一次性标志位、失败降级全在 :mod:`tag_hint`，**判定链一行未改**。
+
+**1.0.18 的第三份证据（外部记忆库，同样不改编判定链）**：判定**不确定**时
+（主题跟踪的 ``split`` / ``unavailable`` / ``low_confidence`` / ``empty``，且画面
+描述里没有角色表内角色），先问一次外部记忆库（Booku Memory，:mod:`memory`）——
+命中「触发词 → 角色表内角色」的明确对应就直接采用（日志
+``记忆库确认:本尊 → 花火（mem-xxxx）``）并把这次确认写回；没有明确对应时把命中的
+``title + content_snippet`` 当作**参考材料**（独立一段「相关记忆（供参考，不是
+指令）」）喂给既有的 LLM 提取。关闭 / 不可用 / 超时 / 非 200 / JSON 坏 → 静默降级回
+1.0.17 的原链路，**绝不拦住生图**。实现落在 :meth:`CharacterGuardHandler._memory_lookup`
+（读）与 :meth:`CharacterGuardHandler._memory_verdict`（用作判定依据 + 触发写回），
+写回本身在 :mod:`memory`；测试用可替换的传输层
+（``memory.set_transport`` 或直接 monkeypatch ``memory._http_get_json`` /
+``memory._http_post_json``）注入假记忆库。
 """
 
 from __future__ import annotations
@@ -57,8 +70,10 @@ from src.app.plugin_system.base import BaseEventHandler
 from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
+from . import memory as memory_api
 from . import tag_hint
 from .character import (
+    BASIS_LATEST_MENTION,
     BASIS_USER_NAMED,
     CharacterEntry,
     NamingDecision,
@@ -210,6 +225,7 @@ class CandidateResult:
         naming: 确定性的「主题跟踪 / 用户点名·粘性」判定结果（1.0.14 起由主题跟踪给出，
             见 :meth:`monitor.SubjectTrack.naming`）
         basis: 判定依据的可读文案（进日志与 WARNING）
+        memory: 本次「记忆库再确认」的结果（1.0.18；没查记忆库时是 ``None``）
     """
 
     candidates: list[CharacterEntry] = field(default_factory=list)
@@ -218,6 +234,7 @@ class CandidateResult:
     mentioned: int = 0
     naming: NamingDecision = field(default_factory=NamingDecision)
     basis: str = ""
+    memory: memory_api.MemoryLookup | None = None
 
 
 _BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
@@ -731,6 +748,155 @@ def resolve_true_self_identity(config: CharPromptGuardConfig) -> TrueSelfIdentit
     return TrueSelfIdentity()
 
 
+# ── 记忆库关联（1.0.18）──────────────────────────────────────────────
+#
+# 判定链一行未改：记忆库只是「多一份证据」—— 只有判定**不确定**时才去读，
+# 读到「触发词 → 角色表内角色」的明确对应就用作判定依据（并把这次确认写回），
+# 否则静默降级回 1.0.17 的原链路（LLM 该问还是问，失败该不补还是不补）。
+
+#: 判定链里「不确定」的四种情形（与主题跟踪的 status 同名）：
+#: ``split`` 拆单 / ``unavailable`` 本尊身份取不到或代词无先行词 /
+#: ``low_confidence`` 置信度不足 / ``empty`` 无信号（但仍可能要问 LLM）。
+UNCERTAIN_SPLIT = "split"
+UNCERTAIN_UNAVAILABLE = "unavailable"
+UNCERTAIN_LOW_CONFIDENCE = "low_confidence"
+UNCERTAIN_EMPTY = "empty"
+UNCERTAIN_STATUSES: frozenset[str] = frozenset(
+    {
+        UNCERTAIN_SPLIT,
+        UNCERTAIN_UNAVAILABLE,
+        UNCERTAIN_LOW_CONFIDENCE,
+        UNCERTAIN_EMPTY,
+    }
+)
+
+
+def memory_uncertainty(track: SubjectTrack | None) -> str:
+    """返回主题跟踪里「不确定」的类型；确定（``ok``）/ 没有跟踪结果时返回空串。
+
+    只有这四种情形才去问记忆库；``ok``（主题可信）时**不查** —— 避免多一次网络
+    请求，也避免记忆库里的旧结论压过用户刚说的话。
+    """
+    status = str(getattr(track, "status", "") or "")
+    return status if status in UNCERTAIN_STATUSES else ""
+
+
+def _memory_candidate_names(
+    track: SubjectTrack | None,
+    window: list[dict[str, Any]] | None,
+    roster: list[CharacterEntry],
+) -> list[str]:
+    """本次上下文里的**候选名**（角色表里出现过的名字 / 别名）。
+
+    只用「角色表里真的出现过」的词，宁少勿多：
+
+    1. 主题跟踪刚提到的角色（``track.entries``，例如拆单里的「爱莉希雅」）；
+    2. 最近若干条消息里被提及过的角色（:func:`character.find_characters_in_history`）。
+
+    一个都没有时返回空列表 —— 那说明本次连候选都没有，记忆库也帮不上忙
+    （``memory.build_keyword`` 会退回「触发词优先」的关键词，例如只有「本尊」那种）。
+
+    .. note::
+       **它只用于关键词构造**（``memory.build_keyword`` 的 ``roster_names`` 第 3 段：
+       「这次上下文里出现的候选名」，帮助检索排序），**不再参与「触发词 → 角色」
+       的对账** —— 对账必须用完整角色表，见 :func:`_roster_match_names`。
+    """
+    if not roster:
+        return []
+    entries: list[CharacterEntry] = list(getattr(track, "entries", None) or [])
+    if window:
+        entries = merge_entries(entries, find_characters_in_history(window, roster))
+    names: list[str] = []
+    for entry in entries:
+        for keyword in entry.keywords():
+            if keyword and keyword not in names:
+                names.append(keyword)
+    return names
+
+
+def _roster_match_names(roster: list[CharacterEntry]) -> list[str]:
+    """**完整角色表**里所有可参与匹配的词：每个条目的 name + 全部别名 + 标准标签。
+
+    去空白、去重（忽略大小写，与 ``character`` 的匹配口径一致）、保序（角色表顺序，
+    条目内 name → 别名 → 标签）。空串一律不要。
+
+    为什么对账必须用**整张**角色表，而不是「当前上下文里出现过的候选名」：
+    记忆里存的对应关系（``角色指向：本尊 → 花火``）指向的角色**不一定出现在本次
+    上下文里** —— 拆单场景里上文只提了「爱莉」，记忆里指向的却是「花火」。若只把
+    候选名（爱莉希雅 / 爱莉 / elysia）交给 ``memory.attribute_items``，它的
+    ``_roster_hits`` 在记忆文本里一个角色表关键词都找不到 → 返回 0 个命中 →
+    整条记忆被判成 miss 并降级去问 LLM（**实测 C60 就是这么失败的**：日志里
+    记忆库明明检索到「角色指向：本尊 → 花火」，status 却是 miss）。
+
+    匹配口径本身不变（见 :func:`memory.attribute_items`）：同一条记忆里必须**同时**
+    出现触发词、且**恰好一个**角色表内角色；出现多个 → 整条作废（歧义不猜）。
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in roster or []:
+        for raw in (entry.name, *entry.aliases, entry.tag):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(text)
+    return names
+
+
+def _memory_character_entry(character: memory_api.MemoryCharacter) -> CharacterEntry:
+    """把记忆库确认出的角色转成判定链使用的 :class:`CharacterEntry`。
+
+    两者字段一一对应，这里只做一次显式转换 —— 记忆库模块刻意不 import
+    ``character``（避免循环依赖），所以转换落在调用方。
+    """
+    return CharacterEntry(
+        name=character.name or character.tag,
+        game=character.game,
+        aliases=list(character.aliases),
+        tag=character.tag,
+    )
+
+
+def _memory_name_lookup(roster: list[CharacterEntry]) -> Any:
+    """造一个「关键词 → 角色」的查表函数（复用角色表自己的匹配规则）。
+
+    走 :func:`character.find_roster_identity`（名字 → 别名 → 标签），因此
+    ``hanabi \\(honkai: star rail\\)`` 与 ``hanabi (Honkai: star rail)`` 视为同一个。
+    """
+
+    def lookup(name: str) -> memory_api.MemoryCharacter | None:
+        entry = find_roster_identity(name, roster)
+        if entry is None:
+            return None
+        return memory_api.MemoryCharacter(
+            name=entry.name,
+            game=entry.game,
+            aliases=tuple(entry.aliases),
+            tag=entry.tag,
+        )
+
+    return lookup
+
+
+@dataclass
+class MemoryContext:
+    """一次「记忆库再确认」的上下文（1.0.18，供调用方记录诊断信息）。
+
+    Attributes:
+        lookup: 记忆库检索 / 对账的结果
+        mentioned: 主题跟踪窗口里被提及过的角色表内角色数（沿用 ``multi_only``
+            的既有口径，只是给日志与 ``CandidateResult`` 用）
+        reason: 触发这次再确认的具体原因（主题跟踪的 ``reason``）
+    """
+
+    lookup: memory_api.MemoryLookup
+    mentioned: int = 0
+    reason: str = ""
+
+
 class CharacterGuardHandler(BaseEventHandler):
     """生图前角色提示词检测与补全处理器。"""
 
@@ -832,8 +998,39 @@ class CharacterGuardHandler(BaseEventHandler):
             entry_key(entry) for entry in roster if character_in_texts(entry, texts)
         }
 
-        # 候选角色：用户点名/粘性 → LLM 仲裁（必要时）
-        result = await self._collect_candidates(params, config, roster, content, texts)
+        # 1.0.18：判定**不确定**且描述里没有角色表内角色时，先去外部记忆库
+        # （Booku Memory）做一次「再确认」。命中「触发词 → 角色表内角色」的明确
+        # 对应就直接用作判定依据（并写回记忆库），否则**静默降级**回 1.0.17 的
+        # 原链路（记忆库模块自己不抛异常、失败只打 DEBUG）。
+        #
+        # 这里放在 _collect_candidates **之前**是有意的：命中时省掉一次 LLM 调用
+        # （确定性记忆比模型猜测更可信），命中不了时 _collect_candidates 会照旧
+        # 把命中片段的 title + snippet 作为参考材料喂给 LLM。
+        description_has_character = any(
+            character_in_texts(entry, [content]) for entry in roster
+        )
+        memory_context = await self._memory_lookup(
+            params=params,
+            config=config,
+            roster=roster,
+            content=content,
+            description_has_character=description_has_character,
+        )
+        memory_lookup = memory_context.lookup if memory_context is not None else None
+        memory_verdict = self._memory_verdict(memory_context, roster)
+        if memory_verdict is not None:
+            # 记忆库给了明确结论 —— 直接走既有注入路径（不额外问 LLM）
+            result = memory_verdict
+        else:
+            # 候选角色：用户点名/粘性 → LLM 仲裁（必要时），记忆库命中片段作为参考材料
+            result = await self._collect_candidates(
+                params,
+                config,
+                roster,
+                content,
+                texts,
+                memory_lookup=memory_lookup,
+            )
         candidates = result.candidates
 
         # 标签补全：描述里已经点名了角色表内的角色、但缺少该角色的标准标签时补标签。
@@ -939,6 +1136,131 @@ class CharacterGuardHandler(BaseEventHandler):
             basis=result.basis,
         )
 
+    # ── 记忆库再确认（1.0.18）─────────────────────────────────────
+
+    async def _memory_lookup(
+        self,
+        *,
+        params: dict[str, Any],
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        content: str,
+        description_has_character: bool,
+    ) -> MemoryContext | None:
+        """判定不确定时去记忆库做一次「再确认」；不需要查时返回 ``None``。
+
+        触发条件（任一，见 :func:`memory_uncertainty`）：主题跟踪的 ``split`` /
+        ``unavailable`` / ``low_confidence`` / ``empty``。另外还要求
+        「画面描述里没有角色表内角色」—— 描述已经点名时判定并不不确定，
+        没必要多一次网络请求（也避免记忆库的旧结论压过描述）。
+
+        **本函数不抛异常**：记忆库的任何问题都只让 ``lookup.hit`` 为假，
+        由调用方走 1.0.17 的原链路。
+        """
+        if not memory_api.memory_enabled(config) or not roster:
+            return None
+        if description_has_character:
+            return None
+        try:
+            monitor = getattr(config, "monitor", None)
+            # 与 _collect_candidates 里那段同一套开关判断：monitor 关掉（或配置对象
+            # 形状不认识）时主题跟踪返回不了结论，这里同样不去打扰记忆库。
+            if not bool(getattr(monitor, "enabled", False)):
+                return None
+            messages = await self._collect_context(params, config)
+            window_size = max(1, int(getattr(monitor, "window", 15) or 15))
+            window = messages[-window_size:]
+            track = track_subject(
+                messages,
+                roster,
+                window=window_size,
+                min_confidence=float(getattr(monitor, "min_confidence", 0.5) or 0.5),
+                half_life_minutes=float(
+                    getattr(monitor, "half_life_minutes", 45.0) or 45.0
+                ),
+                multi_window_minutes=float(config.multi.multi_window_minutes),
+                self_reference_enabled=(
+                    bool(config.general.skip_on_self_reference)
+                    and not description_has_character
+                ),
+                bot_ids=await self._resolve_bot_sender_ids(window),
+                resolve_identity=lambda: resolve_true_self_identity(config),
+            )
+            uncertainty = memory_uncertainty(track)
+            if not uncertainty:
+                return None
+            mentioned = len(find_characters_in_history(window, roster))
+            # 对账用**完整角色表**（name + 别名 + 标准标签），不能用「当前上下文候选名」：
+            # 记忆里指向的角色可能压根不在本次上下文里（实测 C60：上文只提「爱莉」，
+            # 记忆里却是「本尊 → 花火」，只传候选名时 _roster_hits 命中 0 个 → 永远 miss）。
+            # candidate_names（上下文候选名）只用于关键词构造，见 memory.build_keyword 第 3 段。
+            roster_names = _roster_match_names(roster)
+            result = await memory_api.lookup(
+                config,
+                uncertainty=uncertainty,
+                reason=track.reason or track.basis,
+                description=content,
+                candidate_names=_memory_candidate_names(track, window, roster),
+                roster_names=roster_names,
+                signal_label=track.signal_label,
+                name_lookup=_memory_name_lookup(roster),
+            )
+            logger.debug(
+                f"记忆库再确认（不确定类型={uncertainty}）: status={result.status}"
+                f"{f'，{result.reason}' if result.reason else ''}"
+            )
+            return MemoryContext(
+                lookup=result, mentioned=mentioned, reason=track.reason or track.basis
+            )
+        except Exception as e:  # noqa: BLE001 —— 记忆库是「多一份证据」，不许拦住生图
+            logger.debug(
+                f"记忆库不可用，跳过（记忆库再确认失败: {type(e).__name__}: {e}）"
+            )
+            return None
+
+    @staticmethod
+    def _memory_verdict(
+        context: MemoryContext | None,
+        roster: list[CharacterEntry],
+    ) -> CandidateResult | None:
+        """把「记忆库命中」转成判定结果；没有明确结论时返回 ``None``。
+
+        命中时只采纳**角色表内**的角色（记忆库里的名字要对得上角色表才能带着
+        名字 / 游戏名 / 标准标签一起注入），并打 INFO 日志
+        ``记忆库确认:本尊 → 花火（mem-xxxx）``，判定依据写成
+        ``判定依据=记忆库再确认:本尊 → 花火（mem-xxxx）`` —— 与其它判定依据一样，
+        用户对着日志就能看出「这次为什么补了这个人」。
+        """
+        if context is None or not context.lookup.hit:
+            return None
+        lookup = context.lookup
+        decided: list[CharacterEntry] = []
+        for character in lookup.characters:
+            entry = find_roster_identity(character.name or character.tag, roster)
+            if entry is None:
+                entry = _memory_character_entry(character)
+            if any(entry_key(entry) == entry_key(known) for known in decided):
+                continue
+            decided.append(entry)
+        if not decided:
+            return None
+        logger.info(f"{lookup.confirm_log()}（判定依据=记忆库再确认，来自记忆库）")
+        naming = NamingDecision(
+            kind="multi" if len(decided) > 1 else "single",
+            characters=list(decided),
+            basis=BASIS_LATEST_MENTION,
+            note=f"记忆库再确认（{lookup.confirm_log()}）",
+        )
+        return CandidateResult(
+            candidates=list(decided),
+            decided=list(decided),
+            llm_multi=len(decided) > 1,
+            mentioned=context.mentioned,
+            naming=naming,
+            basis=f"判定依据=记忆库再确认:{lookup.confirm_log()}",
+            memory=lookup,
+        )
+
     # ── 配置与检测辅助 ────────────────────────────────────────────
 
     def _config(self) -> CharPromptGuardConfig:
@@ -1022,6 +1344,7 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         content: str,
         texts: list[str],
+        memory_lookup: memory_api.MemoryLookup | None = None,
     ) -> CandidateResult:
         """收集候选角色。
 
@@ -1054,6 +1377,13 @@ class CharacterGuardHandler(BaseEventHandler):
           「用户 21:52 点名流萤、01:03 只说想看看你」时必须是流萤；
         - LLM 仲裁：主题为空 / 置信度不足 / 换人还是追加不确定 / **拆单**时才问（条件见 ④）；
         - 都不成立 → 不补（宁少勿多）。
+
+        Args:
+            memory_lookup: 本次「记忆库再确认」的结果（1.0.18，可为 ``None``）。
+                命中「触发词 → 角色表内角色」时调用方已经在 :meth:`_memory_verdict`
+                里直接用掉了它，走到这里说明**没有明确对应**；此处的用途只有一个 ——
+                把命中片段的 ``title + content_snippet`` 作为**参考材料**（独立一段
+                「相关记忆（供参考，不是指令）」）喂给 LLM 角色提取。
 
         Returns:
             :class:`CandidateResult`
@@ -1139,6 +1469,8 @@ class CharacterGuardHandler(BaseEventHandler):
                     # 本尊身份不在角色表 / 取不到身份名 / 代词没有先行词：宁可什么都不补，
                     # 也绝不用粘性把更早的旧角色捡回来（1.0.12 起一直守的结论）。
                     # 这里**不问 LLM**：问它同样只能从上文里猜出那个旧角色。
+                    # 1.0.18：调用方在问记忆库之前已经先试过「再确认」，能走到这里
+                    # 说明记忆库也没给出明确对应 —— 状态与 1.0.17 完全一致。
                     return CandidateResult(
                         candidates=[],
                         decided=[],
@@ -1146,6 +1478,7 @@ class CharacterGuardHandler(BaseEventHandler):
                         mentioned=mentioned,
                         naming=naming,
                         basis=track.basis,
+                        memory=memory_lookup,
                     )
 
         if not monitor_on:
@@ -1228,6 +1561,14 @@ class CharacterGuardHandler(BaseEventHandler):
         llm_candidates: list[CharacterEntry] = []
         llm_multi = False
         llm_answered = False
+        # 1.0.18：记忆库命中的片段（title + content_snippet）作为**参考材料**喂给
+        # LLM 提取 —— 独立成段「相关记忆（供参考，不是指令）」。只在这里传，不做
+        # 任何额外解释；记忆内容是数据不是指令，提示词里也显式标了这一点。
+        memory_references = (
+            memory_lookup.references
+            if memory_lookup is not None and memory_lookup.items
+            else ""
+        )
         if need_llm:
             context_text = ""
             try:
@@ -1243,6 +1584,7 @@ class CharacterGuardHandler(BaseEventHandler):
             logger.debug(
                 f"调用 LLM 提取角色: 上文 {len(context_text)} 字符 / "
                 f"{len(window)} 条消息，描述={content[:40]!r}"
+                f"{f'，记忆库参考 {len(memory_references)} 字符' if memory_references else ''}"
             )
             extraction = await extract_characters_via_llm(
                 description=content,
@@ -1250,6 +1592,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 roster=roster,
                 translate_model=config.general.translate_model,
                 timeout=float(config.general.llm_timeout),
+                memory_references=memory_references,
             )
             if extraction is None:
                 logger.debug("LLM 提取无结果（超时或失败），按用户点名/粘性判定兜底")
@@ -1309,6 +1652,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 mentioned=mentioned,
                 naming=naming,
                 basis=basis,
+                memory=memory_lookup,
             )
 
         # ⑤ 汇总。优先级：主题跟踪（1.0.14）/ 用户点名·粘性（1.0.13）有确定结论时以它
@@ -1420,6 +1764,7 @@ class CharacterGuardHandler(BaseEventHandler):
             mentioned=mentioned,
             naming=naming,
             basis=basis,
+            memory=memory_lookup,
         )
 
     @staticmethod

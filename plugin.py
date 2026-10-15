@@ -11,6 +11,13 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
 事件时各重试一次）把同一句「最前面必须先写角色的标准标签」**直接追加进生图动作
 的参数说明**（``general.tag_first_hint``，纯内存改动）—— 主模型在工具定义里就能
 看到这条要求，比 system reminder 这种"旁白"有效得多。逻辑都在 :mod:`tag_hint`。
+
+1.0.18 起关联一个**外部记忆库**（Booku Memory，``[memory]`` 节，见 :mod:`memory`）：
+判定**不确定**时（主题跟踪的 ``split`` 拆单 / ``unavailable`` 本尊身份取不到 /
+``low_confidence`` 置信度不足 / ``empty`` 无信号）去检索相关信息做一次「再确认」，
+命中「触发词 → 角色表内角色」的明确对应就直接用作判定依据，并把这次确认写回
+记忆库（``memory.write_back``）。关闭（``memory.enabled = false``）时**完全不发
+任何请求**；不可用时静默降级 —— 判定链与 1.0.17 逐字一致。
 """
 
 from __future__ import annotations
@@ -87,7 +94,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.17"
+    plugin_version: str = "1.0.18"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

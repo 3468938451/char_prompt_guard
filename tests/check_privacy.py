@@ -47,9 +47,12 @@ SENSITIVE_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|pst-[A-Za-z0-9]{4,})"
     ),
     "IPv4": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    # 允许的外部链接：依赖来源 / 文档站，外加**本机回环地址** —— 1.0.18 起
+    # memory.base_url 的默认值是 http://localhost:8000/booku-memory（本机记忆库，
+    # 不含任何凭据、也不是私人网段），属于文档里就该写出来的默认配置。
     "RequestURL": re.compile(
         r"https?://(?!github\.com|qm\.qq\.com|docs\.mofox\.chat|gravatar\.com"
-        r"|fsf\.org|www\.gnu\.org)[^\s\"'\)\]，。]+"
+        r"|fsf\.org|www\.gnu\.org|localhost|127\.0\.0\.1)[^\s\"'\)\]，。]+"
     ),
     "AbsPath": re.compile(
         r"[A-Za-z]:\\[^\s\"'\)\]]+|/(?:home|Users|root|mnt|opt)/[^\s\"'\)\]]+"
@@ -74,8 +77,8 @@ TEXT_SUFFIXES = {
     ".patch",
 }
 
-#: 允许出现的外部链接（依赖来源、文档站等）
-ALLOWED_URL_HOSTS_HINT = "github.com / qm.qq.com / docs.mofox.chat"
+#: 允许出现的外部链接（依赖来源、文档站、本机回环地址）
+ALLOWED_URL_HOSTS_HINT = "github.com / qm.qq.com / docs.mofox.chat / localhost"
 
 _failures: list[str] = []
 

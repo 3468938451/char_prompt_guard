@@ -358,8 +358,67 @@ class CharPromptGuardConfig(BaseConfig):
             ),
         )
 
+    @config_section("memory")
+    class MemorySection(SectionBase):
+        """外部记忆库（Booku Memory）关联配置（1.0.18 起）。"""
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用记忆库关联：判定**不确定**时（主题跟踪的 split 拆单 / "
+                "unavailable 本尊身份取不到或代词无先行词 / low_confidence 置信度不足 / "
+                "empty 无信号但仍可能要问 LLM）去外部记忆库检索相关信息做一次「再确认」，"
+                "命中「触发词 → 角色表内角色」的明确对应就直接用作判定依据，"
+                "并把这次确认写回记忆库（见 write_back）。"
+                "关闭后**完全不发任何请求**（读取与写入都不发），判定行为与 1.0.17 完全一致"
+            ),
+        )
+        base_url: str = Field(
+            default="http://localhost:8000/booku-memory",
+            description=(
+                "记忆库地址（Booku Memory）。默认 http://localhost:8000/booku-memory；"
+                "若你的记忆库在别的机器或别的端口，把整段地址换成你自己的。"
+                "只接受 http/https，地址结尾多写一个斜杠也能容忍（等价于不写）。"
+                "地址不是合法 http/https 时插件**完全不访问记忆库**，只打一条 WARNING"
+            ),
+        )
+        timeout: float = Field(
+            default=2.0,
+            description=(
+                "单次请求（检索 / 写入）的超时秒数。超时就当「记忆库不可用」并跳过，"
+                "静默降级回 1.0.17 的判定链，绝不拦住生图"
+            ),
+        )
+        limit: int = Field(
+            default=5,
+            description=(
+                "每次检索最多取回几条记忆（1~20，超出按 20 处理）。"
+                "条数越多，喂给 LLM 的参考材料越长"
+            ),
+        )
+        write_back: bool = Field(
+            default=True,
+            description=(
+                "是否把这次「确认结果」写回记忆库（记住）——"
+                "仅当本次判定**确实依赖了记忆库**（检索命中并影响了结论）时才写，"
+                "不是每次生图都写。写入内容：标题「角色指向：<触发词> → <角色名>」、"
+                "正文一句话说明场景与标准标签、core_tags=[角色指向, 触发词, 角色名]。"
+                "每次写入都会打一条 INFO 日志（含返回的 id 或失败原因）；"
+                "写入失败只记日志，不影响生图"
+            ),
+        )
+        bucket: str = Field(
+            default="memory",
+            description="写入记忆时使用的 bucket（检索侧不受影响）",
+        )
+        memory_type: str = Field(
+            default="knowledge",
+            description="写入记忆时使用的记忆类型 memory_type",
+        )
+
     general: GeneralSection = Field(default_factory=GeneralSection)
     roster: RosterSection = Field(default_factory=RosterSection)
     targets: TargetsSection = Field(default_factory=TargetsSection)
     multi: MultiSection = Field(default_factory=MultiSection)
     monitor: MonitorSection = Field(default_factory=MonitorSection)
+    memory: MemorySection = Field(default_factory=MemorySection)

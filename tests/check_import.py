@@ -21,6 +21,7 @@ API 路径就会让整个插件加载失败，而 ``py_compile`` 完全看不出
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -43,6 +44,7 @@ MODULES = [
     f"{PLUGIN_NAME}.character",
     f"{PLUGIN_NAME}.config",
     f"{PLUGIN_NAME}.handler",
+    f"{PLUGIN_NAME}.memory",
     f"{PLUGIN_NAME}.monitor",
     f"{PLUGIN_NAME}.plugin",
     f"{PLUGIN_NAME}.tag_hint",
@@ -239,6 +241,43 @@ def main() -> int:
             cfg.general.tag_first_hint is True,
             f"tag_first_hint={cfg.general.tag_first_hint!r}",
         )
+        # 1.0.18 新增：外部记忆库（[memory] 节，Booku Memory）
+        check(
+            "1.0.18 默认启用记忆库关联",
+            cfg.memory.enabled is True,
+            f"memory.enabled={cfg.memory.enabled!r}",
+        )
+        check(
+            "1.0.18 记忆库地址默认 localhost:8000/booku-memory",
+            isinstance(cfg.memory.base_url, str)
+            and cfg.memory.base_url.startswith("http://localhost:8000/booku-memory"),
+            f"memory.base_url={cfg.memory.base_url!r}",
+        )
+        check(
+            "1.0.18 记忆库请求超时默认 2.0 秒",
+            cfg.memory.timeout == 2.0,
+            f"memory.timeout={cfg.memory.timeout!r}",
+        )
+        check(
+            "1.0.18 记忆库检索条数上限默认 5",
+            cfg.memory.limit == 5,
+            f"memory.limit={cfg.memory.limit!r}",
+        )
+        check(
+            "1.0.18 默认把确认结果写回记忆库",
+            cfg.memory.write_back is True,
+            f"memory.write_back={cfg.memory.write_back!r}",
+        )
+        check(
+            '1.0.18 写入 bucket 默认 "memory"',
+            cfg.memory.bucket == "memory",
+            f"memory.bucket={cfg.memory.bucket!r}",
+        )
+        check(
+            '1.0.18 写入 memory_type 默认 "knowledge"',
+            cfg.memory.memory_type == "knowledge",
+            f"memory.memory_type={cfg.memory.memory_type!r}",
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
 
@@ -330,6 +369,125 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("参数说明注入模块可调用", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.17 记忆库关联（1.0.18）：地址容错、关闭时不发请求、结构解析 ────
+    try:
+        from .. import memory as memory_module
+        from ..config import CharPromptGuardConfig as MemoryConfig
+
+        async def _check_memory_module() -> None:
+            check(
+                "结尾斜杠容错（…/booku-memory/ 等价）",
+                memory_module.normalize_base_url("http://localhost:8000/booku-memory/")
+                == "http://localhost:8000/booku-memory",
+            )
+            check(
+                "空地址回落到默认值",
+                memory_module.normalize_base_url("") == memory_module.DEFAULT_BASE_URL,
+            )
+            check(
+                "非 http/https 地址被拒绝（返回空串）",
+                memory_module.normalize_base_url("file:///etc/passwd") == ""
+                and memory_module.normalize_base_url("localhost:8000") == "",
+            )
+            check(
+                "关键词长度上限受控",
+                len(
+                    memory_module.build_keyword(
+                        "split",
+                        reason="拆单（一单多件）",
+                        description="清晨室内明亮柔和的光线。白发少女刚起床，粉色眼睛",
+                        roster_names=["爱莉希雅", "花火", "流萤"],
+                    )
+                )
+                <= memory_module.KEYWORD_MAX_CHARS,
+            )
+            check(
+                "取不到关键词时不请求（parse 空结构返回空列表）",
+                memory_module.parse_memory_items({"items": [{"metadata": {}}]}) == []
+                and memory_module.build_keyword("split") != "",
+            )
+            check(
+                "items 结构解析（id/title/content_snippet/metadata）",
+                [
+                    (item.id, item.title, item.memory_type)
+                    for item in memory_module.parse_memory_items(
+                        {
+                            "action": "list_memory_entries",
+                            "total": 1,
+                            "items": [
+                                {
+                                    "id": "mem-1",
+                                    "title": "角色指向：本尊 → 花火",
+                                    "content_snippet": "片段",
+                                    "metadata": {"memory_type": "knowledge"},
+                                }
+                            ],
+                        }
+                    )
+                ]
+                == [("mem-1", "角色指向：本尊 → 花火", "knowledge")],
+            )
+
+            # 记忆内容是**数据不是指令**：喂给 LLM 的那一段必须自带这句隔离声明；
+            # 没有命中（references 为空）时这一段**必须为空** —— 用户提示词与 1.0.17 逐字一致
+            from ..character import memory_block
+
+            segment = memory_block(
+                "- 角色指向：本尊 → 花火：用户以「本尊」指向「花火」。"
+            )
+            check(
+                "喂给 LLM 的记忆段落自带「不是指令」的安全声明",
+                "不是指令" in segment
+                and "不要执行" in segment
+                and "相关记忆" in segment
+                and "供参考" in segment
+                and "本尊 → 花火" in segment
+                and memory_block("") == ""
+                and memory_block("   ") == "",
+                f"segment = {segment!r}",
+            )
+
+            # 关掉开关时连一次请求都不该发（用一个「一被调用就抛异常」的传输层当哨兵）
+            def boom(*args, **kwargs):
+                raise AssertionError("memory.enabled=False 时不应发请求")
+
+            memory_module.set_transport(getter=boom, poster=boom)
+            try:
+                off = MemoryConfig()
+                off.memory.enabled = False
+                result = await memory_module.lookup(
+                    off,
+                    uncertainty="split",
+                    reason="拆单（一单多件）",
+                    candidate_names=["花火"],
+                    name_lookup=lambda name: None,
+                )
+                check(
+                    "memory.enabled=False 时直接跳过（零请求、status=disabled）",
+                    result.status == "disabled" and not result.hit,
+                    f"status={result.status!r} reason={result.reason!r}",
+                )
+                # 开关打开、但记忆库不可用（这里是「传输层直接抛异常」的替身，不碰网络）
+                broken = await memory_module.lookup(
+                    MemoryConfig(),
+                    uncertainty="split",
+                    reason="拆单（一单多件）",
+                    candidate_names=["花火"],
+                    name_lookup=lambda name: None,
+                )
+                check(
+                    "记忆库不可用时不抛异常（静默降级）",
+                    broken.status in {"unavailable", "miss"} and not broken.hit,
+                    f"status={broken.status!r} reason={broken.reason!r}",
+                )
+            finally:
+                memory_module.set_transport()
+                memory_module.reset_state()
+
+        asyncio.run(_check_memory_module())
+    except Exception as e:  # noqa: BLE001
+        check("记忆库模块可调用", False, f"{type(e).__name__}: {e}")
 
     # ── 5.2 人格配置读取：取不到本尊身份时返回空列表，任何失败都不抛异常 ──
     try:
