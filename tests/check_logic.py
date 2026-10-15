@@ -77,6 +77,26 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
 **不算证据、不报冲突**，内容与关掉记忆库时逐字一致；C67 对账查询超时 → 不崩、
 内容不变、日志里能看到 ``记忆库不可用``。
 
+1.0.20 起再补一条**独立**的检查（C68~C71），修的是同一次事故的**另一半**：用户
+这次点名的是**角色表之外**的角色（「刻律德拉」，不在角色表里），画面里却挂着
+角色表内的花火标签 ``hanabi (honkai: star rail)``（来自调用方过期的备忘规则）。
+实测日志里 1.0.19 的三份证据（判定集合 / 主题跟踪 / 记忆库）**全是空的** ——
+``记忆库对账查询…status=unavailable``、``判定依据=无(不补)`` —— 于是期望集合为空、
+一致性检查**直接跳过**，该报警却没报。1.0.20 因此不看期望集合，改看**用户最近
+说过什么**：扫描「触发消息 + 触发前最近 4 条用户消息」（只取用户消息，bot 复述不算），
+用引号模式（``「」 『』 《》 “” ""``）与句式模式（``披上X这层壳 / 扮演X / 画X / 要X /
+看看X / 换成X / 来张X``）提取**表外**角色名（过滤：长度 / 纯标点 / 常见词黑名单 /
+已在角色表内），若最终提示词里出现**用户这次没点过**的角色表内角色即为冲突：
+
+- C68（warn，默认）：内容**一字不变**，WARNING 里写清两侧名字与建议，且此时
+  1.0.19 的期望集合对账仍在日志里显示 ``一致性检查=跳过``（两条独立）；
+- C69（fix）：**删除**画面里的 ``hanabi \(honkai: star rail\)``（没有表外角色的标准
+  标签可替换，只能删），**外观描述原文一字不动**、不留 ``, ,`` / 行首标点等残渣；
+- C70（防误报）：用户自己也提过画面里的角色（「画花火吧…」）→ 即使另有表外点名，
+  也**不判冲突**；
+- C71（防误报）：用户消息里没有任何表外点名（只有「嗯」「行～」）→ 行为与 1.0.19
+  完全一致（既有对账怎么跳过的、这次还怎么跳过）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -2981,6 +3001,244 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C67 对账查询超时 → 不崩、内容不变、静默降级",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C68 用户点名了角色表外的角色 vs 画面里的表内角色：warn 只报不改（1.0.20）──
+    # 实测日志（1.0.20 要修的那次事故）：
+    #   22:59:43 用户：这身是「刻律德拉」？                      ← 点名的是**表外**角色
+    #   22:59:51 nai_artist tags：… hanabi (honkai: star rail), …, blue eyes,
+    #                              silver hair, blue dress, …, staff …
+    #   22:59:49 记忆库对账查询（画面点名=花火）: status=unavailable
+    #            主题跟踪: … ← 不可用；判定依据=无(不补)
+    #            提示词已包含角色，放行
+    #            一致性检查=跳过（没有可对账的期望集合…）        ← ★ 该报警却没报
+    # 1.0.19 的三份证据全空（判定集合空、主题跟踪不可用、记忆库不可用）→ 期望集合为空
+    # → 既有对账**照旧跳过**（这条用例会断言日志里仍有那一行）；1.0.20 的独立检查
+    # 不看期望集合，只看「用户最近说过什么」：表外点名「刻律德拉」+ 画面里是
+    # 用户**这次没点过**的「花火」→ warn 只打 WARNING，内容一字不改。
+    try:
+        cfg = make_config(roster=RS3, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        raw = (
+            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
+            "头上戴着蓝白饰冠，一身蓝裙，手里握着长杖"
+        )
+        history = [history_message("这身是「刻律德拉」？", 1.0)]
+        with (
+            FakeMemory(error=TimeoutError("timed out")) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c68",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        debugs = logs.debugs()
+        ok = (
+            c == raw  # warn 一字不改
+            and "一致性检查=冲突（warn 不改内容）" in warns
+            and "用户点名「刻律德拉」" in warns  # 用户点名那一侧
+            and "不在角色表中" in warns
+            and "刻律德拉" in warns
+            and ("花火" in warns and "hanabi" in warns)  # 画面那一侧（名字 + 标准标签）
+            and "建议：不要用备忘里的旧标签，只写画面描述" in warns
+            and warns.count("一致性检查=冲突") == 1  # 只有这条独立检查报了冲突
+            and "冲突已修正" not in logs.records_text()  # warn 不做任何修正
+            and "一致性检查=跳过" in debugs  # 1.0.19 的期望集合对账照旧跳过（两条独立）
+            and "表外点名" in debugs  # 新检查确实跑了
+            and len(mem.get) == 1  # 对账用的记忆库查询照发（这里超时）
+            and not mem.post  # 但它绝不写回
+        )
+        check(
+            "C68 表外点名 vs 画面内表内角色：warn 报冲突、内容一字不改",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n"
+            f"        GET = {mem.get!r}\n        日志 = {logs.records_text()!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C68 表外点名 vs 画面内表内角色：warn 报冲突、内容一字不改",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C69 同一场景 consistency_check=fix：**删除**画面里的表内角色标签（1.0.20）──
+    # 与 warn 的唯一区别是行为：表外角色没有标准标签可用（插件绝不编造游戏名 / 标签），
+    # 所以 fix 是**删除**而不是替换 —— 删掉 `Hanabi (Honkai: Star Rail)`（名字 / 别名 /
+    # 标准标签三种写法都认），并按需清掉作品名括号、行首空格与连续分隔符；
+    # **外观描述原文一字不动**（银白色长发的少女站在镜头前 / 蓝白饰冠 / 长杖 都要在）。
+    try:
+        cfg = make_config(roster=RS3, memory=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        raw = (
+            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
+            "头上戴着蓝白饰冠，一身蓝裙，手里握着长杖"
+        )
+        history = [history_message("这身是「刻律德拉」？", 1.0)]
+        with (
+            FakeMemory(error=TimeoutError("timed out")) as mem,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c69",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        records = logs.records_text()
+        ok = (
+            "hanabi" not in c.lower()  # 错误标签被删掉
+            and "Hanabi" not in c
+            and "花火" not in c
+            and "Honkai" not in c  # 连带作品名括号一起清掉，不留半截残渣
+            and "银白色长发的少女站在镜头前" in c  # 外观描述原文保留
+            and "蓝白饰冠" in c
+            and "长杖" in c
+            and c.startswith("银白色长发的少女站在镜头前")  # 行首不留空格/标点
+            and ", ," not in c
+            and ",," not in c
+            and "，，" not in c
+            and ",，" not in c
+            and not c.lstrip().startswith((",", "，"))
+            and not any(
+                line.lstrip().startswith((",", "，")) for line in c.splitlines()
+            )
+            and "一致性检查=冲突已修正（fix）：删除画面里的「花火」标签" in records
+            and "用户点名的是角色表外角色「刻律德拉」" in records
+            and "一致性检查=冲突（warn 不改内容）" not in warns  # fix 模式不该退回 warn
+            and "一致性检查=跳过" in logs.debugs()  # 既有对账仍是跳过（两条独立）
+            and len(mem.get) == 1
+            and not mem.post
+        )
+        check(
+            "C69 同场景 fix：删除画面里的花火标签、保留外观描述原文",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C69 同场景 fix：删除画面里的花火标签、保留外观描述原文",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C70（防误报）用户自己也提过画面里的角色 → 不判冲突（1.0.20）──────────
+    # 这条守的是 1.0.20 最容易踩的坑：只要看到"表外点名"就报警，把**用户自己说的**
+    # 正常画面判成冲突。用户这批消息里既有表外点名（「刻律德拉」），也点过画面里
+    # 那个角色（「画花火吧」）—— 冲突的第 3 个条件（用户这次没点过 Y）不成立，
+    # 必须**一个警告都不打**、内容一字不改，日志里能看到「表外点名检查=正常」。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        raw = (
+            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
+            "头上戴着蓝白饰冠"
+        )
+        history = [
+            history_message("说起来，「刻律德拉」那身也不错", 1.5),
+            history_message("画花火吧，顺便看看这身", 1.0),
+        ]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c70",
+                },
+            )
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        debugs = logs.debugs()
+        ok = (
+            c == raw  # 内容不变
+            and "冲突" not in warns  # 一条冲突告警都没有
+            and "表外点名检查=正常" in debugs  # 新检查跑了，且判成"不是冲突"
+            and "刻律德拉" in debugs  # 表外点名确实被抓到了（否则这条用例是空转）
+            and "用户点名「" not in warns
+        )
+        check(
+            "C70 用户自己也提过画面里的角色 → 不误报冲突",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C70 用户自己也提过画面里的角色 → 不误报冲突",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C71（防误报）没有任何表外点名 → 行为与 1.0.19 一致（1.0.20）────────
+    # 用户消息只有「嗯」「行～」这类普通回应：1.0.20 这条逻辑必须**完全不动**
+    # （跳过），既有对账该跳过还是跳过 —— 内容与 `consistency_check="off"`
+    # （完全不检查）时逐字一致。
+    try:
+        raw = (
+            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
+            "头上戴着蓝白饰冠"
+        )
+        history = [history_message("行～", 1.0)]
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("嗯"),
+            "stream_id": "s-c71",
+        }
+
+        def scenario_cfg(mode: str) -> CharPromptGuardConfig:
+            cfg = make_config(roster=RS3)
+            cfg.general.history_cache_ttl = 0.0
+            cfg.general.consistency_check = mode
+            return cfg
+
+        with FakeHistory(history):
+            gold = (await fire(scenario_cfg("off"), params))["args"]["content"]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(scenario_cfg("warn"), params)
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        debugs = logs.debugs()
+        ok = (
+            c == raw
+            and c == gold  # 与「完全不检查」逐字一致
+            and "冲突" not in warns  # 不因新增逻辑冒出告警
+            and "表外点名检查=跳过" in debugs  # 新检查明确跳过
+            and "一致性检查=跳过" in debugs  # 既有对账也照旧跳过（1.0.19 行为）
+        )
+        check(
+            "C71 没有表外点名 → 行为与 1.0.19 一致（内容不变、无新告警）",
+            ok,
+            f"content = {c!r}\n        gold = {gold!r}\n        WARNING = {warns!r}\n"
+            f"        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C71 没有表外点名 → 行为与 1.0.19 一致（内容不变、无新告警）",
             False,
             f"{type(e).__name__}: {e}",
         )

@@ -335,6 +335,20 @@ def main() -> int:
             and "爱莉希雅" in tag_hint.HINT_SUFFIX,
             f"HINT_SUFFIX = {tag_hint.HINT_SUFFIX!r}",
         )
+        # 1.0.20：追加句再补第三句 —— 用户点名的角色**不在角色表里**时，主模型没有
+        # 可用的标准标签，最容易做的事就是"拿备忘里的旧标签顶上"（实测事故就是
+        # hanabi 被挂在了一张外观完全不同的画面上）。这一句把正确做法写死：
+        # 不写任何标准标签，只写画面描述。前两句同样一字不动。
+        check(
+            "1.0.20 追加句要求「角色表之外的角色不写任何标准标签、只写画面描述」",
+            "角色表之外" in tag_hint.HINT_SUFFIX
+            and "不要写任何标准标签" in tag_hint.HINT_SUFFIX
+            and "只写画面描述" in tag_hint.HINT_SUFFIX
+            and "不要拿备忘" in tag_hint.HINT_SUFFIX
+            and tag_hint.HINT_SUFFIX.index("不要照搬")
+            < tag_hint.HINT_SUFFIX.index("角色表之外"),
+            f"HINT_SUFFIX = {tag_hint.HINT_SUFFIX!r}",
+        )
         check(
             "追加句与原说明用换行分隔（只追加、不覆盖）",
             tag_hint.HINT_SEPARATOR == "\n",
@@ -533,6 +547,66 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("人格配置读取函数可调用", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.20 表外点名（1.0.20）：提取函数与冲突检测入口都在、开关语义不变 ──
+    # 这一节只做"装得上、调得动"的冒烟 —— 完整的判定行为在 check_logic.py 的
+    # C68~C71；这里钉住三件事：① 提取规则对实测事故那句话给出「刻律德拉」，
+    # 且角色表内的名字不会被当成表外；② 「删除角色引用」在没有可删文本时
+    # 原样返回、处数为 0（调用方据此退回 warn）；③ 复用 1.0.19 的开关，
+    # 没有新增配置项。
+    try:
+        from .. import handler as guard_handler
+        from ..character import (
+            CharacterEntry,
+            delete_character_reference,
+            extract_outside_names,
+        )
+        from ..config import CharPromptGuardConfig as OutsideCfg
+
+        roster_one = [
+            CharacterEntry(
+                name="花火",
+                game="崩坏：星穹铁道 (Honkai: Star Rail)",
+                aliases=["hanabi"],
+                tag=r"hanabi \(honkai: star rail\)",
+            )
+        ]
+        quoted = extract_outside_names("这身是「刻律德拉」？", roster_one)
+        inside = extract_outside_names("这身是「花火」吧？", roster_one)
+        check(
+            "1.0.20 引号里的表外角色名能被提取出来（表内的不算）",
+            quoted == ["刻律德拉"] and inside == [],
+            f"表外={quoted!r} 表内={inside!r}",
+        )
+
+        hanabi = roster_one[0]
+        cleaned, hits = delete_character_reference(
+            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前", hanabi
+        )
+        no_hit, no_hits = delete_character_reference("银白色长发的少女站在镜头前", hanabi)
+        check(
+            "1.0.20 「删除角色引用」删掉标签与作品名括号、保留外观描述",
+            hits >= 1
+            and "hanabi" not in cleaned.lower()
+            and "花火" not in cleaned
+            and "Honkai" not in cleaned
+            and cleaned.startswith("银白色长发的少女站在镜头前")
+            and no_hits == 0
+            and no_hit == "银白色长发的少女站在镜头前",
+            f"cleaned={cleaned!r} hits={hits} / 无命中时={no_hit!r}",
+        )
+
+        check(
+            "1.0.20 冲突检测入口存在、开关仍复用 consistency_check（默认 warn）",
+            hasattr(guard_handler.CharacterGuardHandler, "_scan_user_naming")
+            and hasattr(
+                guard_handler.CharacterGuardHandler, "_apply_outside_naming_check"
+            )
+            and isinstance(guard_handler.UserNamingScope().names, list)
+            and OutsideCfg().general.consistency_check == "warn",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("表外点名模块可调用", False, f"{type(e).__name__}: {e}")
 
     print("-" * 72)
     if _failures:

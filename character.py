@@ -841,6 +841,376 @@ def replace_character_reference(
     return result, count
 
 
+# ── 「表外点名」的提取（1.0.20）──────────────────────────────────────
+#
+# 背景（一次真实事故）：用户这次点名的是**角色表之外**的角色（「刻律德拉」，
+# 不在角色表里），画面里却挂着**角色表内**的「花火」标签
+# （``hanabi (honkai: star rail)``，来自调用方过期的备忘规则）。1.0.19 的
+# 「期望集合对账」在「判定集合 / 主题跟踪 / 记忆库」三份证据都为空时会**跳过检查**
+# —— 而这种情况恰恰就是「用户明明点了名，只是那个名字不在角色表里」。
+# 所以 1.0.20 另加一条**独立**判断：从最近若干条**用户消息**里提取
+# 「用户点名的表外角色名」，再看最终提示词里有没有「用户这批消息里没点过的
+# 角色表内角色」。
+#
+# 本模块只做**提取与过滤**（纯文本、零依赖、可单独回归）；「算不算冲突」以及
+# warn / fix 的处理都在 ``handler``。提取天然会有误判 —— 所以这里的口径一律
+# 取**宁少勿多**：宁可漏掉一个表外点名（退回 1.0.19 的行为，无害），也不要把
+# 一句普通描述当成角色名（``fix`` 会因此删掉画面里正确的角色，有害）。
+
+#: 表外点名的最小 / 最大长度（对应需求里的「X 取 2~12 个非标点字符」）。
+OUTSIDE_NAME_MIN_LEN = 2
+OUTSIDE_NAME_MAX_LEN = 12
+
+#: 候选**允许**出现的字符：字母 / 数字 / 汉字 / 日文假名 / 韩文 / 中点。
+#: 要求**整体匹配**（见 :func:`_name_like`）：候选里只要出现别的字符（空格、标点、
+#: 括号、书名号里的作品名常见的「：」……）就不算"名字"，直接丢弃 ——
+#: 于是「《崩坏：星穹铁道》」这类**作品名**、「Hanabi (Honkai: Star Rail)」这类
+#: 完整标签都不会被当成表外角色名。
+_NAME_LIKE_PATTERN = re.compile(
+    r"[0-9A-Za-z\u00b7\u30fb\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+"
+)
+
+#: 候选里**不允许**出现的标点（同时也是句式模式里 X 的边界）。
+_PUNCT_CHARS = (
+    "，。！？；：、,.!?;:…～~·「」『』《》‘’“”\"'（）()[]【】{}<>—－-/|\\"
+)
+#: 句式模式里的「X」：2~12 个非标点、非空白字符。
+_NAME_CHAR_CLASS = "[^" + re.escape(_PUNCT_CHARS) + r"\s]"
+
+#: 引号模式：「…」 / 『…』 / 《…》 / “…” / "…" 里的内容。
+#: 引号是很强的「这是一个名字」信号（用户是**特意**把它括起来的），
+#: 所以它的过滤比句式模式松一些（见 :data:`_QUOTED_NAME_STOP_CHARS`）。
+_QUOTED_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"「([^「」]{1,40})」"),
+    re.compile(r"『([^『』]{1,40})』"),
+    re.compile(r"《([^《》]{1,40})》"),
+    re.compile(r"“([^“”]{1,40})”"),
+    re.compile(r"\"([^\"\n]{1,40})\""),
+)
+
+#: 句式模式（``X`` = :data:`_NAME_CHAR_CLASS` 的 2~12 次）。
+#:
+#: ``画`` / ``要`` 两处加了**负向后顾**，排掉把它们当构词字用的常见复合词：
+#: 「动画 / 漫画 / 壁画 / 图画 / 油画 / 名画 / 刻画 / 绘画 / 插画 / 版画 / 年画 /
+#: 笔画 / 沙画 / 贴画 / 诗画」里的「画」不是"画一张图"的动词；「重要 / 需要 /
+#: 主要 / 只要 / 不要 / 将要 / 快要 / 必要 / 概要 / 摘要 / 纪要 / 既要 / 又要 /
+#: 硬要 / 偏要」里的「要」也不是用户点名的动词。
+#: ``披上X这层壳`` 的壳前允许「这层 / 这具 / 这个 / 的」或直接接「壳」。
+_OUTSIDE_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"披上({_NAME_CHAR_CLASS}{{2,12}})(?:这层|这具|这个|的)?壳"),
+    re.compile(rf"扮演({_NAME_CHAR_CLASS}{{2,12}})"),
+    re.compile(
+        rf"(?<![计动漫壁图年油国名刻勾描绘作策规笔插版字诗贴沙瓷漆岩])"
+        rf"画({_NAME_CHAR_CLASS}{{2,12}})"
+    ),
+    re.compile(rf"(?<![重需主只不将快必概摘纪既又硬偏])要({_NAME_CHAR_CLASS}{{2,12}})"),
+    re.compile(rf"看看({_NAME_CHAR_CLASS}{{2,12}})"),
+    re.compile(rf"换成({_NAME_CHAR_CLASS}{{2,12}})"),
+    re.compile(rf"来张({_NAME_CHAR_CLASS}{{2,12}})"),
+)
+
+#: 「表外点名」的小黑名单：这些词指代词 / 泛指 / 画面元素本身，不是角色名。
+#:
+#: 命中方式：候选**与词完全相同**或**包含该词** —— 「这身」「你自己」「一张图」
+#: 这类抓出来的片段因此都会被丢掉。
+#: 需求里点名要求收录的：``你 / 我 / 他 / 她 / 这 / 那 / 壳 / 本尊 / 图 / 照片 / 样子``。
+OUTSIDE_NAME_BLACKLIST: tuple[str, ...] = (
+    # 人称代词 / 指示代词（含「本尊」这条最容易被抓出来的自我指代）
+    "你", "你们", "您", "我", "我们", "他", "他们", "她", "她们", "它",
+    "这", "那", "哪", "谁", "自己", "本人", "本尊", "真身", "本体", "本我",
+    # 「壳」这一族的说法（拆单场景里用户常说的就是"壳"）
+    "壳", "壳子", "外壳", "这层壳", "那层壳",
+    # 画面元素本身（不是角色名）
+    "图", "图片", "照片", "样子", "模样", "长相", "外观", "画面", "镜头", "镜头里",
+    "东西", "家伙", "人物", "角色", "那个谁", "什么", "怎么", "为什么",
+    # 时间 / 泛指
+    "今天", "现在", "刚才", "最后", "别的", "其它", "其他", "每个", "所有",
+)
+
+#: 引号候选的「不像名字」字符：虚词 / 语气词 / 代词 / 量词 / 常见动词。
+#: 候选里出现任何一个就丢弃（「银白色的长裙」「这身」「换个角色」因此不会误判）。
+#:
+#: 刻意**不含**「不 / 要 / 画 / 换 / 看 / 之 / 上 / 下 / 中 / 里」——
+#: 有的角色名里真的带这些字（「不知火舞」「一方通行」「上条当麻」「三月七」），
+#: 而引号本身已经是很强的"这是一个名字"信号（只要求候选整体由名字字符组成）。
+_QUOTED_NAME_STOP_CHARS = (
+    "的了着过吧吗呢啊呀哦嘛呗啦咯喔"
+    "我你您他她它这那哪谁什么"
+    "是没能会想来看去用把被和与跟"
+    "有又也都就还再很太更个张只些点们"
+)
+
+#: 句式候选的「不像名字」字符：在引号那套之上，再加上动词、连接词与
+#: 「壳 / 本尊 / 图 / 照片 / 样子」这些词的构字 —— 句式模式没有引号那种显式信号，
+#: 抓到的经常是整句描述（「画一张空荡的街道」「要你自己」「换成这个样子」），
+#: 所以这里必须更严。
+_SENTENCE_NAME_STOP_CHARS = _QUOTED_NAME_STOP_CHARS + (
+    "不要画换披扮演穿壳真本尊体身样子图片照上下中里个张只些"
+)
+
+#: 句式候选里的「画面词」黑名单（**词级**，命中即丢弃，仅用于句式模式）。
+#:
+#: 为什么需要它：``画X`` / ``要X`` / ``看看X`` 后面跟的经常是**画面要求**而不是角色名，
+#: 而「画星空」「画战斗场景」这类片段不含任何虚词，靠 :data:`_SENTENCE_NAME_STOP_CHARS`
+#: 拦不住。它们进了 warn 只是多一条噪音日志，但 ``fix`` 会据此删掉画面里正确的
+#: 角色标签 —— 所以这里按"美术需求常用词"再拦一道（宁少勿多）。
+OUTSIDE_NAME_SCENE_WORDS: tuple[str, ...] = (
+    "场景", "风景", "背景", "全景", "特写", "半身", "全身", "立绘", "头像",
+    "壁纸", "海报", "封面", "插画", "草稿", "线稿", "素描", "写实", "油画",
+    "水彩", "漫画", "动画", "表情包", "肖像", "合照", "合影", "自拍", "照片",
+    "画面", "镜头", "构图", "光影", "光线", "色调", "气氛", "姿势", "动作",
+    "表情", "服装", "衣服", "裙子", "长裙", "短裙", "星空", "夜空", "日落",
+    "日出", "海边", "天空", "云彩", "街道", "城市", "森林", "教室", "房间",
+    # 「要X / 看看X」后面常见的同框 / 镜头说法（实测抓到过「要同框」这种词）
+    "同框", "单人", "双人", "多人", "两人", "三人", "互动", "拥抱", "接吻",
+    "背影", "侧脸", "正面", "俯视", "仰视", "近景", "远景", "中景", "氛围",
+)
+
+
+def _name_like(candidate: str, stop_chars: str, roster: list[CharacterEntry]) -> bool:
+    """候选是否**像**一个角色名（1.0.20）。
+
+    依次检查（任一条不满足就丢弃）：
+
+    1. 长度在 :data:`OUTSIDE_NAME_MIN_LEN` ~ :data:`OUTSIDE_NAME_MAX_LEN`；
+    2. 整体由"名字字符"组成（:data:`_NAME_LIKE_PATTERN` 全匹配）——
+       空白、标点、括号、作品名里的「：」一律不要；
+    3. 不含 :data:`_QUOTED_NAME_STOP_CHARS` / :data:`_SENTENCE_NAME_STOP_CHARS`
+       里的任何字符（由 ``stop_chars`` 传入）；
+    4. 不命中 :data:`OUTSIDE_NAME_BLACKLIST`（完全相同或包含）；
+    5. **不在角色表里**（见 :func:`_in_roster`）—— 表内的名字 / 别名不算"表外"。
+    """
+    text = (candidate or "").strip()
+    if not (OUTSIDE_NAME_MIN_LEN <= len(text) <= OUTSIDE_NAME_MAX_LEN):
+        return False
+    if _NAME_LIKE_PATTERN.fullmatch(text) is None:
+        return False
+    if any(char in stop_chars for char in text):
+        return False
+    for word in OUTSIDE_NAME_BLACKLIST:
+        if word and (word == text or word in text):
+            return False
+    return not _in_roster(text, roster)
+
+
+def _in_roster(candidate: str, roster: list[CharacterEntry]) -> bool:
+    """候选是不是「角色表内」的名字（1.0.20）。
+
+    两种关系都算"表内"（都是**保守方向**：算了就不报冲突）：
+
+    - 完全相同（名字 / 别名 / 标准标签，走 :func:`find_roster_identity` 的同一性匹配）；
+    - 互为子串 —— 用户的说法常常带个语气词或只是简称：「画花火吧」抓出来的
+      「花火吧」含角色表里的「花火」，「爱莉」是「爱莉希雅」的简称；
+    - **作品名**（游戏名 / 标签里的作品部分）：用户说「我想看《崩坏三》」时抓到的是
+      作品名而不是角色名，不该算"表外点名"。
+    """
+    if not roster:
+        return False
+    if find_roster_identity(candidate, roster) is not None:
+        return True
+    target = normalize_prompt_text(candidate)
+    if not target:
+        return True
+    for entry in roster:
+        for raw in (entry.name, *entry.aliases, entry.tag, entry.game):
+            known = normalize_prompt_text(str(raw or ""))
+            if known and (known in target or target in known):
+                return True
+    return False
+
+
+def _scene_word_hit(candidate: str) -> bool:
+    """候选里是否含"美术需求"常用词（只用于句式模式，见 :data:`OUTSIDE_NAME_SCENE_WORDS`）。"""
+    return any(word in candidate for word in OUTSIDE_NAME_SCENE_WORDS)
+
+
+def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
+    """从一段**用户消息**里提取「用户点名的角色表外角色名」（1.0.20）。
+
+    规则（对应需求里的两条提取模式 + 三条过滤）：
+
+    1. **引号模式**：``「…」`` / ``『…』`` / ``《…》`` / ``“…”`` / ``"…"`` 里的内容
+       （过滤用 :data:`_QUOTED_NAME_STOP_CHARS`）；
+    2. **句式模式**：``披上X这层壳`` / ``扮演X`` / ``画X`` / ``要X`` / ``看看X`` /
+       ``换成X`` / ``来张X``（X = 2~12 个非标点字符；过滤用
+       :data:`_SENTENCE_NAME_STOP_CHARS` + :data:`OUTSIDE_NAME_SCENE_WORDS`）；
+    3. **过滤**：长度 / 纯标点 / 黑名单 / 角色表内的名字与别名（见 :func:`_name_like`）。
+
+    调用方（``handler``）负责只喂**用户消息**（bot 的复述不算），并沿用自我指代
+    扫描的焦点范围（触发消息 + 触发之前最近 N 条用户消息）。
+
+    Args:
+        text: 一条消息的正文（调用方应先用 :func:`message_text` 剥掉引用块）
+        roster: 角色表（用于剔除"表内"的名字与别名）；为空时全部视为表外
+
+    Returns:
+        表外名字列表（去重、保序；没有则空列表）
+
+    .. note::
+       这是**启发式**：宁可漏（漏了就当 1.0.20 这条不存在，行为退回 1.0.19），
+       也不要把普通词当成角色名（``fix`` 会据此删掉画面里正确的角色）。
+       已知残余风险与边界写在 ``docs/multi-character-design.md`` 的 1.0.20 一节。
+    """
+    if not text:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str, stop_chars: str, *, scene_filter: bool) -> None:
+        candidate = (raw or "").strip()
+        if scene_filter and _scene_word_hit(candidate):
+            return
+        if not _name_like(candidate, stop_chars, roster):
+            return
+        key = candidate.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(candidate)
+
+    for pattern in _QUOTED_NAME_PATTERNS:
+        for match in pattern.finditer(text):
+            add(match.group(1), _QUOTED_NAME_STOP_CHARS, scene_filter=False)
+    for pattern in _OUTSIDE_SENTENCE_PATTERNS:
+        for match in pattern.finditer(text):
+            add(match.group(1), _SENTENCE_NAME_STOP_CHARS, scene_filter=True)
+    return names
+
+
+def delete_character_reference(text: str, entry: CharacterEntry) -> tuple[str, int]:
+    """删除文本里对 ``entry`` 的引用（1.0.20 的 ``fix`` 用；**删除而不是替换**）。
+
+    为什么是删除：用户点名的是**角色表之外**的角色，插件手上**没有**它的标准标签
+    （也绝不编造），所以不能像 :func:`replace_character_reference` 那样换成另一个角色，
+    只能把画面里那个错误的角色引用删掉，**外观描述原文一字不动**。
+
+    删除范围**仅限角色表里已知的字符串**：``entry`` 的名字 / 全部别名 / 标准标签
+    （标准标签会同时尝试「转义写法」与「未转义写法」，例如
+    ``hanabi \\(honkai: star rail\\)`` 与 ``hanabi (honkai: star rail)``），
+    外加一个**收尾清理**：删掉因此变成空壳或只剩作品名的括号块
+    （``(Honkai: Star Rail)`` / ``（…）``）、连续分隔符（``,,`` / ``, ,``）、
+    行首行尾的孤立分隔符与多余空白（见 :func:`_tidy_prompt_after_removal`）。
+    不做任何猜测性改写，也不会动别的角色的文本。
+
+    Returns:
+        ``(新文本, 删除处数)``；一处都没删到时原样返回、处数为 0（调用方退回 warn）
+    """
+    if not text or entry is None:
+        return text, 0
+
+    result = text
+    count = 0
+    # ① 标准标签最具体，先删（转义 / 未转义 / 全角括号三种写法都试）
+    tag = entry.resolved_tag()
+    if tag:
+        unescaped = tag.replace("\\", "")
+        variants = (
+            tag,
+            unescaped,
+            unescaped.replace("(", "（").replace(")", "）"),
+        )
+        for variant in variants:
+            if not variant:
+                continue
+            result, hits = _replace_literal(result, variant, "")
+            count += hits
+    # ② 名字与别名（长的先删，避免短别名先下手把长名字切碎、留下残渣）
+    for keyword in sorted(entry.keywords(), key=len, reverse=True):
+        result, hits = _replace_literal(result, keyword, "")
+        count += hits
+    if count <= 0:
+        return text, 0
+    # ③ 只清「与这个角色的作品名一致」的括号残渣，绝不动别的括号
+    result, extra = _drop_work_name_groups(result, entry)
+    return _tidy_prompt_after_removal(result), count + extra
+
+
+#: 括号块（含 NAI 的转义写法 ``\\(…\\)``），用于清掉删除角色后剩下的作品名
+_GROUP_PATTERN = re.compile(r"\\?[（(]\s*([^（）()]{1,60}?)\s*\\?[）)]")
+
+#: 删除后要清理的分隔符：中英文逗号、顿号、分号
+_SEPARATOR_CHARS = ",，、;；"
+
+#: 删除后要清理的**空对**（``（）`` / ``“”`` / ``「」`` / 转义括号 …）
+_EMPTY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("(", ")"),
+    ("（", "）"),
+    ("\\(", "\\)"),
+    ("[", "]"),
+    ("【", "】"),
+    ("“", "”"),
+    ("「", "」"),
+    ("『", "』"),
+    ("《", "》"),
+    ('"', '"'),
+)
+
+
+def _work_name_variants(entry: CharacterEntry) -> set[str]:
+    """从角色的「游戏名 / 标准标签」里取出**作品名**的可比形式（1.0.20）。
+
+    例：游戏名 ``崩坏：星穹铁道 (Honkai: Star Rail)`` 与标签
+    ``hanabi \\(honkai: star rail\\)`` 都给出一份 ``honkai: star rail``
+    （走 :func:`normalize_prompt_text`，忽略大小写 / 反斜杠 / 下划线）。
+    """
+    variants: set[str] = set()
+    for raw in (entry.game, entry.tag):
+        for piece in re.findall(r"[（(]([^（）()]{1,60})[）)]", str(raw or "")):
+            normalized = normalize_prompt_text(piece)
+            if normalized:
+                variants.add(normalized)
+    return variants
+
+
+def _drop_work_name_groups(text: str, entry: CharacterEntry) -> tuple[str, int]:
+    """删掉文本里**与 ``entry`` 作品名一致**的括号块；其它括号一律不动。
+
+    典型场景：画面里写的是 ``Hanabi (Honkai: Star Rail)``，而角色表的标准标签带转义
+    （``hanabi \\(honkai: star rail\\)``）—— 只按关键词删掉 ``hanabi`` 会剩下
+    ``(Honkai: Star Rail)`` 这个半截残渣，这里把它一起清掉。
+    """
+    variants = _work_name_variants(entry)
+    if not variants:
+        return text, 0
+    removed = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal removed
+        if normalize_prompt_text(match.group(1)) in variants:
+            removed += 1
+            return " "
+        return match.group(0)
+
+    return _GROUP_PATTERN.sub(replace, text), removed
+
+
+def _tidy_prompt_after_removal(text: str) -> str:
+    """清理「删除角色引用」后留下的残渣（1.0.20）。
+
+    只做**不留痕**所必需的清理，绝不重写描述性文字：
+
+    - 空括号 / 空引号对（``（）`` / ``“”`` / ``,,`` 旁边的 ``\\(`` ``\\)`` …）；
+    - 连续分隔符只留第一个：``, ,`` / ``,,`` / ``，,`` → ``,``；
+    - 行首 / 行尾的孤立分隔符与空白（逐行）；
+    - 连续空格、行尾空格、连续空行。
+
+    外观描述原文一字不动 —— ``fix`` 只能删，不能编。
+    """
+    result = text or ""
+    for left, right in _EMPTY_PAIRS:
+        result = re.sub(re.escape(left) + r"[ \t]*" + re.escape(right), " ", result)
+    separators = re.escape(_SEPARATOR_CHARS)
+    result = re.sub(
+        rf"([{separators}])[ \t]*(?:[{separators}][ \t]*)+", r"\1", result
+    )
+    result = re.sub(rf"^[ \t{separators}]+", "", result, flags=re.MULTILINE)
+    result = re.sub(rf"[ \t{separators}]+$", "", result, flags=re.MULTILINE)
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"[ \t]+\n", "\n", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
 def _format_roster_for_prompt(roster: list[CharacterEntry]) -> str:
     """将角色表格式化为 LLM 提示词中的参考文本。"""
     lines: list[str] = []

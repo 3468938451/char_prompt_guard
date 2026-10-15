@@ -494,6 +494,8 @@ class MemoryClient:
             "memory_type": self.memory_type,
             "status": WRITE_STATUS,
             "core_tags": [CORE_TAG, trigger_word, character.label()],
+            "diffusion_tags": ["角色指向", "photo", "标签", "角色表"],
+            "opposing_tags": ["标签误用", "角色混淆", "张冠李戴"],
         }
         url = f"{self.base_url}/api/memories"
         try:

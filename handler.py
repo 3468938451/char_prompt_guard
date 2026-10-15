@@ -70,6 +70,38 @@
   角色的名字 / 别名 + 自我指代词**做关键词查一次（``limit`` 用配置值），结果
   **只**喂给上面那条对账，**不参与判定链、不替换描述点名的角色、不写回**；
   失败 / 超时 / 结构不符照旧静默降级。
+
+**1.0.20 的第三条判断（又一次真实事故，同样不新增配置项）**：用户这次点名的是
+**角色表之外**的角色（「刻律德拉」，不在角色表里），画面里却挂着**角色表内**的
+花火标签 ``hanabi (honkai: star rail)``（来自调用方过期的备忘规则）。实测日志里
+1.0.19 的三份证据**全都是空的** —— 记忆库 ``status=unavailable``、主题跟踪
+``判定依据=无(不补)`` —— 于是期望集合为空、一致性检查**直接跳过**：
+
+    记忆库对账查询（画面点名=花火）: status=unavailable
+    提示词已包含角色，放行
+    一致性检查=跳过（没有可对账的期望集合…）      ← ★ 该报警却没报
+
+1.0.20 因此另加一条**独立**判断（复用 ``general.consistency_check`` 的
+off/warn/fix，与期望集合那套互不影响）：
+
+- **提取「用户点名的表外角色名」**（:meth:`CharacterGuardHandler._scan_user_naming`
+  + :func:`character.extract_outside_names`）：焦点范围沿用自我指代扫描的做法
+  （**触发消息 + 触发之前最近 N 条用户消息**，N = ``min(multi.recent_messages, 4)``），
+  但**只取用户消息**、bot 的复述不算，也**不扫画面描述**（那是被检查的一侧）；
+  引号模式（``「」 『』 《》 “” ""``）与句式模式（``披上X这层壳 / 扮演X / 画X /
+  要X / 看看X / 换成X / 来张X``）各抓一遍，再按长度 / 纯标点 / 常见词黑名单 /
+  「已经在角色表里」三条过滤 —— 细节见 ``character`` 模块的「表外点名」一节；
+- **判断冲突**（:meth:`CharacterGuardHandler._apply_outside_naming_check`）：
+  存在表外点名 ``X`` + 最终提示词里出现了角色表内角色 ``Y`` + **这批用户消息里
+  没提过 ``Y``** → 冲突。``warn`` 只打 WARNING（格式里写清两侧名字与建议）、
+  **内容一字不改**；``fix`` **删除**画面里 ``Y`` 的名字 / 别名 / 标准标签
+  （我们没有表外角色的标准标签可替换，只能删）并清理删除后的
+  ``,,`` / ``, ,`` / 行首孤立标点等残渣，**外观描述原文一字不动**，打 INFO；
+  删不出可识别文本、或删完提示词就空了 → 退回 warn 行为；``off`` 完全不检查
+  （连用户消息都不扫）。
+- 与既有对账**两条独立、可以各自触发**：本条跑在 :meth:`CharacterGuardHandler._finalize`
+  里、:meth:`CharacterGuardHandler._apply_consistency_check` **之后**，因此既有对账
+  若已修正过内容，本条按**修正后**的文本再判一次；两条都命中时日志各有一条。
 """
 
 from __future__ import annotations
@@ -99,8 +131,10 @@ from .character import (
     NamingDecision,
     character_in_texts,
     content_contains_tag,
+    delete_character_reference,
     entry_key,
     extract_characters_via_llm,
+    extract_outside_names,
     find_characters_in_history,
     find_roster_identity,
     find_self_reference_word,
@@ -197,6 +231,19 @@ _COMPONENT_NAME_PREFIX = "tool-"
 #: 上限取 4 而不是无限往回翻：再往前容易把别的话题里的「本尊」翻出来，
 #: 反而压制掉正常的角色点名（``multi.recent_messages`` 默认 6，故默认回看 4 条）。
 _SELF_REFERENCE_SCAN_LIMIT = 4
+
+#: 「表外点名」扫描的焦点范围（1.0.20）：与自我指代扫描同一套做法 ——
+#: 触发消息 + 触发之前最近 ``min(multi.recent_messages, 这个值)`` 条**用户**消息。
+#:
+#: 为什么沿用同一个上限：它守的是同一件事 —— 「用户这几句话里到底在说谁」。
+#: 再往前翻容易把别的话题里的名字翻出来，反而制造误报；而这条判断的误报代价不低
+#: （``fix`` 会删掉画面里正确的角色标签），所以宁少勿多。
+_OUTSIDE_NAMING_SCAN_LIMIT = _SELF_REFERENCE_SCAN_LIMIT
+
+#: ``fix`` 删除后至少要剩下多少个"非分隔符字符"，否则退回 warn（1.0.20）。
+#: 提示词被删空、或只剩几个标点时，删掉的东西才是画面主体 —— 那就不是"清理错误
+#: 标签"而是"清空画面"了，这种修改一律不做（只报警）。
+_MIN_FIX_CONTENT_CHARS = 4
 
 
 @dataclass(frozen=True)
@@ -1040,6 +1087,47 @@ def build_expectation_set(
     return ExpectationSet(entries=entries, reasons=reasons)
 
 
+# ── 「用户点名了角色表外角色」的冲突检测（1.0.20）──────────────────────
+#
+# 与上面那套「期望集合对账」**完全独立**：期望集合对账在「判定 / 主题跟踪 /
+# 记忆库」三份证据都为空时直接跳过，而实测事故恰恰就是这种情况 —— 用户点名的
+# 角色**不在角色表里**（「刻律德拉」），所以三份证据全空，画面里挂着的却是
+# 角色表内的「花火」标签。这条判断不看那三份证据，只看：
+#   ① 用户最近说过的话里有没有「角色表外」的名字（X）；
+#   ② 最终提示词里有没有角色表内角色（Y）；
+#   ③ 用户这批消息里**没有**提过 Y（用户这次没点它）。
+# 三者同时成立才算冲突。
+
+
+@dataclass(frozen=True)
+class UserNamingScope:
+    """一次「用户点名扫描」的结果（1.0.20）。
+
+    Attributes:
+        texts: 参与扫描的用户消息正文（**触发消息在前**，其后由新到旧）；
+            冲突判断里的「用户这次提过 Y 吗」查的就是这一份
+        scanned: 触发之前实际回看的用户消息条数（触发消息不算在内）
+        names: 从这些消息里提取出的**表外**名字（已过滤：长度 / 纯标点 /
+            常见词黑名单 / 角色表内的名字与别名），去重、保序
+    """
+
+    texts: list[str] = field(default_factory=list)
+    scanned: int = 0
+    names: list[str] = field(default_factory=list)
+
+    def names_text(self) -> str:
+        """表外名字的可读列表（进日志）：``刻律德拉、卡芙卡``。"""
+        return "、".join(self.names) if self.names else "无"
+
+    def label(self) -> str:
+        """一行式诊断文案（DEBUG 日志用）。"""
+        return (
+            f"表外点名={self.names_text()} "
+            f"（焦点范围=触发消息+触发前最近 {self.scanned} 条用户消息，"
+            f"共 {len(self.texts)} 条用户消息）"
+        )
+
+
 class CharacterGuardHandler(BaseEventHandler):
     """生图前角色提示词检测与补全处理器。"""
 
@@ -1136,6 +1224,14 @@ class CharacterGuardHandler(BaseEventHandler):
             if config.roster.enabled
             else []
         )
+        # 1.0.20：「用户点名了角色表外角色」这条判断要看**用户最近说过什么**，
+        # 所以先把焦点范围内的用户消息扫一遍（触发消息 + 触发前最近 N 条用户消息，
+        # 只取用户消息）。consistency_check="off" 时**一次都不扫**（连上文都不读），
+        # 与「off=完全不检查」的语义一致。结果只用于 _finalize 里那条冲突检测，
+        # 不参与判定链 —— 扫描本身失败也只记 DEBUG、返回空结果。
+        user_naming = await self._scan_user_naming(
+            params=params, config=config, roster=roster
+        )
         texts = self._detection_texts(content, spec, args)
         present_keys = {
             entry_key(entry) for entry in roster if character_in_texts(entry, texts)
@@ -1226,6 +1322,7 @@ class CharacterGuardHandler(BaseEventHandler):
                     basis=result.basis,
                     track=result.track,
                     memory=reconcile_lookup,
+                    naming_scope=user_naming,
                 )
             target_characters = candidates[:1]
         else:
@@ -1253,6 +1350,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 basis=result.basis,
                 track=result.track,
                 memory=reconcile_lookup,
+                naming_scope=user_naming,
             )
 
         new_content = self._apply(
@@ -1276,6 +1374,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 basis=result.basis,
                 track=result.track,
                 memory=reconcile_lookup,
+                naming_scope=user_naming,
             )
 
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
@@ -1298,6 +1397,7 @@ class CharacterGuardHandler(BaseEventHandler):
             basis=result.basis,
             track=result.track,
             memory=reconcile_lookup,
+            naming_scope=user_naming,
         )
 
     # ── 记忆库再确认（1.0.18）─────────────────────────────────────
@@ -2231,6 +2331,185 @@ class CharacterGuardHandler(BaseEventHandler):
                 bot_ids.add(bot_id)
         return bot_ids
 
+    # ── 「用户点名了角色表外角色」的扫描与检测（1.0.20）──────────────
+
+    async def _scan_user_naming(
+        self,
+        *,
+        params: dict[str, Any],
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+    ) -> UserNamingScope:
+        """扫描「最近若干条用户消息」里用户点名的**表外**角色名（1.0.20）。
+
+        焦点范围沿用 1.0.12 起自我指代扫描（:meth:`_detect_self_reference`）的做法：
+        **触发消息** + **触发之前最近 N 条用户消息**（N = ``min(multi.recent_messages,
+        _OUTSIDE_NAMING_SCAN_LIMIT)``，默认 ``min(6, 4) = 4``；bot 自己的消息跳过、
+        不占名额）。区别只有两点：
+
+        - **只取用户消息**，且**不扫画面描述** —— 画面描述是"画面那一侧"，
+          正是这条判断要检查的对象，不能拿它给自己作证；
+        - 取正文一律走 :func:`character.message_text` / :func:`strip_quoted_blocks`，
+          引用块（``[回复…]``）与媒体块里的文字**不算**用户自己的点名。
+
+        提取规则（引号 / 句式）与过滤（长度 / 纯标点 / 常见词黑名单 / 角色表内）
+        全部在 :func:`character.extract_outside_names`，本方法只负责"扫哪些消息"。
+
+        ``consistency_check = "off"``、角色表为空时**直接返回空结果**（连上文都不读）；
+        任何异常同样只记 DEBUG 并返回空结果 —— 这条判断是「多一条检查」，
+        绝不允许影响判定链或拦住生图。
+
+        .. note::
+           本方法自己读一次上文（``_collect_context``）。这是一次**独立**的读取，
+           但它走的是同一份进程内缓存（``general.history_cache_ttl``，默认 5 秒）：
+           缓存热时只是列表拷贝，缓存冷时它顺手把缓存填上，后面的
+           ``_memory_lookup`` / ``_collect_candidates`` 直接命中 —— 也就是说
+           **同一次生图事件最多只多一次库读**，且只在 ``history_cache_ttl = 0``
+           （用户显式关掉缓存）时才会真的多读一次。
+        """
+        mode = (
+            str(getattr(config.general, "consistency_check", "") or "").strip().lower()
+        )
+        if mode == "off" or not roster:
+            return UserNamingScope()
+        try:
+            messages = await self._collect_context(params, config)
+            trigger_text = self._trigger_text(params)
+            # _collect_context 只在 trigger_text 非空时才把触发消息追加在末尾
+            history = messages[:-1] if trigger_text else messages
+            bot_ids = await self._resolve_bot_sender_ids(messages)
+
+            texts: list[str] = []
+            if trigger_text:
+                texts.append(strip_quoted_blocks(trigger_text))
+            scan_limit = max(
+                1,
+                min(int(config.multi.recent_messages), _OUTSIDE_NAMING_SCAN_LIMIT),
+            )
+            scanned = 0
+            for message in order_messages_newest_first(history):
+                if scanned >= scan_limit:
+                    break
+                if is_known_bot_message(message, bot_ids):
+                    continue
+                scanned += 1
+                texts.append(message_text(message))
+
+            names: list[str] = []
+            for text in texts:
+                for name in extract_outside_names(text, roster):
+                    if name not in names:
+                        names.append(name)
+            scope = UserNamingScope(texts=texts, scanned=scanned, names=names)
+            if names:
+                logger.debug(f"表外点名扫描: {scope.label()}")
+            return scope
+        except Exception as e:  # noqa: BLE001 —— 多一条检查，失败即静默退回
+            logger.debug(
+                f"表外点名扫描失败，本次跳过（{type(e).__name__}: {e}）"
+            )
+            return UserNamingScope()
+
+    def _apply_outside_naming_check(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        roster: list[CharacterEntry],
+        config: CharPromptGuardConfig,
+        naming_scope: UserNamingScope | None = None,
+    ) -> str:
+        """「用户点名了角色表外角色」的冲突检测（1.0.20）。
+
+        与 :meth:`_apply_consistency_check`（期望集合对账）**完全独立、可各自触发**：
+
+        - 期望集合对账问的是「画面里的角色是不是**这次该画的那个**」（依据 = 判定集合 /
+          主题跟踪 / 记忆库）；
+        - 本条问的是「画面里怎么挂着**用户这次没点过**的角色表内角色，而用户明明
+          点了一个**不在角色表里**的角色」（依据 = 用户最近几条消息本身）。
+
+        实测事故里前者三份证据全空 → 直接跳过；后者恰恰能看到问题，所以必须独立成条。
+
+        判断（三者同时成立才算冲突）：
+
+        1. 焦点范围内的用户消息里存在**表外点名** ``X``（:meth:`_scan_user_naming`）；
+        2. **最终提示词**里出现了角色表内角色 ``Y``；
+        3. 这批用户消息里**没有提过** ``Y``（用户这次没点它）。
+
+        任一不成立 → 不判冲突，只记 DEBUG（保持 1.0.19 行为：用户点过画面的角色、
+        或压根没有表外点名时，一个字都不动）。
+
+        Args:
+            content: **已经是最终文本**（既有对账若修正过，这里是修正后的内容 ——
+                本方法在 :meth:`_finalize` 里跑在 :meth:`_apply_consistency_check` 之后）
+        """
+        mode = (
+            str(getattr(config.general, "consistency_check", "") or "").strip().lower()
+        )
+        if mode == "off" or not roster:
+            return content
+        if mode not in {"warn", "fix"}:
+            # 非法取值在上面那条检查里已经记过 WARNING，这里静默按 warn 处理
+            mode = "warn"
+        if naming_scope is None or not naming_scope.names:
+            logger.debug("表外点名检查=跳过（用户最近的几条消息里没有角色表外的点名）")
+            return content
+
+        texts = self._detection_texts(content, spec, args)
+        present = [entry for entry in roster if character_in_texts(entry, texts)]
+        # 冲突 = 画面里有、但用户这批消息里**没点过**的角色表内角色
+        conflicts = [
+            entry
+            for entry in present
+            if not character_in_texts(entry, naming_scope.texts)
+        ]
+        if not conflicts:
+            logger.debug(
+                "表外点名检查=正常（画面里的角色表内角色都在用户最近说过的话里"
+                f"出现过：{_entry_names(present) or '无'}；表外点名="
+                f"{naming_scope.names_text()}）"
+            )
+            return content
+
+        outside = naming_scope.names_text()
+        detail = (
+            f"用户点名「{outside}」（不在角色表中），"
+            f"但画面标签={'、'.join(_entry_label(entry) for entry in conflicts)}"
+        )
+        suggestion = "；建议：不要用备忘里的旧标签，只写画面描述"
+
+        if mode != "fix":
+            # warn（默认）：只报不改 —— 内容必须一字不变
+            logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suggestion}")
+            return content
+
+        # fix：**删除**画面里那个角色的可识别文本。
+        # 为什么是删除而不是替换：用户点名的是角色表**外**的角色，插件没有它的
+        # 标准标签（也绝不编造游戏名/标签），拿别的角色顶上只会错得更彻底。
+        cleaned = content
+        removed = 0
+        for entry in conflicts:
+            cleaned, hits = delete_character_reference(cleaned, entry)
+            removed += hits
+        remaining = sum(
+            1 for char in cleaned if not char.isspace() and char not in ",，、;；"
+        )
+        if removed <= 0 or remaining < _MIN_FIX_CONTENT_CHARS:
+            # 删不出可识别文本（角色表里的字面写法都没出现），或删完提示词就空了 ——
+            # 那说明这段提示词的主体就是那个标签，删掉等于清空画面，一律不做
+            logger.warning(
+                f"一致性检查=冲突但无法安全删除（删除处数={removed}，剩余有效字符={remaining}），"
+                f"退回 warn 行为、不改内容：{detail}{suggestion}"
+            )
+            return content
+
+        logger.info(
+            f"一致性检查=冲突已修正（fix）：删除画面里的「{_entry_names(conflicts)}」标签"
+            f"（用户点名的是角色表外角色「{outside}」）"
+        )
+        return cleaned
+
     # ── 收尾：二次一致性检测 → 按需写回 ────────────────────────────
 
     def _finalize(
@@ -2247,12 +2526,24 @@ class CharacterGuardHandler(BaseEventHandler):
         basis: str,
         track: SubjectTrack | None = None,
         memory: memory_api.MemoryLookup | None = None,
+        naming_scope: UserNamingScope | None = None,
     ) -> tuple[EventDecision, dict[str, Any]]:
         """统一的收尾：跑二次一致性检测，内容有变化才回写 args。
 
         ``track``（本次主题跟踪的完整结果）与 ``memory``（1.0.19 描述点名时的
         **对账用**记忆库查询结果）都只是给一致性检测提供「期望集合」的证据，
         不参与其它任何判断。
+
+        **两条检查互相独立、按顺序各跑一次**（1.0.20）：
+
+        1. :meth:`_apply_consistency_check`：与「期望集合」（判定集合 + 主题跟踪主题
+           + 记忆库确认结果）对账；
+        2. :meth:`_apply_outside_naming_check`：与「用户最近几条**用户消息**」对账
+           （``naming_scope``）—— 用户点名了**角色表外**的角色、画面里却是用户
+           这次没点过的角色表内角色时报警 / 删除。
+
+        第 2 条跑在第 1 条**之后**：第 1 条若已修正过内容，第 2 条按**修正后**的文本
+        再判一次；两条都命中时日志各留一条，互不覆盖。
         """
         checked = self._apply_consistency_check(
             content=final_content,
@@ -2264,6 +2555,14 @@ class CharacterGuardHandler(BaseEventHandler):
             basis=basis,
             track=track,
             memory=memory,
+        )
+        checked = self._apply_outside_naming_check(
+            content=checked,
+            spec=spec,
+            args=args,
+            roster=roster,
+            config=config,
+            naming_scope=naming_scope,
         )
         if checked != original:
             args[spec.prompt_arg] = checked
@@ -2300,6 +2599,12 @@ class CharacterGuardHandler(BaseEventHandler):
         「画面 = 判定」永远自洽，一次告警都没有。期望集合任意一份证据成立即可报冲突；
         **期望集合为空**（谁都没结论）时仍然跳过 —— 那种情况下提示词里的角色是描述
         自己写的，没有依据可对账，报警只会是噪音。
+
+        .. note::
+           1.0.20 起另有一条**独立**的检查 :meth:`_apply_outside_naming_check`
+           （「用户点名了角色表外角色 vs 画面里的表内角色」），它不看期望集合，
+           因此本方法「跳过」时它照样会跑 —— 实测事故正是「期望集合为空」那种情况。
+           两条可以各自触发，日志各留一条。
         """
         mode = str(config.general.consistency_check or "").strip().lower()
         if mode == "off" or not roster:
