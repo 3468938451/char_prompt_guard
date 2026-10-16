@@ -336,29 +336,45 @@ async def _call(func: Callable[..., Any], *args: Any) -> Any:
 
 # ── 失败退避（模块级状态，避免"记忆库挂掉时每次生图都白等"） ──────────
 
-#: ``base_url`` → 最近一次「没拿到结果」的时间戳
-_LAST_ATTEMPT: dict[str, float] = {}
+#: ``(base_url, 用途)`` → 最近一次「没拿到结果」的时间戳
+#:
+#: 1.0.25 起**按用途分键**：早先只按 ``base_url`` 共享时，一次「不确定再确认」超时
+#: 会让同一分钟内的「描述点名对账」也一起被跳过 —— 而那条对账是唯一能发现
+#: "画面标签与描述不一致"的通道，等于静默关掉了它。
+_LAST_ATTEMPT: dict[tuple[str, str], float] = {}
+
+#: ``(base_url, 用途)`` → 上次「没拿到结果」的类型（``error`` / ``empty``）。
+#: 必须是模块级状态：client 是每次用完就丢的，写在实例上会让退避判断永远读到空串，
+#: 于是 ``EMPTY_COOLDOWN_SECONDS``（15s）这一档从来没生效过。
+_LAST_KIND: dict[tuple[str, str], str] = {}
 
 
 def reset_state() -> None:
     """清空「失败退避」状态（只给用例用）。"""
     _LAST_ATTEMPT.clear()
+    _LAST_KIND.clear()
+
+
+def _cooldown_key(base_url: str, uncertainty: str = "") -> tuple[str, str]:
+    """退避键 = ``(base_url, 用途)``（用途为空串时退化为"通用"一档）。"""
+    return (str(base_url or ""), str(uncertainty or ""))
 
 
 def _cooldown_remaining(
-    base_url: str, cooldown: float, now: float | None = None
+    key: tuple[str, str], cooldown: float, now: float | None = None
 ) -> float:
     """距离上次失败是否还在退避窗口内；返回剩余秒数（0 表示可以请求）。"""
-    stamp = _LAST_ATTEMPT.get(base_url)
+    stamp = _LAST_ATTEMPT.get(key)
     if stamp is None:
         return 0.0
     remaining = cooldown - ((now if now is not None else time.time()) - stamp)
     return max(0.0, remaining)
 
 
-def _mark_attempt(base_url: str) -> None:
-    """记一次「没拿到结果」的时间（退避窗口起点）。"""
-    _LAST_ATTEMPT[base_url] = time.time()
+def _mark_attempt(key: tuple[str, str], kind: str = "error") -> None:
+    """记一次「没拿到结果」的时间与类型（退避窗口起点）。"""
+    _LAST_ATTEMPT[key] = time.time()
+    _LAST_KIND[key] = str(kind or "error")
 
 
 # ── 配置读取（任何字段都容错） ────────────────────────────────────────
@@ -448,16 +464,16 @@ class MemoryClient:
             payload = await _call(_http_get_json, url, float(self.timeout))
         except Exception as e:  # noqa: BLE001 —— 连接失败/超时/非 200/JSON 坏都走这里
             logger.debug(f"记忆库不可用，跳过（{_failure_reason(e)}）")
+            # 退避由 lookup() 按 (base_url, 用途) 记录；这里只留下"失败类型"信号
             self.last_failure_kind = "error"
-            _mark_attempt(self.base_url)
             return []
         items = parse_memory_items(payload)
         if not items:
             # 服务可能是好的，只是这次没命中：退避窗口比「连不上」短得多，
             # 别因为一句没查到就把记忆库锁死一分钟（用户的下一句很可能就查得到）
             logger.debug(f"记忆库检索无结果（关键词={keyword!r}）")
+            # 同上：不在 client 侧记退避（client 用完即丢，记了也读不到）
             self.last_failure_kind = "empty"
-            _mark_attempt(self.base_url)
         else:
             self.last_failure_kind = ""
             logger.debug(
@@ -965,22 +981,28 @@ async def lookup(
     if not keyword:
         return MemoryLookup(status="skipped", reason="没有可用的关键词，不请求记忆库")
 
+    cooldown_key = _cooldown_key(client.base_url, uncertainty)
     remaining = _cooldown_remaining(
-        client.base_url,
+        cooldown_key,
         (
             EMPTY_COOLDOWN_SECONDS
-            if client.last_failure_kind == "empty"
+            if _LAST_KIND.get(cooldown_key) == "empty"
             else FAILURE_COOLDOWN_SECONDS
         ),
     )
     if remaining > 0:
-        logger.debug(f"记忆库不可用，跳过（仍在退避窗口内，剩余 {remaining:.0f}s）")
+        kind_label = "空结果" if _LAST_KIND.get(cooldown_key) == "empty" else "失败"
+        logger.debug(
+            f"记忆库不可用，跳过（仍在退避窗口内，上次={kind_label}，剩余 {remaining:.0f}s）"
+        )
         return MemoryLookup(
-            status="unavailable", reason="退避窗口内（上次请求未取到记忆）"
+            status="unavailable", reason=f"退避窗口内（上次={kind_label}）"
         )
 
     items = await client.search(keyword)
     if not items:
+        # 服务可能是好的、只是这次没查到：按 15s 短退避记，且只影响**同一用途**
+        _mark_attempt(cooldown_key, str(client.last_failure_kind or "empty"))
         return MemoryLookup(
             status="unavailable", reason=f"未取到记忆（关键词={keyword!r}）"
         )
