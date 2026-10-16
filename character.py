@@ -336,6 +336,15 @@ BASIS_USER_NAMED = "用户点名"
 BASIS_LATEST_MENTION = "最近提及"
 BASIS_NONE = "无"
 
+#: **1.0.30**：判定依据文案 —— 「用户**最新一条消息**里点名的角色表内角色」
+#: （:meth:`handler.CharacterGuardHandler._latest_named_entry`）。
+#:
+#: 为什么单开一个常量而不是复用 :data:`BASIS_USER_NAMED`：这条信号的**范围**与
+#: 既有用户点名不同（只看触发消息 / 触发前最近 1 条用户消息，且有置信度闸门），
+#: 日志里必须能一眼区分出「依据到底是哪一条」—— 用户核对"为什么这次按爱莉希雅画"
+#: 时看的就是 ``用户点名(最新消息):爱莉希雅`` 这一行。
+BASIS_LATEST_NAMED = "用户点名(最新消息)"
+
 #: 消息被明确标成 bot/助手时的角色取值（框架自带的 history 字典里**没有**
 #: ``is_bot`` / ``role`` 字段，只有 ``sender_id`` / ``sender_name``；真实的
 #: bot 判定要靠 ``adapter_api.get_bot_info_by_platform`` 拿 bot_id 比对，

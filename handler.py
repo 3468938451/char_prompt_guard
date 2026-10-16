@@ -222,7 +222,9 @@ off/warn/fix，与期望集合那套互不影响）：
   → **④ 穿着模型解析**（同样 ``auto_resolve``，针对"看起来是穿着"的候选，
   穿着专用提示词）→ **⑤ ``infer_unnamed``**（默认关）。③ 与 ④ 互斥、
   ⑤ 与"已识别到穿着 / 皮肤"互斥；
-- **穿着类型表**：候选**包含**表中某个词即命中（``学生装`` / ``居家服`` / ``泳衣``），
+- **穿着类型表**：候选**本身是**表中某个词、或**以它结尾**才算命中
+  （``学生装`` / ``居家服`` / ``泳衣`` / ``穿学生装``；1.0.29 起收紧，
+  ``学生会`` / ``学生时代`` 这种"只是包含"的不再命中），
   多个词命中取**最长**的；命中日志
   ``穿着类型解析(内置表): 学生 → school uniform, pleated skirt``
   （用户补充的表写 ``(配置表)``），注入日志
@@ -245,15 +247,73 @@ off/warn/fix，与期望集合那套互不影响）：
   **最新一条消息里最长的那个**，日志写明被忽略的候选；
   ``outfits.enabled = false`` 时仍然只做 1.0.26 那条**纯字符串**识别（只为豁免，
   皮肤表里确实有的才豁免），不注入、不调模型、日志里也没有 ``穿着类型解析``。
+
+1.0.29 起修审计发现的两条（**判定链、优先级、注入位置都没动**）：
+
+- **穿着类型的匹配口径收紧**（:func:`outfit.find_wear_type`）：由"候选**包含**
+  表中词"改成"候选**是**表中词或**以它结尾**"（归一后比较）—— 「我想看学生会」
+  「学生时代的花火」这类**不含穿着意图**的话不再被零模型调用地注入
+  ``school uniform, pleated skirt``（1.0.28 会；1.0.27 时同样的候选走模型兜底，
+  模型答 ``unknown`` → 什么都不注入）。**本身是键**的写法（``学生装`` / ``婚服`` /
+  ``和服`` …）与**后缀**写法（``穿学生装`` / ``男生学生``）照旧命中；代价是
+  ``学生服`` / ``校服外套`` / ``婚纱照`` 这类"键 + 别的后缀"从零模型调用降级为
+  走 ④ 问一次模型（残余盲区，见 README 与 ``docs/multi-character-design.md``）；
+- **穿着也做归属校验**（:meth:`CharacterGuardHandler._wear_character_hint` +
+  :meth:`CharacterGuardHandler._apply_outfit`）：② / ④ 产出的
+  ``ResolvedOutfit.character`` 填上"**说这句话的那条消息**里唯一提到的角色表内
+  角色"（多个 / 没有就留空 → 照常注入）；非空且与本次判定角色不一致时
+  **不注入 + WARNING** ``穿着跳过：穿着「婚纱」属于「爱莉希雅」，但本张判定角色是
+  「流萤」`` —— 与 1.0.26 起皮肤那条路的归属校验同一口径（线索不进穿着缓存：
+  缓存键只有原词，通用服装词与角色无关）。
+
+1.0.30 起补四件事（**判定链的规则、优先级次序与注入位置都没动**）：
+
+- **用户最新点名 = 角色判定的最高优先**（:meth:`CharacterGuardHandler._latest_named_entry`）：
+  用户**最新一条消息**（**触发消息**优先；它没点名才看**触发前最近 1 条用户消息**）
+  里明确写出的**角色表内**角色（名字 / 别名 / 标准标签，走既有
+  :func:`character.find_characters_in_text`）**压过主题跟踪的粘性与代词回指**。
+  实测场景 ``你：那画流萤吧`` → ``你：画爱莉的婚纱～``：婚纱原本会因归属冲突
+  "不注入 + 告警"，现在判定 = 爱莉希雅、婚纱**正常注入**，日志
+  ``判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:流萤）`` ——
+  括号里写的是"**没有这条信号时本次会怎么判**"（由
+  :meth:`CharacterGuardHandler._overtaken_conclusion` 用同一套代码算出来，只进日志）。
+  口径刻意窄（宁可不采用，也不抢走既有链路），**1.0.30 定型为四条闸门**：
+  ① **追加语义 / 多人 → 不采用**（含 ``character.ADDITIVE_WORDS`` 或点名 ≥2 个角色时
+  退回主题跟踪的追加/多人分支 —— 「还有伊甸，一起画」是"本条 + 上一条"，
+  回归用例 C34/C35/C109）；② **自我指代 / 疑问语气 → 不采用**（含自我指代词 =
+  "本尊 vs 壳"交给拆单 1.0.16 与本尊身份那条链路；含 ``？``/``?`` 的选择疑问句
+  「是爱莉还是你？」交给 LLM 仲裁 —— 回归用例 C42/C110）；③ **只读清洗后的正文**
+  （触发消息走 :func:`character.strip_quoted_blocks`、历史消息走
+  :func:`character.message_text`，``[回复…]`` / ``[图片(…)]`` 里的名字是别人说的，
+  回归用例 C43/C111）；④ **保留**时间衰减闸门（``_LATEST_NAMED_MIN_DECAY``，与
+  ``monitor.min_confidence`` 同值同义）、**描述点名优先**与触发消息自身点名的原路径
+  （C37/C52/C108）。它**压不过描述点名**（描述里写了角色时调用方早就放行）——
+  描述里点名的是**别人**时，1.0.19 的期望集合对账会把「用户最新说的人 ≠ 画面里的人」
+  报出来（``warn`` 只报 / ``fix`` 替换），日志与依据都能看出这一点；
+- **C104 的端到端从抽取侧修**（见 :mod:`outfit` 的 1.0.30 说明）：「我想看学生会～」
+  的候选不再被虚词「会」截断成 ``学生``，因此不再零模型调用地注入校服 —— 这与
+  1.0.29 那条"匹配口径收紧"是同一件事的两半（一个在匹配侧、一个在抽取侧）；
+- **穿着类型表的同义写法补齐**（``学生服`` / ``校服外套`` / ``婚纱照`` 等 15 条）：
+  1.0.29 的残余盲区因此收口，又是零模型调用命中（详见
+  :data:`outfit.WEAR_TYPE_KEYWORDS`）；
+- **穿着识别补上「归属句式」**（``…的婚纱`` / ``…的居家服``，见
+  :data:`outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`）：用户说「画爱莉的婚纱～」时
+  「婚纱」既不在皮肤表里、也不符合七条句式里的任何一条 —— 穿着这一层因此什么都
+  识别不到（C107/C108 卡住的地方）。词表直接用内置穿着类型表的键 + 一个"后面不再
+  接名字字符"的边界，所以抓到的候选**只可能是已知的穿着词**
+  （``我想看你的学生会长制服`` 里的「学生」不会被拆出来，C91 守的就是这条）。
+  同一版还把**候选过滤**的虚词表与**句式抽取**对齐（都不再拿 ``会`` 当虚词），
+  「我想看学生会～」的候选因此是完整的 ``学生会``（详见 :mod:`outfit`）。
 """
 
 from __future__ import annotations
 
 import importlib
 import json
+import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -268,12 +328,15 @@ from src.kernel.event import EventDecision
 from . import memory as memory_api
 from . import tag_hint
 from .character import (
+    ADDITIVE_WORDS,
     BASIS_LATEST_MENTION,
+    BASIS_LATEST_NAMED,
     BASIS_USER_NAMED,
     CharacterEntry,
     NamingDecision,
     ResolvedCharacter,
     character_in_texts,
+    contains_any_word,
     content_contains_tag,
     delete_character_reference,
     entry_key,
@@ -287,6 +350,7 @@ from .character import (
     iter_config_entries,
     merge_entries,
     message_text,
+    message_time,
     normalize_prompt_text,
     order_messages_newest_first,
     parse_roster,
@@ -416,6 +480,64 @@ _OUTSIDE_NAMING_SCAN_LIMIT = _SELF_REFERENCE_SCAN_LIMIT
 #: 提示词被删空、或只剩几个标点时，删掉的东西才是画面主体 —— 那就不是"清理错误
 #: 标签"而是"清空画面"了，这种修改一律不做（只报警）。
 _MIN_FIX_CONTENT_CHARS = 4
+
+# ── 「用户最新一条消息里点名的角色表内角色」（1.0.30）──────────────────
+#
+# 用户场景（需求原话）：
+#
+#     你：那画流萤吧
+#     你：画爱莉的婚纱～
+#
+# 现在判定仍是**流萤**（主题跟踪的粘性 + 代词回指把它按住），于是穿着冲突只能
+# 「不注入 + 告警」。用户希望**按他最新说的角色来画**（用"用户说的名字"，
+# 不是"从外观猜"）—— 所以新增一条**最高优先**的信号。
+#
+# 口径（窄到只够解决这个问题，见 :meth:`CharacterGuardHandler._latest_named_entry`）。
+# **1.0.30 定型为四条闸门**（缺一不可，每条都有独立回归用例）：
+#
+#   ① **追加语义 / 多人 → 不采用**：最新一条消息含追加语义词
+#      （``character.ADDITIVE_WORDS``：还有 / 一起 / 俩 / 都 / 加上 / 和她 / and / both）
+#      或**点名 ≥2 个**角色表内角色时，这条信号一律让位 ——
+#      「还有伊甸，一起画」是「本条 + 上一条点名」（回归用例 C35/C109），
+#      「她俩一起」是多人同框（C34），都该由主题跟踪 / ``resolve_naming_decision``
+#      的多人分支给出结论，不能被"最新一条里恰好 1 个角色"这条窄口径抢走；
+#   ② **自我指代 / 疑问语气 → 不采用**：最新一条消息含
+#      :func:`character.find_self_reference_word` 或含 ``？`` / ``?`` 时让位 ——
+#      「本尊 + 角色名」要的是"本尊 vs 壳"（交给拆单 1.0.16 与本尊身份那条链路），
+#      选择疑问句「是爱莉还是你？」要的是"换人还是追加不确定 → 交 LLM 仲裁"
+#      （回归用例 C42/C110：LLM 说花火就是花火）；
+#   ③ **只读清洗后的正文**：正文一律走 :func:`character.message_text` 口径
+#      （先剥 ``[回复…]`` / ``[图片(…)]`` 这类中括号块）—— 触发消息用
+#      :func:`character.strip_quoted_blocks`、历史消息用
+#      :func:`character.message_text`，两边同一口径。引用块里的名字是**别人说的**
+#      或只是文件名，不是用户本次的点名（回归用例 C43/C111）；
+#   ④ **保留（1.0.30 之前就有的两件事，一个字都没改）**：
+#      · 触发前那条用户消息要**够新**：时间衰减 ≥ :data:`_LATEST_NAMED_MIN_DECAY`
+#        （与主题跟踪同一个公式 ``exp(-Δt / monitor.half_life_minutes)`` 与同一个
+#        阈值 ``monitor.min_confidence``，默认 45 分钟半衰期 → 约半小时内说的才算）。
+#        「画爱莉希雅」（3 小时前）+ 触发「嗯哼？」这种**旧粘性**场景必须照旧不补
+#        （回归用例 C52/C37 守的就是这条）；
+#      · **描述点名优先**：画面描述里已经写了角色表内角色时，调用方（``execute``
+#        的 ``present_keys`` 分支）早就按描述那一档处理了，走不到这里；
+#        描述里写的是**别人**时，判定按这里的结论走，由 1.0.19 的期望集合对账
+#        把「用户最新说的人 ≠ 画面里的人」报出来（``warn`` 只报 / ``fix`` 替换，
+#        回归用例 C108）；
+#      · 触发消息本身点名时**沿用原路径**（触发消息不需要衰减闸门：它就是"这一句"）。
+#
+# 它压过主题跟踪的**粘性与代词回指**，但压不过描述点名 —— 与既有的
+# 「描述点名 > 主题跟踪 > …」总优先级一致（描述里写了角色时调用方早就放行了）。
+# **日志**：命中时打 ``判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:流萤；
+# 来源=…，原文=…）`` —— 括号里写的是"**原来会生效的那个结论**"（由
+# ``CharacterGuardHandler._overtaken_conclusion`` 用**同一套代码**算出来，
+# 只进日志、不参与判定），用户核对"为什么这次按爱莉希雅画"看的就是这一行。
+
+#: 「用户最新一条消息」这条信号最多回看几条用户消息（触发前）。**就是 1 条**：
+#: 再往前翻会把旧话题里的名字当成"用户刚说的"，那是粘性，不是点名。
+_LATEST_NAMED_HISTORY_LIMIT = 1
+
+#: 触发前那条用户消息的**时间衰减下限**（与 ``monitor.min_confidence`` 同值同义）：
+#: ``exp(-Δt / half_life)`` 低于它就不采用 —— 信号强度按 1.0 算（"点名"是最强信号）。
+_LATEST_NAMED_MIN_DECAY = 0.5
 
 
 @dataclass(frozen=True)
@@ -1384,6 +1506,43 @@ class UserNamingScope:
         )
 
 
+@dataclass(frozen=True)
+class LatestNamedEntry:
+    """「用户**最新一条消息**里点名的角色表内角色」这条信号的结果（1.0.30）。
+
+    Attributes:
+        entry: 命中的角色表条目；没有信号时为 ``None``
+        source: 名字**来自哪条消息**的说明（``触发消息`` / ``触发前第 1 条用户消息``）
+        named: 那条消息里命中的**全部**角色表内角色（日志 / 诊断用：为什么没采用）
+        text: 那条消息的正文（截断后进日志）
+        basis: 判定依据文案（``用户点名(最新消息):爱莉希雅``）
+        note: 没采用时的原因（``多个角色`` / ``自我指代`` / ``太旧`` …）
+    """
+
+    entry: CharacterEntry | None = None
+    source: str = ""
+    named: list[CharacterEntry] = field(default_factory=list)
+    text: str = ""
+    basis: str = ""
+    note: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """是否拿到了可用的「用户最新点名」。"""
+        return self.entry is not None
+
+    def names_text(self, entries: list[CharacterEntry] | None = None) -> str:
+        """角色名的可读列表（默认用 :attr:`named`）。"""
+        items = self.named if entries is None else entries
+        return "、".join(entry.name or entry.tag or "?" for entry in items) or "无"
+
+    def label(self) -> str:
+        """一行式诊断文案（DEBUG 日志用）。"""
+        if not self.usable:
+            return f"用户最新点名=无（{self.note or '最近一条消息里没有角色表内角色'}）"
+        return f"{self.basis}（来源={self.source}，原文={self.text[:30]!r}）"
+
+
 # ── 皮肤/时装 与 泛指的穿着（1.0.22 / 1.0.28）─────────────────────────
 #
 # 需求原话：「当说『我想看看你的 xxxx（皮肤）』，可以搜索并加进去」——
@@ -1441,7 +1600,9 @@ class OutfitScope:
         texts: 参与扫描的用户消息正文（**触发消息在前**，其后由新到旧）；
             角色线索（给模型当提示、也是缓存键的一半）就是从这一份里取的
         name: 选中的皮肤名（空串表示这次没有皮肤意图）
-        source: 这个皮肤名**来自哪条消息**（给模型当上下文线索，也让日志可核对）
+        source: 这个皮肤名**来自哪条消息**（给模型当上下文线索，也让日志可核对）；
+            **1.0.29 起穿着的归属线索也从这里取**（见
+            :meth:`CharacterGuardHandler._wear_character_hint`）
         names: **本次识别到的全部**皮肤 / 时装名（1.0.23）—— 句式 / 引号抓到的候选
             加上它们命中皮肤表时的**正式名**，去重保序。它不进日志、不参与解析，
             只用来把「这些是皮肤，不是角色表外的角色名」告诉表外点名那条链路
@@ -2115,11 +2276,19 @@ class CharacterGuardHandler(BaseEventHandler):
     ) -> CandidateResult:
         """收集候选角色。
 
-        判定优先级（1.0.10 起，1.0.14 起第二级由主题跟踪承担）：**描述点名 >
+        判定优先级（1.0.10 起，1.0.14 起第二级由主题跟踪承担；1.0.30 起在最前面
+        插了一条"用户最新点名"）：**描述点名 > 用户最新点名（1.0.30）>
         主题跟踪（用户点名/粘性） > LLM 仲裁 > 不补**。
 
         - 描述点名：画面描述里已经写了角色表内角色 —— 由调用方直接放行/补标签，
           本函数只负责算出「判定集合」，供二次一致性检测对账；
+        - **用户最新点名**（1.0.30，:meth:`_latest_named_entry`）：**触发消息**里
+          明确写出、或（触发消息没写时）**触发前最近 1 条用户消息**里明确写出的
+          角色表内角色（名字 / 别名 / 标签）。它压过主题跟踪的**粘性与代词回指** ——
+          实测场景：`你：那画流萤吧` → `你：画爱莉的婚纱～`，1.0.29 判定仍是流萤，
+          穿着冲突只能"不注入 + 告警"；用户要的是**按他最新说的角色画**。
+          口径窄：那一条里**恰好 1 个**角色表内角色才采用（**多个 → 不采用**）、
+          含自我指代 → 不采用（交给拆单 / 本尊身份）、触发前那条太旧 → 不采用；
         - **主题跟踪**（1.0.14 起，``monitor.enabled = true``）：把「这次该画谁」交给
           :func:`monitor.track_subject` —— 按时间正序扫最近 ``monitor.window`` 条消息
           维护一个「当前主题」（改口 / 多人 / 点名 / 本尊身份 / 代词回指 / 拆单），置信度 =
@@ -2195,10 +2364,76 @@ class CharacterGuardHandler(BaseEventHandler):
         #
         # ``monitor.enabled = false`` 时走下面的 else 分支：1.0.13 的两条链路
         # 一字未改，可逐字节回归（用例 C53）。
-        monitor = getattr(config, "monitor", None)
-        monitor_on = bool(getattr(monitor, "enabled", False)) and bool(roster)
+        #
+        # ①.5 用户最新点名（1.0.30）：**先算「用户最新一条消息里点名的角色表内角色」**
+        # （``_latest_named_entry``，只读触发消息 / 触发前最近 1 条用户消息，
+        # 见那一处的口径与闸门）。它压过下面主题跟踪的**粘性与代词回指**，
+        # 也压过 ``monitor.enabled = false`` 时那条 1.0.13 的"用户点名·粘性"链路
+        # （同一个口径）—— 但**压不过描述点名**（画面描述里写了角色时调用方早就
+        # 放行了），也不改变下面任何一条既有分支的规则。
+        latest_named = self._latest_named_entry(
+            trigger_text=self._trigger_text(params),
+            window=window,
+            bot_ids=bot_ids,
+            config=config,
+            roster=roster,
+        )
+        if latest_named.usable:
+            logger.debug(f"用户最新点名: {latest_named.label()}")
         track: SubjectTrack | None = None
         naming = NamingDecision()
+
+        # 1.0.30：**用户最新一条消息里点名的角色表内角色 = 最高优先** ——
+        # 它压过主题跟踪的**粘性与代词回指**（"画爱莉的婚纱～" 要按爱莉画，而不是按
+        # 上一条 "那画流萤吧" 的粘性），也压过 1.0.13 那条"用户点名·粘性"链路 ——
+        # 所以**放在两条链路之前**（monitor 开着关着同一个口径），但排在**描述点名**
+        # 之后（画面描述里写了角色时调用方早就放行了，走不到这里）。
+        # **四条闸门**（追加语义/多人、自我指代/疑问语气、只读清洗后的正文、保留
+        # 时间衰减与描述优先）全部在 `_latest_named_entry` 里 —— 被闸门挡掉的情形
+        # 一律退回下面原来的判定链，一个字都不变。
+        # 命中时日志写明**被压过的那个结论**（`_overtaken_conclusion`，只进日志）。
+        if latest_named.usable and latest_named.entry is not None:
+            entry = latest_named.entry
+            basis = f"判定依据={latest_named.basis}"
+            # 1.0.30：把「被这条信号压过的那个结论」一并写进同一行日志 —— 用户核对
+            # 「为什么这次按爱莉希雅画、而不是上一条粘住的流萤」看的就是这一行
+            # （README / docs 给的样例就是
+            # ``判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:流萤）``）。
+            # 括号里写的**一律是"原来会生效的那个结论"**（用**同一套代码**算出来的，
+            # 见 :meth:`_overtaken_conclusion`），不是写死的角色名 —— 所以它同时也是
+            # 「没有这条信号时本次会怎么判」的自证。它**只进日志**，不参与本次判定。
+            overtaken = self._overtaken_conclusion(
+                messages=messages,
+                config=config,
+                roster=roster,
+                bot_ids=bot_ids,
+                description_has_character=description_has_character,
+            )
+            logger.debug(
+                f"{basis}（优先于{overtaken}；来源={latest_named.source}，"
+                f"原文={latest_named.text[:30]!r}）"
+            )
+            return CandidateResult(
+                candidates=[entry],
+                decided=[entry],
+                llm_multi=False,
+                mentioned=mentioned,
+                naming=NamingDecision(
+                    kind="single",
+                    characters=[entry],
+                    basis=BASIS_LATEST_NAMED,
+                    note=(
+                        f"用户最新一条消息（{latest_named.source}）里点名，"
+                        f"优先于{overtaken}"
+                    ),
+                ),
+                basis=basis,
+                memory=memory_lookup,
+                track=track,
+            )
+
+        monitor = getattr(config, "monitor", None)
+        monitor_on = bool(getattr(monitor, "enabled", False)) and bool(roster)
 
         if monitor_on:
             try:
@@ -2536,6 +2771,264 @@ class CharacterGuardHandler(BaseEventHandler):
             memory=memory_lookup,
             track=track,
         )
+
+    # ── 「用户最新一条消息里点名的角色表内角色」（1.0.30）──────────────
+
+    @staticmethod
+    def _overtaken_conclusion(
+        *,
+        messages: list[dict[str, Any]],
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        bot_ids: set[str] | frozenset[str],
+        description_has_character: bool,
+    ) -> str:
+        """「用户最新点名」这条信号**压过的**那个结论（1.0.30，**只用于日志**）。
+
+        为什么要算它：这条信号是最高优先，但"它压过的到底是什么"必须能一眼看出来 ——
+        README / ``docs/multi-character-design.md`` 给的日志样例就是
+        ``判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:流萤）``。
+        写死角色名不行：真实事故里被压过的是"上一条粘住的流萤"，换个场景可能是主题
+        跟踪的另一个人、甚至"无(不补)"（主题不可用 / 置信度不足）。
+
+        口径：**与正式判定链同一套代码** —— ``monitor.enabled`` 时是
+        :func:`monitor.track_subject`（参数与 :meth:`_collect_candidates` 里那次
+        **完全一致**），关掉时是 1.0.13 那条
+        :func:`character.resolve_naming_decision`。所以括号里写出来的就是
+        「**没有这条信号时，本次会怎么判**」：
+
+        - ``主题跟踪:爱莉希雅`` / ``主题跟踪:伊甸、爱莉希雅``：主题跟踪的结论；
+          带 ``（换人还是追加不确定）`` 时说明它原本会交 LLM 仲裁，而这条信号
+          直接按用户最新点名拍板（1.0.30 要的正是"别让仲裁改掉用户刚说的名字"）；
+        - ``主题跟踪:无(不补)``：主题不可用（本尊身份取不到 / 代词无先行词 /
+          置信度不足 / 无信号）；
+        - ``用户点名·粘性:…``：``monitor.enabled = false`` 时那条 1.0.13 链路。
+
+        **只读、只算、不写任何状态**：结果只进日志，绝不参与判定；任何异常都退成
+        ``…:未知``，绝不允许影响判定或拦住生图（这条信号本身就是"多一条证据"，
+        它的诊断文案更加不能反过来把生图拦住）。
+        """
+        monitor = getattr(config, "monitor", None)
+        if bool(getattr(monitor, "enabled", False)) and roster:
+            try:
+                track = track_subject(
+                    messages,
+                    roster,
+                    window=int(getattr(monitor, "window", 15)),
+                    min_confidence=float(getattr(monitor, "min_confidence", 0.5)),
+                    half_life_minutes=float(
+                        getattr(monitor, "half_life_minutes", 45.0)
+                    ),
+                    multi_window_minutes=float(config.multi.multi_window_minutes),
+                    self_reference_enabled=(
+                        bool(config.general.skip_on_self_reference)
+                        and not description_has_character
+                    ),
+                    bot_ids=bot_ids,
+                    resolve_identity=lambda: resolve_true_self_identity(config),
+                )
+            except Exception as e:  # noqa: BLE001 —— 只为日志，失败就写"未知"
+                return f"主题跟踪:未知（{type(e).__name__}）"
+            if track.usable:
+                note = "（换人还是追加不确定）" if track.ambiguous else ""
+                return f"主题跟踪:{track.subject_names()}{note}"
+            return "主题跟踪:无(不补)"
+        try:
+            naming = resolve_naming_decision(
+                messages,
+                roster,
+                stickiness_hours=float(config.multi.stickiness_hours),
+                multi_window_minutes=float(config.multi.multi_window_minutes),
+                bot_ids=bot_ids,
+            )
+        except Exception as e:  # noqa: BLE001 —— 同上
+            return f"用户点名·粘性:未知（{type(e).__name__}）"
+        if naming.kind in {"single", "multi", "uncertain"} and naming.characters:
+            return f"用户点名·粘性:{naming.names()}"
+        return "用户点名·粘性:无(不补)"
+
+    @staticmethod
+    def _latest_named_entry(
+        *,
+        trigger_text: str,
+        window: list[dict[str, Any]],
+        bot_ids: set[str] | frozenset[str],
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+    ) -> LatestNamedEntry:
+        """用户**最新一条消息**里点名的角色表内角色（1.0.30）—— 角色判定的**最高优先**。
+
+        需求场景（原话）::
+
+            你：那画流萤吧
+            你：画爱莉的婚纱～
+
+        用户要的是「**按我最新说的角色来画**」：这两句里最新点名的是**爱莉希雅**，
+        而既有的判定链会被"上一条粘住的流萤"按住（``_apply_outfit`` 的归属校验于是
+        把婚纱拦下来：不注入 + 告警）。所以这里给出**一条最高优先的信号**，依据文案
+        写明它来自"最新消息"，日志里同时写明它压过了哪个结论
+        （``_overtaken_conclusion``）—— 穿着那一侧因此不再因归属冲突被拦
+        （回归用例 C107/C108）。
+
+        **只认用户说的名字，不从外观猜**：命中判定复用
+        :func:`character.find_characters_in_text`（名字 / 别名 / 标准标签三种写法），
+        与既有判定链完全同一口径。
+
+        口径（窄到只解决这个问题 —— 宁可不采用，也不抢走既有链路）。
+        **1.0.30 的四条闸门**（与模块顶部那段注释同一份口径）：
+
+        1. **只看两条**：**触发消息**优先；它没点名才看**触发前最近 1 条用户消息**
+           （``_LATEST_NAMED_HISTORY_LIMIT`` = 1，再往前是粘性、不是"刚说的"）；
+        2. **闸门①：追加语义 / 多人 → 不采用**。那一条里命中**恰好 1 个**角色表内
+           角色才采用 —— **≥2 个一律不采用**（「她俩一起」「爱莉和流萤」这种一单多人
+           / 闲聊会误判）；含**追加语义词**（``character.ADDITIVE_WORDS``：还有 /
+           一起 / 俩 / 都 / 加上 / 和她 / and / both）同样不采用 ——
+           「还有伊甸，一起画」＝**本条 + 上一条点名**，要交回主题跟踪（或 1.0.13 的
+           ``resolve_naming_decision``）的追加分支，否则上一条点名的角色会丢
+           （回归用例 C35/C109）；
+        3. **闸门②：自我指代 / 疑问语气 → 不采用**。含**自我指代**
+           （``本尊`` / ``你自己`` …）→ 不采用：「本尊 + 角色名」要的是"本尊 vs 壳"，
+           由既有的拆单（1.0.16）与本尊身份那条链路决定（C54/C98/C110）；
+           含 ``？`` / ``?`` → 不采用：选择疑问句「是爱莉还是你？」不是点名，它要的是
+           「换人还是追加不确定 → 交 LLM 仲裁」（C42/C110：LLM 说花火就是花火）；
+        4. **闸门③：只读清洗后的正文**。触发消息先走
+           :func:`character.strip_quoted_blocks`、历史消息走
+           :func:`character.message_text`（本来就是同一个口径）—— ``[回复…]`` /
+           ``[图片(…)]`` 这类中括号块里的名字是**别人说的**，不算用户点名
+           （C43/C111）；
+        5. **闸门④（1.0.30 之前就有的两件事，一个字都没改）**：触发前那条用户消息要
+           **够新** —— 时间衰减 ``exp(-Δt / monitor.half_life_minutes)`` ≥
+           ``handler._LATEST_NAMED_MIN_DECAY``（**数值与语义都对齐**
+           ``monitor.min_confidence`` 的默认 0.5：按默认 45 分钟半衰期，约半小时内
+           说的才算"刚说的"）—— 「画爱莉希雅」（3 小时前）+ 触发「嗯哼？」这种
+           **旧粘性**必须照旧不补（C52/C37 守的）；触发消息**不需要**衰减闸门：
+           它就是"这一句"；时间戳缺失的**历史**消息一律不采用（拿不到 Δt 就不敢说
+           "刚说的"）。**描述点名优先**同样保留：画面描述里写了角色表内角色时调用方
+           早就按那一档放行了，走不到这里。
+
+        它压过主题跟踪的**粘性与代词回指**，也压过 ``monitor.enabled = false`` 时
+        1.0.13 那条"用户点名·粘性"链路（所以调用方把它放在两条链路**之前**）；
+        但**压不过描述点名** —— 画面描述里写了角色时调用方早就放行了，走不到这里。
+        描述里写的是**别的**角色时，判定按这里的结论走，由 1.0.19 的期望集合对账把
+        「用户最新说的人 ≠ 画面里的人」报出来（``warn`` 只报 / ``fix`` 替换）。
+
+        本函数**不抛异常**（任何意外都返回"无信号"）：它只是多一条信号，
+        绝不允许影响既有判定链或拦住生图。
+
+        Args:
+            trigger_text: 触发本次生图的那条消息正文（:meth:`_trigger_text`）
+            window: 上文窗口（``_collect_context`` 的结果，末尾是触发消息）
+            bot_ids: 本机 bot 的 ``sender_id`` 集合（bot 的复述不算用户点名）
+            config: 插件配置（取 ``monitor.half_life_minutes``）
+            roster: 角色表（空表直接返回"无信号"）
+
+        Returns:
+            :class:`LatestNamedEntry`；``entry is None`` 表示本次没有这条信号
+        """
+        if not roster:
+            return LatestNamedEntry(note="角色表为空")
+        monitor = getattr(config, "monitor", None)
+        half_life = float(getattr(monitor, "half_life_minutes", 45.0) or 0.0)
+
+        # 候选：触发消息（若有）在前，其后是触发前最近 N 条用户消息（新 → 旧）
+        #
+        # **闸门③（只读清洗后的正文）**：触发消息也要先剥掉 ``[回复…]`` / ``[图片(…)]``
+        # 这类中括号块（:func:`character.strip_quoted_blocks` 就是
+        # :func:`character.message_text` 内部那一步），历史消息本来就走
+        # :func:`character.message_text` —— 两边同一口径。引用块 / 媒体占位里的文字
+        # 是**别人说的话**或文件名，不是用户本次的点名：实测事故原文
+        # ``[回复<…>：那你告诉我，是爱莉还是你？][图片(xxx)]`` 里的「爱莉」正是这样
+        # 被当成"用户点名"的（回归用例 C43/C111）。
+        candidates: list[tuple[dict[str, Any] | None, str, str]] = []
+        clean_trigger = strip_quoted_blocks(trigger_text) if trigger_text else ""
+        if clean_trigger:
+            candidates.append((None, "触发消息", clean_trigger))
+        # 触发消息是否被 append 进 window 由**原始** trigger_text 决定
+        # （见 ``_collect_context``），所以这里判空仍用原始值。
+        history = list(window[:-1]) if trigger_text else list(window)
+        scanned = 0
+        for message in order_messages_newest_first(history):
+            if scanned >= _LATEST_NAMED_HISTORY_LIMIT:
+                break
+            if is_known_bot_message(message, bot_ids):
+                continue
+            scanned += 1
+            candidates.append(
+                (message, f"触发前第 {scanned} 条用户消息", message_text(message))
+            )
+        stale = False
+        for message, source, text in candidates:
+            if not text:
+                continue
+            if find_self_reference_word(text):
+                # 闸门②（自我指代）：「本尊 + 角色名」＝一单多件，交给拆单 / 本尊
+                # 身份那条链路（口径 ②）
+                return LatestNamedEntry(
+                    source=source,
+                    text=text,
+                    note=f"{source}里有自我指代，交给拆单/本尊身份判断",
+                )
+            if "？" in text or "?" in text:
+                # 闸门②（疑问语气）：选择疑问句「是爱莉还是你？」不是用户点名 ——
+                # 它要的是「换人还是追加不确定 → 交 LLM 仲裁」（回归用例 C42/C110：
+                # LLM 说花火就是花火）。含问号就整条让位，宁可不采用。
+                return LatestNamedEntry(
+                    source=source,
+                    text=text,
+                    note=f"{source}是疑问句（含问号），交给 LLM 仲裁/原判定链",
+                )
+            if contains_any_word(text, ADDITIVE_WORDS):
+                # 闸门①（追加语义）：「还有伊甸，一起画」＝**本条 + 上一条点名**，
+                # 该由主题跟踪的追加分支（``monitor.enabled=false`` 时是
+                # ``resolve_naming_decision`` 的追加分支）给出多人结论 ——
+                # 被"最新一条里恰好 1 个角色"这条窄口径接管的话，上一条点名的角色
+                # 就丢了（回归用例 C35/C109）。
+                return LatestNamedEntry(
+                    source=source,
+                    text=text,
+                    note=(
+                        f"{source}含追加语义词（还有/一起/俩/都/加上/和她…），"
+                        "交给「本条 + 上一条点名」那条链路"
+                    ),
+                )
+            if message is not None and half_life > 0:
+                stamp = message_time(message)
+                if stamp is None:
+                    stale = True
+                    continue
+                age_minutes = max(0.0, (time.time() - stamp) / 60.0)
+                if math.exp(-age_minutes / half_life) < _LATEST_NAMED_MIN_DECAY:
+                    stale = True
+                    continue
+            named = find_characters_in_text(text, roster)
+            if not named:
+                continue
+            if len(named) > 1:
+                # 闸门①（多人）：同一条消息里出现多个角色表内角色 → **不采用**
+                # （「爱莉和流萤」既可能是一单多人、也可能只是闲聊里提到两个名字，
+                #  拿它当"用户点名"会抢掉既有判定链的正确结论；回归用例 C34 守的是
+                #  "同一条消息点两名 → 补两人"）
+                return LatestNamedEntry(
+                    source=source,
+                    named=list(named),
+                    text=text,
+                    note=(
+                        f"{source}里有 {len(named)} 个角色表内角色"
+                        f"（{_entry_names(named)}），不采用"
+                    ),
+                )
+            return LatestNamedEntry(
+                entry=named[0],
+                source=source,
+                named=list(named),
+                text=text,
+                basis=f"{BASIS_LATEST_NAMED}:{named[0].name or named[0].tag or '?'}",
+            )
+        if stale:
+            return LatestNamedEntry(
+                note="触发前最近 1 条用户消息太旧（按时间衰减闸门不采用）"
+            )
+        return LatestNamedEntry(note="最近一条用户消息里没有角色表内角色")
 
     @staticmethod
     def _detect_self_reference(
@@ -3030,11 +3523,13 @@ class CharacterGuardHandler(BaseEventHandler):
            没给（本方法被单独调用）才自己扫一次；
         3. **① 皮肤表命中** → 直接用表里的关键词 / 中文描述，**零模型调用**；表里的
            那一行没写关键词时按「表未命中」处理（继续往下走，用户少填一列也能用）；
-        4. **② 穿着类型命中**（1.0.28）→ 内置表 :data:`outfit.WEAR_TYPE_KEYWORDS`
-           与 ``outfits.wear_types`` 合并后的表里**包含**候选即命中（``学生装`` /
-           ``居家服`` / ``泳衣``），直接用表里的关键词，**同样零模型调用**
-           —— 需求原话：「判断不是皮肤，转成'穿对应的衣服'……要能**看到注入了
-           什么样的衣服**」；
+        4. **② 穿着类型命中**（1.0.28；1.0.29 收紧了匹配口径）→ 内置表
+           :data:`outfit.WEAR_TYPE_KEYWORDS` 与 ``outfits.wear_types`` 合并后的表里
+           **候选本身是表中词、或以它结尾**才算命中（``学生装`` / ``居家服`` /
+           ``泳衣`` / ``穿学生装``；``学生会`` / ``学生时代`` 这类"只是包含"的
+           不再命中 —— 见 :func:`outfit.find_wear_type`），直接用表里的关键词，
+           **同样零模型调用** —— 需求原话：「判断不是皮肤，转成'穿对应的衣服'……
+           要能**看到注入了什么样的衣服**」；
         5. **③/④ 模型解析**（``outfits.auto_resolve``，默认开）：候选**看起来是
            穿着**（:func:`outfit.wear_like_candidate`：含 ``衣/服/装/裙/…`` 或句式
            「穿 X」「换上 X」）→ **④ 穿着模型解析**（:meth:`_resolve_wear_with_cache`
@@ -3047,6 +3542,25 @@ class CharacterGuardHandler(BaseEventHandler):
            去认「<角色>的那一套皮肤」并让模型推断（默认关）。
            **与穿着互斥**：已经识别到穿着词 / 皮肤名（``scope.name`` 非空）时
            绝不进这一步。
+
+        **1.0.29 的两处增量**（判定链与优先级一个字都没改）：
+
+        - **② 的匹配口径收紧**（见第 4 条与 :func:`outfit.find_wear_type`）：
+          "候选**包含**表中词"→"候选**是**表中词或**以它结尾**"，于是
+          「学生会」「学生时代」这类不含穿着意图的话不再被零模型调用地注入；
+        - **穿着也带归属线索**：② / ④ 产出的 ``ResolvedOutfit.character`` 由
+          :meth:`_wear_character_hint` 填（"说这句话的那条消息"里**唯一**提到的
+          角色表内角色），:meth:`_apply_outfit` 的归属校验据此对穿着同样生效。
+
+        **1.0.30 的两处增量**（优先级次序与注入位置同样一个字都没改）：
+
+        - **② 的候选不再被虚词截断**：句式抽取去掉虚词「会」
+          （:data:`outfit._OUTFIT_SENTENCE_STOP_CHARS`），「我想看学生会～」的候选
+          是完整的 ``学生会`` → 这里既不命中 ② 也不命中 ① ，落到 ③/④ 模型兜底；
+          1.0.29 时它是被截断的 ``学生``（**相等命中** ② → 零模型调用注入校服）；
+        - **② 的同义写法补全**：``学生服`` / ``校服外套`` / ``婚纱照`` 等 15 条
+          常见写法各自成为内置表里的**键**（见 :data:`outfit.WEAR_TYPE_KEYWORDS`），
+          它们因此又是零模型调用命中，而且日志里写的是用户的原话。
 
         **本函数不抛异常**：任何失败都只记日志并返回 ``None``，由调用方什么都不注入。
         """
@@ -3066,6 +3580,10 @@ class CharacterGuardHandler(BaseEventHandler):
                 config=config, roster=roster, texts=scope.texts
             )
         character = self._outfit_character_hint(scope, entries, roster)
+        # 1.0.29：穿着那两条路（② / ④）也带**归属线索** —— 归属校验（_apply_outfit）
+        # 才对穿着同样生效。线索只从"说这句话的那条消息"里取，且**唯一**时才填，
+        # 见 :meth:`_wear_character_hint` 的 docstring。
+        wear_character = self._wear_character_hint(scope, roster)
         entry = find_outfit_entry(scope.name, entries)
         if entry is not None and entry.keywords:
             outfit = ResolvedOutfit(
@@ -3089,6 +3607,9 @@ class CharacterGuardHandler(BaseEventHandler):
         if wear_type is not None:
             outfit = ResolvedOutfit(
                 name=wear_type.word,
+                # 1.0.29：穿着类型表没有归属列，归属线索由"说这句话的那条消息"给出
+                # （唯一才填）—— _apply_outfit 的归属校验据此拦"婚纱贴到流萤身上"。
+                character=wear_character,
                 keywords=list(wear_type.keywords),
                 source=OUTFIT_SOURCE_TABLE,
                 confidence=1.0,
@@ -3109,9 +3630,15 @@ class CharacterGuardHandler(BaseEventHandler):
         if wear_like:
             # ④ 穿着模型解析（1.0.28）：候选"看起来是穿着"（「雨衣」「白色长裙」
             # 「换上战甲」…），但内置表与皮肤表都没有 → 交给穿着专用提示词。
-            return await self._resolve_wear_with_cache(
+            resolved = await self._resolve_wear_with_cache(
                 config=config, name=scope.name, context_text=scope.source
             )
+            # 1.0.29：归属线索**在缓存之外**补 —— 穿着缓存的键只有原词（不含角色，
+            # 通用服装词与角色无关），把归属烤进缓存会让"同一个词、换个角色"的
+            # 下一次解析用上上一次的归属；命中缓存时同样要按**本次**这句话重判。
+            if resolved is not None and wear_character:
+                resolved = replace(resolved, character=wear_character)
+            return resolved
         # ③ 皮肤模型解析（1.0.22 起的原路，一个字没改）
         return await self._resolve_outfit_with_cache(
             config=config,
@@ -3201,6 +3728,35 @@ class CharacterGuardHandler(BaseEventHandler):
             if hits:
                 return hits[0].name
         return ""
+
+    @staticmethod
+    def _wear_character_hint(scope: OutfitScope, roster: list[CharacterEntry]) -> str:
+        """穿着候选的**归属线索**（1.0.29）——"说这句话的那条消息"里提到的角色表内角色。
+
+        与 :meth:`_outfit_character_hint` 的区别只有**线索范围**：
+
+        - 皮肤那条路取整个焦点范围（``scope.texts`` = 触发消息 + 触发前最近几条
+          用户消息）：用户常常在**上一条**消息里说清楚这套皮肤属于谁；
+        - 穿着这条路只取**抓到候选的那条消息**（``scope.source``）：要拦的场景是
+          「爱莉穿婚纱的样子」这种"同一句话里既有归属又有穿着"；跨消息取线索会把
+          C98「本尊看看，然后穿着爱莉来看看～」（本张主题是**花火**，爱莉只是那句
+          话里的旧名字）也算成归属，从而**误杀**本来正常的注入。
+
+        **只在能唯一确定时填**：这条消息里的角色表内角色恰好一个才返回它的正式名；
+        多个（「爱莉和流萤穿婚纱」）或一个都没有（「我想看你的雨衣」）一律返回空串
+        —— 留空 = 照常注入（见 :meth:`_apply_outfit`），**宁可不拦，也不误杀**。
+
+        线索本身不注入任何东西，只用来回答"这件衣服属于谁"。
+        """
+        text = (scope.source or "").strip()
+        if not text or not roster:
+            return ""
+        names: list[str] = []
+        for entry in find_characters_in_text(text, roster):
+            name = (entry.name or entry.tag or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names[0] if len(names) == 1 else ""
 
     async def _resolve_outfit_with_cache(
         self,
@@ -3345,6 +3901,11 @@ class CharacterGuardHandler(BaseEventHandler):
         （标题「皮肤指向：…」），穿着关键词是**通用服装词**（「雨衣 → raincoat」），
         记下来既没有复用价值，也不该被当成"用户确认过的身份事实"。
         ``outfits.write_back`` 因此对这条链路无效（皮肤那条路照旧）。
+
+        **1.0.29**：归属线索（``ResolvedOutfit.character``）**不在这里填、也不进缓存**
+        —— 缓存键只有原词（通用服装词与角色无关），由调用方
+        （:meth:`_resolve_outfit`）在拿到结果后按"**本次**这句话"补上，命中缓存时
+        同样按本次重判（见 :meth:`_wear_character_hint`）。
 
         **本函数不抛异常**（异常一律转成失败结果并写负缓存）；调用方拿到 ``None``
         或 ``ok`` 为假的结果时**什么都不注入**。
@@ -4496,9 +5057,14 @@ class CharacterGuardHandler(BaseEventHandler):
 
         **1.0.28 的三条冲突裁决**（冲突矩阵第 6、7 条）：
 
-        - **归属校验**只对**有归属列**的结果生效（皮肤表第 2 列 / 推断结果）；
-          穿着那两条路一律没有归属（穿着类型表只有两列），因此照常注入 ——
-          这正是需求说的"多数情况无归属 → 照常注入"。
+        - **归属校验对穿着同样生效**（1.0.26 皮肤 / **1.0.29 起穿着**）：
+          ``outfit.character`` 非空（皮肤表第 2 列、皮肤 / 穿着的角色线索）而本次
+          判定的角色里没有它 → **不注入** + WARNING
+          ``穿着跳过：穿着「婚纱」属于「爱莉希雅」，但本张判定角色是「流萤」``；
+          穿着类型表本身没有归属列，它的线索由 :meth:`_wear_character_hint` 从
+          "说这句话的那条消息"里取（唯一才填），皮肤那条路沿用
+          :meth:`_outfit_character_hint`。**判不出角色**（``decided`` 为空）时
+          保持原行为：照常注入，只打一条 DEBUG。
         - 穿着关键词**只走** :func:`outfit.validate_outfit_keyword`（含 1.0.26 那条
           "拒收 ``\\(…\\)`` 形状"），所以它**不可能**被角色对账 / ``fix`` 当成角色
           标签 —— 而本方法本来就跑在两条一致性检查**之后**，``fix`` 替换 / 删除
@@ -4514,7 +5080,9 @@ class CharacterGuardHandler(BaseEventHandler):
         # 若本次判定的角色里没有它，就**不注入**（否则会出现"流萤的招牌衣服被贴到爱莉
         # 身上"这种错图，而插件既不报也不拦）。判不出角色（decided 为空）时保持原行为：
         # 照样注入，只打一条 DEBUG。
-        # 1.0.28：穿着那两条路没有归属列（character 恒为空串）→ 这一关自然不触发。
+        # 1.0.29：穿着那两条路的 character 由 handler._wear_character_hint 填
+        # （"说这句话的那条消息"里唯一提到的角色表内角色）→ 这一关对穿着**同样生效**：
+        # 「爱莉穿婚纱的样子」+ 本张判定=流萤 → 不注入并告警，与皮肤那条路口径一致。
         if outfit.character and decided:
             wanted = str(outfit.character).strip().casefold()
             owners = {

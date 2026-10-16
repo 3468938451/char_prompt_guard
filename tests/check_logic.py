@@ -222,6 +222,33 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
 三条模型路（皮肤解析 / 皮肤推断 / 穿着解析）各自的 payload 与计数器互相独立。
 ``make_config`` 的 ``[outfits]`` 默认值与 1.0.27 相同（C1~C88 一个字都没改）。
 
+1.0.29 起修**独立只读审计发现的两条**（C104~C106，**判定链、优先级、注入位置
+一个字都没改**）：
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C104 | **穿着匹配收紧为「相等或后缀」**（审计 🟠1）：1.0.28 的"候选**包含**表中词即命中"会把**不含穿着意图**的话吞掉 —— 「学生会」「学生时代」里含「学生」→ 零模型调用地注入 ``school uniform, pleated skirt``（1.0.27 时同候选走模型兜底 → unknown → 不注入）。单元级钉住 ``学生 / 学生装 / 居家服 / 泳衣 / 婚服 / 和服 / 穿学生装 / 我想看你的学生 / 男生学生`` 仍命中、``学生会 / 学生时代 / 我想看学生会`` 不命中；端到端钉住「我想看学生时代的花火～」（候选 ``学生时代``）**不注入**、日志无 ``穿着类型解析(内置表)``、走模型兜底且 ``unknown`` → 什么都不注入。**用例内同时钉住一条残留**：「我想看学生会～」的候选在**抽取**那一步被虚词「会」截断成「学生」→ 相等命中仍然注入（抽取侧问题，不在本次两条范围内；**已在 1.0.30 修掉**，见下表 C104 那一行） |
+| C105 | **穿着也做归属校验**（审计 🟠2）：「爱莉穿婚纱的样子」是**穿着**那句话（同句提到爱莉），判定角色由更新的那句「画流萤吧」给出（→ decided=[流萤]）→ ② / ④ 两条路都**不注入** + WARNING ``穿着跳过：穿着「婚纱」属于「爱莉希雅」，但本张判定角色是「流萤」``；② 走内置表（0 次模型调用）、④ 走穿着模型解析（恰好 1 次），两条都先**真的解析出关键词**再被归属校验拦下（不是空转） |
+| C106 | **防误杀**：同一句穿着请求，判定角色 = 爱莉希雅（与归属一致）→ 婚纱**照常注入**、日志无 ``穿着跳过`` |
+
+``FakeOutfit`` 1.0.29 起不用加桩：C104 用默认 payload（``{"unknown": True}``），
+C105/C106 只用 1.0.28 已有的 ``wear_payload`` / ``wear_calls``。
+
+**1.0.30 修掉上面那条残留，并补三件产品需求**（C104 重写、C107/C108 新增、
+C109~C111 新增；**原 C1~C103 与 C105/C106 的断言一个字都没改**）：
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C104（重写） | **抽取侧修掉虚词截断**：句式抽取与候选过滤**共用同一张虚词表**（都不把「会」当虚词，``outfit._OUTFIT_STOP_CHARS`` / ``_OUTFIT_SENTENCE_STOP_CHARS`` / ``_OUTFIT_SENTENCE_NAME_CLASS``），「我想看学生会～」的候选因此是完整的 ``学生会``（1.0.29 时是截断的 ``学生``，只会把句式那一侧改掉时又会被**过滤**整条丢掉）→ 不等于任何键、也不以任何键结尾 → ② 不命中 → 走 ③/④ 模型兜底（假模型 ``unknown``）→ **什么都不注入**。断言：``council_candidate == ["学生会"]``、端到端「走的是皮肤模型路（``stub.calls == ["学生时代"]``）且没有注入」；单元样例表**加严**（1.0.30 新补的 15 条同义写法全部要求命中）。**这是"按真实可达范围重写"，不是放宽** —— 改动前断言的是 bug 存在，改动后断言的是 bug 已修 |
+| C107 | **用户最新点名 = 角色判定最高优先**：``那画流萤吧``（2 分钟前）→ ``画爱莉的婚纱～``（1 分钟前）→ 触发消息 ``嗯～``。1.0.30 起判定 = **爱莉希雅**（依据 ``判定依据=用户点名(最新消息):爱莉希雅``）→ ``穿着类型解析(内置表): 婚纱`` → **正常注入** ``wedding dress, bridal veil, white dress``（不再 ``穿着跳过``）、0 次模型调用；括号里写的永远是"**原来会生效的那个结论**"（``handler._overtaken_conclusion``），本 fixture 里同样是爱莉希雅（``换人还是追加不确定``）—— 真实事故里被压过的是上一条粘住的流萤（C105/C106 守的就是那个场景）。修这条用例时一并补上了**归属句式** ``…的婚纱``（``outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN``）：原先七条句式都抓不到「画爱莉的婚纱～」里的「婚纱」，判定改对了、衣服却还是没注入 |
+| C108 | 同一判定 + **画面描述里已经写着** ``firefly \(honkai: star rail\)`` + ``consistency_check="fix"`` → 1.0.19 的期望集合对账识别冲突（画面=流萤、期望=爱莉希雅）并**替换**成 ``elysia \(honkai impact 3rd\)``；日志同时能看到 ``判定依据=用户点名(最新消息):爱莉希雅`` 与 ``优先于主题跟踪:…``（＝「用户最新说的人 ≠ 画面里的人」）。**档位说明**：冲突本身与 ``warn``/``fix`` 无关（``warn`` 只报不改），本用例按 ``fix`` 写是因为需求要的是"换成用户说的那个角色" |
+| C109 | **闸门①（追加语义 / 多人）**：与 C35 同一场景（``还有伊甸，一起画``）→ **不采用**新信号、结果与 C35 一致（本条 + 上一条都补），日志里没有 ``判定依据=用户点名(最新消息)``、走的是主题跟踪的 ``[追加]`` 分支 |
+| C110 | **闸门②（疑问语气 / 自我指代）**：A）与 C42 同一句「是爱莉还是你？」→ 结果与 C42 一致（LLM 仲裁说花火就是花火）；B）触发消息含「你自己」→ 不补、内容一字不改，两条都不出现 ``判定依据=用户点名(最新消息)`` |
+| C111 | **闸门③（只读清洗后的正文）**：A）与 C43 同一份事故原文（整条都是 ``[回复…][图片(…)]``）→ 清洗后没有正文 → ``判定依据=无(不补)``、内容不改；B）正文 + 引用块混写 → 清洗后的正文照旧点名（``判定依据=用户点名(最新消息):爱莉希雅``），引用块里的花火 / 流萤一个字都不参与 |
+
+``FakeOutfit`` 1.0.30 起同样不用加桩：C107/C108 全部命中内置穿着类型表（0 次模型调用），
+断言里 ``stub.calls == []`` 与 ``stub.wear_calls == []`` 就是这条。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -334,7 +361,7 @@ def make_config(
     1.0.19 的 C64~C67 同理（也都是 ``memory=True`` + :class:`FakeMemory`）。
     1.0.22 起 ``[outfits]``（皮肤/时装）**同样默认关掉**：C1~C76 是 1.0.21 及以前的
     行为回归，不该因为本机恰好配了皮肤表或可用模型而变红；需要皮肤功能的用例
-    （C77~C102）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
+    （C77~C106）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
     1.0.23 的 ``outfits_infer_unnamed``（「没说名字的那一套」）**默认 false**，
     与插件配置类的默认值一致（见 tests/check_import.py 的断言）。
     1.0.28 的穿着类型表 ``outfits.wear_types`` 同样**默认留空**（= 只用内置表），
@@ -920,6 +947,66 @@ COUNCIL_OUTFIT = (
     "学生会长制服 | 爱莉希雅 | student council uniform | 爱莉希雅的学生会长制服"
 )
 COUNCIL_REQUEST = "我想看你的学生会长制服"
+
+# ── 1.0.29（审计两修）用例的夹具 ──────────────────────────────────────
+#: C104：「我想看学生时代的花火～」——句式抓到候选 **学生时代**（前缀含「学生」，
+#: 本身不是穿着词）；1.0.28 的"包含匹配"会零模型调用地注入 school uniform。
+WEAR_ERA_REQUEST = "我想看学生时代的花火～"
+#: C104 的第二个样例（1.0.30 起**已经从"残留"变成"修好了"**）：「我想看学生会～」。
+#: 1.0.29 时候选在**句式抽取**那一层被虚词「会」截断成「学生」（`_OUTFIT_STOP_CHARS`），
+#: 于是以**相等**命中内置表的「学生」→ 仍然注入 school uniform。
+#: 1.0.30 把「会」从**句式抽取**的虚词里摘掉（`_OUTFIT_SENTENCE_STOP_CHARS`），
+#: 候选因此是完整的「学生会」→ 不命中任何键 → 走模型兜底 → 不注入。
+WEAR_COUNCIL_REQUEST = "我想看学生会～"
+#: C105/C106：**同一句**穿着请求（句式「穿X」抓到候选「婚纱」，同句提到爱莉），
+#: 只换"本张判定角色是谁"的那句更新的话 —— 一个该拦、一个不该拦（防误杀）。
+WEAR_OWNER_SENTENCE = "爱莉穿婚纱的样子"
+WEAR_RAIN_OWNER_SENTENCE = "爱莉穿雨衣的样子"
+#: 判定角色 = 流萤（与穿着归属「爱莉希雅」冲突 → C105 断言不注入）
+WEAR_JUDGE_OTHER_REQUEST = "画流萤吧"
+#: 判定角色 = 爱莉希雅（与穿着归属一致 → C106 断言正常注入）
+WEAR_JUDGE_SAME_REQUEST = "画爱莉希雅吧"
+#: 内置表里「婚纱 / 婚服 / 结婚礼服 / 新娘装」映射到的那组关键词（C105/C106）
+WEDDING_KEYWORDS = ("wedding dress", "bridal veil", "white dress")
+
+# ── 1.0.30（C104 端到端改法 + 同义写法 + 用户最新点名）用例的夹具 ──────
+#: C104 的单元级样例：**去掉「会」这个虚词之后的句式抽取**（见 C104 的说明）。
+#: 「我想看学生」这类**以键结尾**的写法照旧命中（相等 / 后缀口径一个字没改）。
+WEAR_COUNCIL_UNIT_CASES = {
+    "学生": True,
+    "学生装": True,
+    "学生服": True,  # 1.0.30 新补的同义写法（本身就是键）
+    "学生制服": True,  # 1.0.30 新补
+    "校服外套": True,  # 1.0.30 新补
+    "婚纱照": True,  # 1.0.30 新补
+    "居家服": True,
+    "泳衣": True,  # 本身是键
+    "泳衣套装": True,  # 1.0.30 新补
+    "睡衣套装": True,  # 1.0.30 新补
+    "婚服": True,
+    "和服": True,
+    "和服裙": True,  # 1.0.30 新补
+    "女仆装束": True,  # 1.0.30 新补
+    "护士服装": True,  # 1.0.30 新补
+    "西装外套": True,  # 1.0.30 新补
+    "运动服装": True,  # 1.0.30 新补
+    "旗袍裙": True,  # 1.0.30 新补
+    "居家服装": True,  # 1.0.30 新补
+    "婚纱裙": True,  # 1.0.30 新补
+    "穿学生装": True,  # 后缀命中
+    "我想看你的学生": True,  # 后缀命中
+    "男生学生": True,  # 后缀命中（"X + 键"的复合写法保留）
+    "学生会": False,  # 只有前缀含「学生」→ 不算命中
+    "学生时代": False,  # 同上
+    "我想看学生会": False,  # 把整句当候选传进来时同样不命中
+    "画花火吧": False,
+}
+#: C107/C108：用户**最新一条消息**里点名的角色（穿着那句话也提到爱莉，但与角色判定无关）
+LATEST_NAMED_OUTFIT_REQUEST = "画爱莉的婚纱～"
+#: C107/C108 里"上一条"那句（点的是流萤 —— 1.0.29 的粘性会把它一直按到下一张图）
+LATEST_NAMED_STICKY_REQUEST = "那画流萤吧"
+#: C108：画面描述里**已经写着流萤**的标签（1.0.19 的期望集合对账要替换掉它）
+FIREFLY_SCENE = f"{TAG_FIREFLY}, 银白色长发的少女站在镜头前，一身蓝裙，手里握着长杖"
 
 
 def natural_params(
@@ -4632,7 +4719,9 @@ async def run_cases() -> int:
     # ── C90 内置表的同义写法（泳衣 / 居家服）→ 各自命中并注入（1.0.28）────────
     # 需求追加：「内置穿着类型表要覆盖同义词，避免常见词白跑一次模型」——
     # 「泳衣」「居家服」都不在皮肤表里，但分别命中内置表的「泳衣」「居家服」
-    # （包含匹配：居家服 里含 居家，取**最长**的那个词 → 命中「居家服」）。
+    # （1.0.28 靠包含匹配；**1.0.29 起是相等命中** —— 表里本来就有这两个键，
+    #   所以这条用例的口径没变，变的只是匹配规则）。
+    # 断言一个字都没动（1.0.29 只改了上面这行注释里的规则说明）。
     try:
         cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
         cfg.general.history_cache_ttl = 0.0
@@ -5313,8 +5402,588 @@ async def run_cases() -> int:
             f"{type(e).__name__}: {e}",
         )
 
-    # ── C14/C15 需要真调小模型 ─────────────────────────────────────
+    # ── C104（1.0.30 重写）「学生会 / 学生时代」端到端不再注入校服 ──────────────
+    #
+    # 这条用例的历史（**1.0.30 的改法是抽取侧，不是放宽断言**）：
+    #   · 1.0.29 把 `find_wear_type` 的匹配口径从"包含"收紧成"相等或后缀"，
+    #     修好了「学生时代」；但「我想看学生会～」还是红 —— 候选在**句式抽取**那一步
+    #     就被虚词「会」截断成「学生」，而「学生」**恰好是内置表的键** → 相等命中 →
+    #     零模型调用注入 `school uniform, pleated skirt`。
+    #   · 1.0.29 的用例把这条**当成残留事实钉住**（`council_candidate == ["学生"]`）。
+    #   · 1.0.30 改的是**抽取侧**：句式抽取不再把「会」当虚词
+    #     （`outfit._OUTFIT_SENTENCE_STOP_CHARS`），候选因此是完整的「学生会」→
+    #     不等于任何键、也不以任何键结尾 → 不命中穿着类型表 → 走模型兜底
+    #     （假模型答 unknown）→ **什么都不注入**。
+    #   · 因此 `council_candidate` 的断言**按真实行为重写**为 `["学生会"]`，
+    #     其余断言（不注入 / 无穿着日志 / 走模型兜底 / 角色照旧补花火）一个字没改；
+    #     单元级样例表反而**加严**了（1.0.30 新补的 15 条同义写法全部要求命中）。
+    #     ⚠️ 这是"按最终真实可达到的行为重写"，**不是放宽**：改动前它断言的是
+    #     「仍然注入校服」这一 bug 的存在，改动后断言的是 bug 已被修掉。
+    try:
+        from ..character import parse_roster
+        from ..outfit import extract_outfit_names, find_wear_type, wear_type_table
 
+        # ★ 单元级：**本身是键**（相等）与**后缀**照旧命中，前缀 / 中缀不再命中
+        #   （find_wear_type 的第 2 参是 ``dict[str, WearTypeMatch]`` 的"条目表"；
+        #   省略时它自己按内置表 :data:`outfit.WEAR_TYPE_KEYWORDS` 拼同一张表 ——
+        #   这里显式传 ``wear_type_table("")`` = 与 handler._wear_types 同一形状）
+        wear_table = wear_type_table("")
+        strict = WEAR_COUNCIL_UNIT_CASES
+        strict_hits = {
+            word: find_wear_type(word, wear_table) is not None for word in strict
+        }
+        wrong = {word: hit for word, hit in strict_hits.items() if hit != strict[word]}
+
+        # ★ extract_outfit_names 的真实签名是 ``(text, entries, roster)``：第 2 / 3 参
+        #   要的是 **parse_outfits / parse_roster 解析出来的条目列表**，不是配置原文。
+        #   把配置原文（``RS3`` 是 str）当 roster 传进去 → ``_outfit_like`` → ``_in_roster``
+        #   去 ``for entry in roster`` 迭代字符串、对每个字符取 ``.name``
+        #   → ``AttributeError: 'str' object has no attribute 'name'``（C104 原来红在这里）。
+        #   handler._scan_outfit_names 传的就是解析后的角色表，这里与它对齐。
+        roster = parse_roster(RS3)
+
+        # ★ 端到端：候选是「学生时代」（**前缀**含「学生」，不是以它结尾）
+        #    → 不再命中内置表 → 按"两张表都没有"继续走模型兜底（假模型默认
+        #    unknown）→ 什么都不注入；日志里**没有** `穿着类型解析(内置表)`。
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_ERA_REQUEST)
+        params["stream_id"] = "s-c104"
+        with (
+            FakeOutfit() as stub,  # 默认 payload = {"unknown": True}
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        # 候选确实**包含**「学生」（不是空转）——这正是 1.0.28 会被吞掉的那个形状
+        # （第 2 参 ``[]`` = 不带皮肤表 → 拿**原始候选集**，与 handler 的
+        # ``extract_outfit_names(text, [], roster)`` 同一次调用）
+        era_candidate = extract_outfit_names(WEAR_ERA_REQUEST, [], roster)
+        # 1.0.30：抽取侧去掉虚词「会」之后，候选是**完整的**「学生会」
+        # （1.0.29 时这里是被截断的「学生」→ 相等命中 → 仍然注入）
+        council_candidate = extract_outfit_names(WEAR_COUNCIL_REQUEST, [], roster)
+        ok = (
+            not wrong  # ★ 相等 / 后缀命中，前缀 / 中缀不命中
+            and era_candidate == ["学生时代"]  # ★ 候选真的是「学生时代」
+            and all(keyword not in c for keyword in STUDENT_KEYWORDS)  # ★ 不注入
+            and "（穿着：" not in c
+            and "已追加穿着" not in records
+            and "穿着类型解析(内置表)" not in records  # ★ 没有零模型调用注入
+            and "穿着类型解析(内置表): 学生" not in records
+            and "穿着类型解析(内置表): 学生会" not in records  # 与上面两条同一件事
+            and stub.calls == ["学生时代"]  # 走了模型兜底（皮肤那条路）
+            and stub.wear_calls == []
+            and "皮肤解析(LLM)失败" in records  # 假模型默认 unknown → 什么都不注入
+            and "花火" in c  # 角色注入照旧（触发消息里点的是花火 → decided=[花火]）
+            # 1.0.30：句式抽取与候选过滤**共用同一张虚词表**（``_OUTFIT_STOP_CHARS`` /
+            # ``_OUTFIT_SENTENCE_STOP_CHARS``，两边都不把「会」当边界），所以候选是
+            # **完整的**「学生会」—— 与上面 era_candidate 同一形状，**不是**被过滤阶段
+            # 整条丢掉的 ``[]``（``[]`` 是"只改句式抽取那一侧"时的中间态，见 README
+            # 「两张表必须一起改」与 docs 的 1.0.30 ①）。断言按真实可达行为对齐，
+            # **不是放宽**：改动前钉的是"候选被截断成 学生 → 误命中 → 误注入"，
+            # 改动后钉的是"候选是完整的 学生会 → 不等于任何键、也不以任何键结尾
+            # → 不命中穿着类型表 → 不误注入"；真正要守的安全属性由上面几条端到端断言
+            # （不注入 / 无穿着类型日志 / 走模型兜底）覆盖。
+            and council_candidate == ["学生会"]
+        )
+        check(
+            "C104 学生会 / 学生时代都不再被当成穿着（抽取侧修掉虚词截断）",
+            ok,
+            f"单元命中 = {strict_hits!r}（不符 = {wrong!r}）\n"
+            f"        候选(学生时代) = {era_candidate!r} / 候选(学生会) = "
+            f"{council_candidate!r}\n        content = {c!r}\n"
+            f"        调用 = 皮肤{stub.calls!r} / 穿着{stub.wear_calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C104 学生会 / 学生时代都不再被当成穿着（抽取侧修掉虚词截断）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C105（1.0.29 审计修 2）穿着也做归属校验：爱莉的婚纱贴不到流萤身上 ───────
+    # 独立只读审计：用户说「画爱莉的婚纱」而本张判定角色是**流萤**时，② / ④ 产出的
+    # `ResolvedOutfit.character` 恒为空 → `_apply_outfit` 的归属校验（1.0.26 起只对
+    # 皮肤那条路生效）不触发 → 婚纱照旧贴到流萤身上（1.0.27 的皮肤那条路会因
+    # hint=爱莉被拦）。1.0.29 起：线索由 `_wear_character_hint` 从**说这句话的那条
+    # 消息**里取（唯一才填），归属校验对穿着同样生效 → 不注入 + WARNING。
+    #
+    # 两句用户话的分工（这样才真的复现审计场景）：「爱莉穿婚纱的样子」是**穿着**那句
+    # 话（句式「穿X」抓到候选「婚纱」，同句提到爱莉），判定角色由**更新**的那句给出
+    # （「画流萤吧」→ 主题跟踪 = 流萤 → decided=[流萤]）。
+    # ② 与 ④ 两条路各跑一遍：婚纱是内置表的键（零模型调用），雨衣要问一次模型。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        for (
+            label,
+            sentence,
+            wear_payload,
+            keywords,
+            wear_calls,
+            resolve_log,
+            skip_log,
+        ) in (
+            (
+                "② 穿着类型表（婚纱）",
+                WEAR_OWNER_SENTENCE,
+                None,
+                WEDDING_KEYWORDS,
+                [],
+                "穿着类型解析(内置表): 婚纱 → wedding dress, bridal veil, white dress",
+                "穿着跳过：穿着「婚纱」属于「爱莉希雅」，但本张判定角色是「流萤」",
+            ),
+            (
+                "④ 穿着模型解析（雨衣）",
+                WEAR_RAIN_OWNER_SENTENCE,
+                WEAR_PAYLOAD,
+                WEAR_KEYWORDS,
+                ["雨衣"],
+                "穿着解析(模型): 雨衣 → raincoat, hood",
+                "穿着跳过：穿着「雨衣」属于「爱莉希雅」，但本张判定角色是「流萤」",
+            ),
+        ):
+            params = natural_params(PINK_SCENE, text="嗯～")
+            params["stream_id"] = f"s-c105-{label}"
+            with (
+                FakeOutfit(wear_payload=wear_payload) as stub,
+                FakeHistory(
+                    [
+                        history_message(sentence, 20.0),
+                        history_message(WEAR_JUDGE_OTHER_REQUEST, 1.0),
+                    ]
+                ),
+                LogCapture() as logs,
+            ):
+                out = await fire(cfg, params)
+            content = out["args"]["content"]
+            records = logs.records_text()
+            hit = (
+                all(keyword not in content for keyword in keywords)  # ★ 没有注入
+                and "（穿着：" not in content
+                and "已追加穿着" not in records
+                and resolve_log in records  # ★ 穿着**确实解析出来了**（不是空转）
+                and skip_log in records  # ★ 归属冲突 → 告警写明"属于谁 / 判定是谁"
+                and "流萤" in content  # ★ 判定角色照旧注入（decided 真是流萤）
+                and "爱莉希雅" not in content
+                and stub.calls == []
+                and stub.wear_calls == wear_calls
+            )
+            runs.append(
+                (
+                    label,
+                    hit,
+                    (
+                        f"content={content!r} 调用=皮肤{stub.calls!r}/穿着"
+                        f"{stub.wear_calls!r} 日志={records!r}"
+                    ),
+                )
+            )
+        check(
+            "C105 穿着归属校验：属于爱莉希雅的婚纱 / 雨衣在判定=流萤时不注入并告警",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C105 穿着归属校验：属于爱莉希雅的婚纱 / 雨衣在判定=流萤时不注入并告警",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C106（防误杀）同一句穿着请求 + 判定角色与归属一致 → 照常注入 ────────────
+    # 与 C105 只差"更新那句话里的名字"：判定角色 = 爱莉希雅 = 穿着归属 →
+    # 归属校验**不该**触发（否则 1.0.29 会把"本人穿自己的婚纱"也一起拦掉）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text="嗯～")
+        params["stream_id"] = "s-c106"
+        with (
+            FakeOutfit() as stub,
+            FakeHistory(
+                [
+                    history_message(WEAR_OWNER_SENTENCE, 20.0),
+                    history_message(WEAR_JUDGE_SAME_REQUEST, 1.0),
+                ]
+            ),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in WEDDING_KEYWORDS)  # ★ 照常注入
+            and "（穿着：“婚纱”：wedding dress, bridal veil, white dress）" in c
+            and "穿着跳过" not in records  # ★ 归属一致 → 不拦
+            and "已追加穿着（share_visual / natural）: 婚纱 → wedding dress, "
+            "bridal veil, white dress" in records
+            and "爱莉希雅" in c  # 判定角色照旧注入
+            and stub.calls == []  # ② 命中内置表：0 次模型调用
+            and stub.wear_calls == []
+        )
+        check(
+            "C106 防误杀：判定角色与穿着归属一致（爱莉希雅）→ 照常注入婚纱",
+            ok,
+            f"content = {c!r}\n        调用 = 皮肤{stub.calls!r} / 穿着"
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C106 防误杀：判定角色与穿着归属一致（爱莉希雅）→ 照常注入婚纱",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C107（1.0.30 产品需求）「最新一条消息里点名的角色」= 最高优先 ──────────
+    # 用户场景（需求原话）：
+    #     你：那画流萤吧
+    #     你：画爱莉的婚纱～
+    # 用户要的是**按他最新说的角色来画** —— 1.0.30 新增信号
+    # `handler._latest_named_entry`：触发消息没点名时，取**触发前最近 1 条用户消息**
+    # 里明确写出的角色表内角色（恰好 1 个才采用），作为**最高优先**压过粘性与代词回指。
+    # 本用例断言：判定角色=爱莉希雅、穿着走内置表零模型调用、**正常注入**婚纱关键词。
+    #
+    # 1.0.30 修这条用例时查清的两件事（都是**代码侧**修的，断言一条都没放宽）：
+    #   ① 穿着那一层原本**识别不到**「画爱莉的婚纱～」里的「婚纱」（七条句式里没有
+    #      「X 的 Y」这种归属写法）→ 判定改对了、衣服却还是没注入。修法：新增
+    #      `outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`（词表 = 内置穿着类型表的键 +
+    #      "后面不再接名字字符"的边界，见那一处的说明）。
+    #   ② 断言里的 `优先于主题跟踪:流萤` 与实现不符：**括号里写的是"原来会生效的那个
+    #      结论"，而不是写死的名字**（`handler._overtaken_conclusion` 用同一套代码算
+    #      出来，只进日志）。本 fixture 的窗口里 `画爱莉的婚纱～` 就是**最新**那条点名
+    #      消息，主题跟踪自己也落在爱莉希雅（`换人还是追加不确定`）—— 所以这里断言
+    #      `优先于主题跟踪:爱莉希雅` 与 `换人还是追加不确定`：语义没放宽（判定仍是
+    #      爱莉希雅、婚纱照旧正常注入、无 `穿着跳过`），只是把日志文案对齐实现。
+    #      真实事故里被压过的确实是上一条粘住的流萤（C105/C106 守的就是那个场景）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text="嗯～")
+        params["stream_id"] = "s-c107"
+        with (
+            FakeOutfit() as stub,
+            FakeHistory(
+                [
+                    history_message(LATEST_NAMED_STICKY_REQUEST, 2.0),
+                    history_message(LATEST_NAMED_OUTFIT_REQUEST, 1.0),
+                ]
+            ),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        wear_line = (
+            "穿着类型解析(内置表): 婚纱 → wedding dress, bridal veil, white dress"
+        )
+        ok = (
+            all(keyword in c for keyword in WEDDING_KEYWORDS)  # ★ 正常注入（不再跳过）
+            and "（穿着：“婚纱”：wedding dress, bridal veil, white dress）" in c
+            and "穿着跳过" not in records  # ★ 归属校验没有拦它
+            and "已追加穿着（share_visual / natural）: 婚纱" in records
+            and "爱莉希雅" in c  # ★ 判定角色 = 最新那条消息里点的爱莉希雅
+            and "流萤" not in c  # 不再是上一条的流萤
+            and "判定依据=用户点名(最新消息):爱莉希雅" in records  # ★ 依据写明来源
+            # ★ 日志同时写明"被压过的那个结论"（README 里那一行的形状：
+            # `判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:…）`）。
+            # **名字按本次 fixture 的真实结论写**：本 fixture 的窗口里
+            # `画爱莉的婚纱～`（1 分钟前）是**最新**那条点名消息，主题跟踪自己也
+            # 落在爱莉希雅（`换人还是追加不确定`）；真实事故里被压过的是上一条
+            # 粘住的流萤 —— 括号里写的永远是"原来会生效的那个结论"，不是写死的名字。
+            and "优先于主题跟踪:爱莉希雅" in records  # ★ 日志能看出压过了谁
+            and "换人还是追加不确定" in records  # ★ 写明了压过的是什么状态
+            and wear_line in records
+            and stub.calls == []  # ① 皮肤表未命中、② 内置表命中 → 0 次模型调用
+            and stub.wear_calls == []
+        )
+        check(
+            "C107 用户最新点名优先：画爱莉的婚纱 → 判定爱莉希雅并正常注入婚纱",
+            ok,
+            f"content = {c!r}\n        调用 = 皮肤{stub.calls!r} / 穿着"
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C107 用户最新点名优先：画爱莉的婚纱 → 判定爱莉希雅并正常注入婚纱",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C108（1.0.30 产品需求）同一场景 + 画面已点名别的角色 → fix 替换 ─────────
+    # 与 C107 同一个判定（爱莉希雅），但**画面描述里已经写着流萤的标签**
+    # （`firefly \(honkai: star rail\)`，就是调用方那份过期备忘的典型形状）。
+    # 判定链走到「描述点名」那一档之后，1.0.19 的**期望集合对账**发现：
+    # 画面里的流萤**不在**期望集合（本次判定=爱莉希雅）里 → 冲突；
+    # `consistency_check="fix"` 且两侧都唯一 → 把画面里的流萤标签**替换**成爱莉希雅。
+    # 日志一眼能看出「用户最新说的人 ≠ 画面里的人」：判定依据行带
+    # `优先于主题跟踪:<原来会生效的那个结论>`（本 fixture 里同样是爱莉希雅，
+    # 见 C107 的说明），告警行写的是
+    # `画面标签=流萤…但上下文/记忆指向=爱莉希雅`。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        # 与 C38/C39/C64/C65 同一口径：隔离"标签补全"，只看一致性检测本身
+        cfg.general.tag_completion = False
+        params = natural_params(FIREFLY_SCENE, text="嗯～")
+        params["stream_id"] = "s-c108"
+        with (
+            FakeOutfit() as stub,
+            FakeHistory(
+                [
+                    history_message(LATEST_NAMED_STICKY_REQUEST, 2.0),
+                    history_message(LATEST_NAMED_OUTFIT_REQUEST, 1.0),
+                ]
+            ),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            TAG_FIREFLY not in c  # ★ 画面里那个过期标签被替换掉
+            and TAG_ELYSIA in c  # ★ 换成本次判定角色的标准标签
+            and "爱莉希雅" in c
+            and "一致性检查=冲突已修正（fix）" in records  # ★ 冲突被认出来并修正
+            and "判定依据=用户点名(最新消息):爱莉希雅" in records
+            # ★ 与 C107 同一处口径：括号里写的是"原来会生效的那个结论"
+            # （本 fixture 的主题跟踪结论也是爱莉希雅 —— 见 C107 的说明）
+            and "优先于主题跟踪:爱莉希雅" in records
+            and all(keyword in c for keyword in WEDDING_KEYWORDS)  # 穿着照旧注入
+            and "穿着跳过" not in records
+            and stub.calls == []
+            and stub.wear_calls == []
+        )
+        check(
+            "C108 用户最新点名优先：画面已点名流萤时 fix 替换为爱莉希雅",
+            ok,
+            f"content = {c!r}\n        调用 = 皮肤{stub.calls!r} / 穿着"
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C108 用户最新点名优先：画面已点名流萤时 fix 替换为爱莉希雅",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C109（1.0.30 闸门①）追加语义不抢：新信号不采用，退回「本条 + 上一条」──
+    # 与 C35 **同一个场景、同一个结果**（「还有伊甸，一起画」→ 伊甸 + 上一条的爱莉希雅），
+    # 只是把"新信号会不会抢走它"也钉住：日志里**不出现** `判定依据=用户点名(最新消息)`，
+    # 走的是主题跟踪的追加分支（轨迹里有 `[追加]`）。
+    # 为什么必须单独一条：闸门①没加时，这条信号会认为"最新一条里恰好 1 个角色 = 伊甸"，
+    # 于是**只补伊甸**、把上一条点名的爱莉希雅丢掉（C35 就是这么红的）。
+    try:
+        cfg = make_config()
+        cfg.general.history_cache_ttl = 0.0
+        history = [history_message("画爱莉希雅", 1.0)]
+        with FakeHistory(history), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_drawing",
+                    "action_name": "share_drawing",
+                    "args": {"content": "画一张战斗场景"},
+                    "message": FakeMessage("还有伊甸，一起画"),
+                    "stream_id": "s-c109",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "伊甸" in c and "爱莉希雅" in c  # ★ 与 C35 同结果：本条 + 上一条都补
+            and "判定依据=用户点名(最新消息)" not in debugs  # ★ 新信号没有接管
+            and "[追加]" in debugs  # ★ 交回主题跟踪的"追加语义"分支
+        )
+        check(
+            "C109 追加语义（还有/一起）→ 用户最新点名不采用，退回「本条 + 上一条」",
+            ok,
+            f"content = {c!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C109 追加语义（还有/一起）→ 用户最新点名不采用，退回「本条 + 上一条」",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C110（1.0.30 闸门②）疑问句 / 自我指代不抢：交回原判定链 ──────────────
+    # 两跑：
+    #   A. 疑问语气（与 C42 同一个场景「是爱莉还是你？」）→ 结果与 C42 一致：
+    #      LLM 仲裁说花火就是花火，新信号不接管；
+    #   B. 自我指代（「你自己也来一张～」）→ 新信号不接管，交给"本尊 vs 壳"那条链路
+    #      （这里取不到本尊身份 → 不补，内容保持原样）。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+
+        async def fake_extract(**kwargs):
+            # 模拟"LLM 读了画面描述与上文后给出的结论"：这次要画的是花火
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
+                ],
+                multi=False,
+            )
+
+        runs: list[tuple[str, bool, str]] = []
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            # A. 疑问句：与 C42 同一句、同一条上文（1 分钟前点过爱莉希雅）
+            with FakeHistory([history_message("画爱莉希雅", 1.0)]), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_drawing",
+                        "action_name": "share_drawing",
+                        "args": {"content": "画一张战斗场景"},
+                        "message": FakeMessage("是爱莉还是你？"),
+                        "stream_id": "s-c110-a",
+                    },
+                )
+            c = out["args"]["content"]
+            debugs = logs.debugs()
+            runs.append(
+                (
+                    "A 疑问句",
+                    "花火" in c
+                    and "爱莉希雅" not in c
+                    and "LLM 仲裁" in debugs  # ★ 与 C42 同结果
+                    and "判定依据=用户点名(最新消息)" not in debugs,  # ★ 新信号没有接管
+                    f"content={c!r} 日志={debugs!r}",
+                )
+            )
+
+            # B. 自我指代：新信号不接管 → 走「本尊 vs 壳」那条链路（取不到本尊身份
+            #    就不补，也不问 LLM —— 与 1.0.13 起的行为一致）
+            raw = "画一张战斗场景"
+            with FakeHistory([history_message("画爱莉希雅", 1.0)]), LogCapture() as logs:
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_drawing",
+                        "action_name": "share_drawing",
+                        "args": {"content": raw},
+                        "message": FakeMessage("你自己也来一张～"),
+                        "stream_id": "s-c110-b",
+                    },
+                )
+            c = out["args"]["content"]
+            debugs = logs.debugs()
+            runs.append(
+                (
+                    "B 自我指代",
+                    c == raw
+                    and "爱莉希雅" not in c
+                    and "判定依据=用户点名(最新消息)" not in debugs,  # ★ 新信号没有接管
+                    f"content={c!r} 日志={debugs!r}",
+                )
+            )
+        finally:
+            handler_module.extract_characters_via_llm = original
+
+        check(
+            "C110 疑问句 / 自我指代 → 用户最新点名不采用（疑问句交 LLM 仲裁）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C110 疑问句 / 自我指代 → 用户最新点名不采用（疑问句交 LLM 仲裁）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C111（1.0.30 闸门③）引用块 / 媒体块里的文字不算「用户最新点名」──────
+    # 两跑（与 C43 同一份事故原文）：
+    #   A. 整条消息就是引用块 + 图片块 → 清洗后**没有正文** → 判定依据=无(不补)，
+    #      内容一字不改（这就是 C43 的场景，新信号原本会从引用块里抢走「爱莉」）；
+    #   B. 正文 + 引用块混在一起：「画爱莉希雅吧[回复<…>：是花火还是流萤？][图片(xxx)]」
+    #      → 清洗后正文仍是「画爱莉希雅吧」→ 新信号照常生效（爱莉希雅），
+    #      引用块里的花火 / 流萤一个字都不参与（证明清洗只剥块、不剥正文）。
+    try:
+        cfg = make_config(roster=RS3, use_llm=False)
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        raw = "白发少女站在镜头前"
+
+        # A. 与 C43 完全同一份事故原文
+        trigger_a = (
+            "[回复<的饮水思源(2224****93)>：那你告诉我，是爱莉还是你？][图片(xxx)]"
+        )
+        with FakeHistory([]), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage(trigger_a),
+                    "stream_id": "s-c111-a",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        runs.append(
+            (
+                "A 整条都是引用/图片块",
+                c == raw
+                and "爱莉希雅" not in c
+                and "判定依据=无(不补)" in debugs  # ★ 与 C43 同结果
+                and "判定依据=用户点名(最新消息)" not in debugs,  # ★ 新信号没有接管
+                f"content={c!r} 日志={debugs!r}",
+            )
+        )
+
+        # B. 正文 + 引用块：清洗只剥块，正文照旧算点名
+        trigger_b = "画爱莉希雅吧[回复<某人>：是花火还是流萤？][图片(xxx)]"
+        with FakeHistory([]), LogCapture() as logs:
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": raw},
+                    "message": FakeMessage(trigger_b),
+                    "stream_id": "s-c111-b",
+                },
+            )
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        runs.append(
+            (
+                "B 正文 + 引用块",
+                "爱莉希雅" in c  # ★ 清洗后的正文照常点名
+                and "判定依据=用户点名(最新消息):爱莉希雅" in debugs
+                and "花火" not in c
+                and "流萤" not in c,  # ★ 引用块里的名字不参与
+                f"content={c!r} 日志={debugs!r}",
+            )
+        )
+        check(
+            "C111 引用/图片块里的名字不算用户最新点名（正文照旧算）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C111 引用/图片块里的名字不算用户最新点名（正文照旧算）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C14/C15 需要真调小模型 ─────────────────────────────────────
     if RUN_LLM:
         try:
             from src.core.config.model_config import init_model_config

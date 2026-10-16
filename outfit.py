@@ -52,8 +52,10 @@
   含常见同义写法：``学生`` / ``学生装`` / ``校服`` / ``JK`` / ``水手服`` →
   ``school uniform, pleated skirt``），用户可在 ``[outfits] wear_types`` 里
   按同样写法补充 / 覆盖（同名覆盖内置，见 :func:`wear_type_table`）；
-- **识别** :func:`find_wear_type`：候选**包含**表中某个词即命中（``学生装`` /
-  ``居家服`` / ``泳衣``），多个词命中时取**最长**的那个；**具体皮肤名优先**
+- **识别** :func:`find_wear_type`：候选**本身是**表中某个词、或**以它结尾**即命中
+  （``学生装`` / ``居家服`` / ``泳衣`` / ``穿学生装``；**1.0.29 起收紧** —— 1.0.28
+  是"包含即命中"，``学生会`` / ``学生时代`` 会被吞掉），多个词命中时取**最长**的
+  那个；**具体皮肤名优先**
   由调用方（``handler._resolve_outfit``：皮肤表 → 穿着类型 → 模型）保证，
   所以皮肤表里的「学生会长制服」不会被拆成"学生装"；
 - **模型兜底** :func:`looks_like_wear` / :func:`looks_like_wear_sentence` 认出
@@ -63,6 +65,36 @@
 - 校验口径与皮肤解析**完全相同**（:func:`parse_outfit_resolution_payload`：
   只收小写 ASCII 关键词，``unknown`` / JSON 坏 / ``confidence < 0.5`` /
   没有可用关键词 → **什么都不注入**），日志 ``穿着解析(LLM)失败：<原因>``。
+
+**1.0.30 修 C104 的端到端**（「我想看学生会～」仍被注入 ``school uniform``）——
+两条路都试过，最终选的是**改动更小的 A**：
+
+- **思路 A（采用）**：把 ``会`` 从虚词里摘出来，**两张虚词表合并成一张**
+  （:data:`_OUTFIT_STOP_CHARS` / :data:`_OUTFIT_SENTENCE_STOP_CHARS` /
+  :data:`_OUTFIT_SENTENCE_NAME_CLASS`）。
+  「我想看学生会～」的候选因此是完整的 ``学生会``（既不被句式抽取截断、也不会在
+  **候选过滤**那一步被整条丢掉），它既不是表中的键、也不以任何键结尾 → ② 不命中
+  → 走 ③/④ 模型兜底，模型答 ``unknown`` 就**什么都不注入**（= 1.0.27 的行为）；
+- **思路 B（评估后未采用）**：给 :func:`find_wear_type` 加"边界判据"——候选在原文里
+  的下一个字符是 CJK 字母就不算命中。**会误伤正常写法**：``她穿学生装的样子``
+  里 ``学生装`` 后面紧跟的「的」也是 CJK 字母，整条就会被判成"被截断的长词"，
+  于是「学生装」「婚纱」这类**明确命中**的说法反而要去问一次模型（C89/C90/C105/C106
+  都会因此变红）。要做到不误伤就得再引入"哪些字允许跟在衣服名后面"的白名单，
+  等于把复杂度搬了个地方 —— 所以走 A。
+  两条思路都只在**抽取侧**动，:func:`find_wear_type` 的"相等或后缀"口径一个字未改。
+
+**1.0.30 补上「归属句式」**（``…的婚纱`` / ``…的居家服``）：用户说
+「画爱莉的婚纱～」时，「婚纱」不符合七条句式里的任何一条，穿着这一层原本**什么都
+识别不到**（C107/C108 卡住的地方）。:data:`_OUTFIT_POSSESSIVE_WEAR_PATTERN`
+用**内置穿着类型表的键**当词表、并加一个"后面不再接名字字符"的边界，
+把这条说法补齐（``的学生会长制服`` 不会被拆出 ``学生``，C91 守的就是这条）。
+
+**1.0.30 顺手补上 1.0.29 的残余盲区**：``学生服`` / ``学生制服`` / ``校服外套`` /
+``校服裙`` / ``婚纱照`` / ``婚纱裙`` / ``和服裙`` / ``泳衣套装`` / ``居家服装`` /
+``女仆装束`` / ``护士服装`` / ``西装外套`` / ``运动服装`` / ``旗袍裙`` / ``睡衣套装``
+各自成为 :data:`WEAR_TYPE_KEYWORDS` 里的一条键 —— 这些写法在"相等或后缀"口径下
+本来就命中，但命中的是**较短的键**（``学生服`` 会被 ``制服`` 抢成军装风），
+补成独立词条之后日志写的是用户的原话、关键词也确定，而且又是**零模型调用**。
 """
 
 from __future__ import annotations
@@ -219,15 +251,47 @@ _PUNCT_CHARS = "，。！？；：、,.!?;:…～~·「」『』《》‘’“�
 #: 句式模式没有引号那种"这是一个名字"的显式信号，不加这一道就会把整句话
 #: （「我想看你的漂亮衣服」抓成「你的漂亮衣服」）当成皮肤名 —— 与 ``character``
 #: 的「表外点名」同一思路：**宁少勿多**（漏了只是不注入，抓错会把衣服画错）。
+#:
+#: **1.0.30：``会`` 不再算虚词，而且句式抽取与候选过滤**共用这一张表**
+#: （见 :data:`_OUTFIT_SENTENCE_STOP_CHARS`）。原先只有句式抽取去掉 ``会``、
+#: 过滤这一侧仍把它当虚词，结果是：「我想看学生会～」的候选虽然是完整的
+#: ``学生会``，却会在**过滤**那一步被整条丢掉（``extract_outfit_names`` 返回空
+#: 列表）—— 与"候选是完整的 ``学生会``"这个目标行为不一致（C104 的
+#: ``council_candidate == ["学生会"]`` 就是这么红的）。两张表统一之后：
+#: ``学生会`` 通过过滤 → 它不等于任何键、也不以任何键结尾 → 不命中穿着类型表
+#: → 落到 ③/④ 模型兜底（模型答 ``unknown`` 就什么都不注入）。
+#:
+#: 代价（有意的取舍）：含 ``会`` 的候选（``学生会`` / ``学生会长`` …）现在会走到
+#: 模型那一层，而不是在过滤阶段被静默丢掉 —— 多一次"看起来像穿着"的模型调用，
+#: 换"候选与用户原话一致"；命中穿着类型表仍要求**相等或后缀**
+#: （:func:`find_wear_type`），所以 ``学生会`` 这类**永远不会**零模型调用地注入校服。
 _OUTFIT_STOP_CHARS = (
     "的了着过吧吗呢啊呀哦嘛呗啦咯喔"
     "我你您他她它这那哪谁什么"
-    "是没能会想来看去用把被和与跟"
+    "是没能想来看去用把被和与跟"
     "有又也都就还再很太更个张只些点们"
 )
 
-#: 句式模式里的 ``X``：2~16 个「非标点、非空白、非虚词」字符。
+#: 句式模式里的 ``X``（**表外候选的过滤**口径）：2~16 个「非标点、非空白、非虚词」字符。
+#: **1.0.30 起与句式抽取用的是同一张虚词表**（见 :data:`_OUTFIT_STOP_CHARS`）。
 _OUTFIT_NAME_CLASS = "[^" + re.escape(_PUNCT_CHARS + _OUTFIT_STOP_CHARS) + r"\s]"
+
+#: **1.0.30**：句式抽取专用的虚词表。
+#:
+#: 1.0.29 时它比 :data:`_OUTFIT_STOP_CHARS` 少一个 ``会``（句式抽取不把 ``会``
+#: 当边界，于是「我想看学生会～」抽到的是完整的 ``学生会``），但候选**过滤**那一侧
+#: 仍把 ``会`` 当虚词，完整的候选随后被丢掉。1.0.30 把两张表**统一**
+#: （``_OUTFIT_STOP_CHARS`` 也不再含 ``会``），这里因此与它**完全相等**；
+#: 保留这个名字是为了让"句式这一侧用哪张表"在代码里仍然显式可见
+#: （回归用例 C104 同时钉住 ``council_candidate == ["学生会"]`` 与既有命中，
+#: 例如 ``学生装`` / ``校服`` / ``居家服``）。
+_OUTFIT_SENTENCE_STOP_CHARS = _OUTFIT_STOP_CHARS
+
+#: 句式抽取用的 ``X`` 字符类：与 :data:`_OUTFIT_NAME_CLASS` 同一份字符集
+#: （见 :data:`_OUTFIT_SENTENCE_STOP_CHARS`）。
+_OUTFIT_SENTENCE_NAME_CLASS = (
+    "[^" + re.escape(_PUNCT_CHARS + _OUTFIT_SENTENCE_STOP_CHARS) + r"\s]"
+)
 
 #: 皮肤名候选**允许**出现的字符：字母 / 数字 / 汉字 / 日文假名 / 韩文 / 中点。
 #: 要求**整体匹配**：候选里只要出现别的字符（空白、标点、括号）就不算皮肤名。
@@ -243,18 +307,28 @@ _OUTFIT_QUOTED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\"([^\"\n]{2,40})\""),
 )
 
-#: 句式模式（需求里点名的七种说法，``X`` = :data:`_OUTFIT_NAME_CLASS` 的 2~16 次）。
+#: 句式模式（需求里点名的七种说法，``X`` = :data:`_OUTFIT_SENTENCE_NAME_CLASS` 的 2~16 次）。
 #:
 #: 顺序有意从具体到宽泛：``我想看你的X`` 在 ``我想看X`` 前面，``你的`` 里的「你」
 #: 又是虚词字符，因此「我想看你的粉色妖精小姐」只会抓到皮肤名本身。
+#:
+#: **1.0.30**：这一组用 :data:`_OUTFIT_SENTENCE_NAME_CLASS` —— 与
+#: :data:`_OUTFIT_NAME_CLASS` 是**同一份字符集**（两边都不把 ``会`` 当虚词），
+#: 见 :data:`_OUTFIT_SENTENCE_STOP_CHARS` 的说明。
 _OUTFIT_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"我想看(?:看)?你的({_OUTFIT_NAME_CLASS}{{2,16}})"),
-    re.compile(rf"看看你的({_OUTFIT_NAME_CLASS}{{2,16}})"),
-    re.compile(rf"穿上?({_OUTFIT_NAME_CLASS}{{2,16}})"),
-    re.compile(rf"换上({_OUTFIT_NAME_CLASS}{{2,16}})"),
-    re.compile(rf"({_OUTFIT_NAME_CLASS}{{2,16}})(?:这|那)(?:一)?套"),
-    re.compile(rf"({_OUTFIT_NAME_CLASS}{{2,16}})(?:皮肤|时装|衣服|裙子|装扮|造型)"),
-    re.compile(rf"我想看({_OUTFIT_NAME_CLASS}{{2,16}})"),
+    re.compile(
+        rf"我想看(?:看)?你的({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})"
+    ),
+    re.compile(rf"看看你的({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})"),
+    re.compile(rf"穿上?({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})"),
+    re.compile(rf"换上({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})"),
+    re.compile(
+        rf"({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})(?:这|那)(?:一)?套"
+    ),
+    re.compile(
+        rf"({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})(?:皮肤|时装|衣服|裙子|装扮|造型)"
+    ),
+    re.compile(rf"我想看({_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}})"),
 )
 
 #: 候选黑名单：指代词 / 泛指 / 画面元素本身（皮肤名不可能长这样）。
@@ -408,8 +482,14 @@ def extract_outfit_names(
     2. **句式模式**：``我想看(看)?你的X`` / ``看看你的X`` / ``穿(上)?X`` / ``换上X`` /
        ``X这套|这一套`` / ``X(皮肤|时装|衣服|裙子|装扮|造型)`` / ``我想看X``
        （``X`` = 2~16 个非标点、非空白、非虚词字符）；
-    3. **过滤**：长度 2~16、整体是名字字符、不含虚词字符、不命中黑名单、
-       不是「衣服/皮肤」这类通用词、**不在角色表里**（那些归角色逻辑）；
+    2.5 **归属句式**（**1.0.30 新增**）：``…的<穿着词>`` —— 词表就是内置穿着类型表的
+       键（见 :data:`_OUTFIT_POSSESSIVE_WEAR_PATTERN`）。用户说「画爱莉的婚纱～」时
+       「婚纱」既不在皮肤表里、也不符合上面七条句式里的任何一条，穿着这一层会**什么
+       都识别不到** ── 这条句式把它补上（回归用例 C107/C108）；
+    3. **过滤**：长度 2~16、整体是名字字符、不含虚词字符（**1.0.30 起与句式抽取共用
+       同一张虚词表** —— 两边都不把 ``会`` 当虚词，否则「我想看学生会～」的完整候选
+       ``学生会`` 会在这一步被整条丢掉，见 :data:`_OUTFIT_STOP_CHARS`）、
+       不命中黑名单、不是「衣服/皮肤」这类通用词、**不在角色表里**（那些归角色逻辑）；
     4. **皮肤表命中优先**：只要有候选命中 ``entries``（大小写 / 空白不敏感，
        允许只写一部分：「粉色妖精」→「粉色妖精小姐」），就**只**返回这些候选 ——
        表是用户自己维护的确定答案，比表外的自由文本更可信。
@@ -446,6 +526,13 @@ def extract_outfit_names(
     for pattern in _OUTFIT_SENTENCE_PATTERNS:
         for match in pattern.finditer(text):
             add(match.group(1))
+    # 1.0.30：归属句式「…的婚纱 / …的居家服」（见
+    # :data:`_OUTFIT_POSSESSIVE_WEAR_PATTERN`）—— 「画爱莉的婚纱～」这类说法
+    # 因此也能被识别到（否则穿着这一层会整个漏掉它）。抓到的候选一定是**表里的键**，
+    # 所以这里不需要再做"像不像名字"的猜测：命中穿着类型表仍由
+    # :func:`find_wear_type` 的"相等或后缀"口径把关。
+    for match in _OUTFIT_POSSESSIVE_WEAR_PATTERN.finditer(text):
+        add(match.group(1))
     if not raw:
         return []
 
@@ -627,20 +714,33 @@ def validate_outfit_tag(tag: str) -> tuple[bool, str]:
 #: 内置的「穿着类型 → 英文关键词」表（1.0.28）。
 #:
 #: 键是**中文词**（用户会说的那种），值是 2~5 个**小写 ASCII** 英文关键词，风格与
-#: 皮肤关键词一致（写成 NovelAI / Danbooru 能直接用的外观词）。匹配是**包含**式的
-#: （:func:`find_wear_type`）：候选里出现该词就算命中（``学生装`` / ``居家服`` /
-#: ``泳衣``），因此这里只放"指向明确、不会与具体皮肤名混淆"的词 —— **宁缺勿滥**。
+#: 皮肤关键词一致（写成 NovelAI / Danbooru 能直接用的外观词）。匹配口径是
+#: **相等或后缀**（:func:`find_wear_type`，1.0.29 起收紧）：候选**本身就是**该词
+#: （``学生装`` / ``居家服`` / ``泳衣``）或以它**结尾**（``穿学生装``）才算命中 ——
+#: 只是"候选里出现该词"不算，否则「学生会」「学生时代」也会被当成穿着。
+#: 因此这里只放"指向明确、不会与具体皮肤名混淆"的词 —— **宁缺勿滥**。
 #:
 #: 常见**同义写法**都列进来了（``学生`` / ``学生装`` / ``校服`` / ``JK`` / ``水手服``
 #: 映射到同一组关键词），免得同一个意思换个说法就白跑一次模型；命中的是**最长的**
 #: 那个词，所以日志里写的是用户实际说的那个（``穿着类型解析(内置表): 学生装 → …``）。
 #: 用户可以按同样的写法在 ``[outfits] wear_types`` 里补充 / 覆盖（同名覆盖内置，
 #: 见 :func:`wear_type_table`）。
+#:
+#: **1.0.30 补上 15 条常见同义写法**（``学生服`` / ``校服外套`` / ``婚纱照`` …）：
+#: 这些写法在 1.0.29 的"相等或后缀"口径下**本来就命中**（它们都以表中的某个键结尾），
+#: 但命中的是那个**较短的键**，日志里写的是键名而不是用户的原话，且容易被别的键抢走
+#: （``学生服`` 会被 ``制服`` 抢成 ``uniform, military uniform, necktie``）。给它们
+#: **各自一条明确的词条**之后：日志写的就是用户说的那个词，关键词也确定 ——
+#: 零模型调用命中、意图明确，不再落进"键 + 别的后缀"这个残余盲区。
 WEAR_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    # 学生 / 校服（5 种同义写法 → 同一组关键词）
+    # 学生 / 校服（1.0.30 再补 3 条同义写法，全部映射到同一组关键词）
     "学生": ("school uniform", "pleated skirt"),
     "学生装": ("school uniform", "pleated skirt"),
+    "学生服": ("school uniform", "pleated skirt"),
+    "学生制服": ("school uniform", "pleated skirt"),
     "校服": ("school uniform", "pleated skirt"),
+    "校服外套": ("school uniform", "cardigan", "pleated skirt"),
+    "校服裙": ("school uniform", "pleated skirt"),
     "JK": ("school uniform", "pleated skirt"),
     "水手服": ("sailor dress", "school uniform"),
     # 制服（泛指的制服；「学生会长制服」这种具体皮肤名由皮肤表优先）
@@ -649,31 +749,42 @@ WEAR_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "居家": ("loungewear", "casual", "home wear", "t-shirt"),
     "家居": ("loungewear", "casual", "home wear", "t-shirt"),
     "居家服": ("loungewear", "casual", "home wear", "t-shirt"),
+    "居家服装": ("loungewear", "casual", "home wear", "t-shirt"),
     "家居服": ("loungewear", "casual", "home wear", "t-shirt"),
     # 睡衣
     "睡衣": ("pajamas", "sleepwear"),
     "睡裙": ("nightgown", "sleepwear"),
+    "睡衣套装": ("pajamas", "sleepwear"),
     # 泳装
     "泳衣": ("swimsuit",),
     "泳装": ("swimsuit",),
+    "泳衣套装": ("swimsuit",),
     "比基尼": ("bikini", "swimsuit"),
     # 传统服饰
     "浴衣": ("yukata", "japanese clothes", "floral print"),
     "和服": ("kimono", "japanese clothes", "obi"),
+    "和服裙": ("kimono", "japanese clothes", "long skirt"),
     "汉服": ("hanfu", "chinese clothes", "long sleeves"),
     "旗袍": ("qipao", "chinese clothes", "side slit"),
+    "旗袍裙": ("qipao", "chinese clothes", "long skirt"),
     # 职业 / 风格
     "女仆": ("maid", "maid headdress", "apron"),
     "女仆装": ("maid", "maid headdress", "apron"),
+    "女仆装束": ("maid", "maid headdress", "apron"),
     "护士": ("nurse uniform", "nurse cap"),
     "护士服": ("nurse uniform", "nurse cap"),
+    "护士服装": ("nurse uniform", "nurse cap"),
     "西装": ("suit", "necktie", "blazer"),
+    "西装外套": ("suit", "blazer", "necktie"),
     "运动": ("sportswear", "track suit", "sneakers"),
     "运动服": ("tracksuit", "sportswear", "sneakers"),
+    "运动服装": ("sportswear", "track suit", "sneakers"),
     "洛丽塔": ("lolita fashion", "frilled dress", "petticoat"),
     "兔女郎": ("bunny girl", "leotard", "rabbit ears"),
-    # 婚服（4 种同义写法 → 同一组关键词；「礼服」是更泛的那一档）
+    # 婚服（1.0.30 再补 2 条同义写法 → 同一组关键词；「礼服」是更泛的那一档）
     "婚纱": ("wedding dress", "bridal veil", "white dress"),
+    "婚纱照": ("wedding dress", "bridal veil", "white dress"),
+    "婚纱裙": ("wedding dress", "bridal veil", "white dress"),
     "婚服": ("wedding dress", "bridal veil", "white dress"),
     "结婚礼服": ("wedding dress", "bridal veil", "white dress"),
     "新娘装": ("wedding dress", "bridal veil", "white dress"),
@@ -684,6 +795,38 @@ WEAR_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
 #: 命中 ``[outfits] wear_types`` 写 ``配置表``。
 WEAR_SOURCE_BUILTIN = "内置表"
 WEAR_SOURCE_CONFIG = "配置表"
+
+#: **1.0.30**：``「…的<穿着词>」`` 这条**归属句式**用的词表 —— 直接把内置穿着类型表的
+#: 键拼成正则（**长的在前**，``婚纱照`` 因此压过 ``婚纱``、``学生制服`` 压过 ``学生``）。
+#:
+#: 为什么需要它（C107/C108 卡住的地方）：用户说「画爱莉的婚纱～」时，「婚纱」既不在
+#: 皮肤表里、也不符合 :data:`_OUTFIT_SENTENCE_PATTERNS` 里那七条句式（那七条没有
+#: 「X 的 Y」这种归属写法），于是穿着这一层**什么都识别不到** —— 判定侧明明已经按
+#: 「用户最新点名」改成了爱莉希雅，衣服却还是没注入。
+#:
+#: 为什么用**表里的键**当词表，而不是放一条宽泛的 ``的(X)``：候选只可能是"已知的
+#: 穿着词"，凭空造不出杂词（``战斗场景`` / ``白色长裙`` 这类描述抓不进来 ——
+#: 它们该由皮肤表或模型那两条路处理，而不是被一条句式硬塞成穿着）；
+#: 命中之后照样要过 :func:`find_wear_type` 的"相等或后缀"，才可能零模型调用注入。
+#:
+#: 词表取的是**内置表**的键（模块导入时定下来）：用户在 ``[outfits] wear_types`` 里
+#: 自己补的词不在这条句式里 —— 那是配置态数据，跟着配置变；补的词照旧可以用七条句式
+#: 说出来（``我想看你的女警服``），不走这条归属句式。
+_WEAR_WORD_ALTERNATION = "|".join(
+    re.escape(word) for word in sorted(WEAR_TYPE_KEYWORDS, key=len, reverse=True)
+)
+
+#: 归属句式的边界：候选**后面不能再接名字字符**（字母 / 数字 / 汉字 / 假名 / 韩文）。
+#:
+#: 为什么必须有它：``我想看你的学生会长制服`` 里「学生」后面紧跟「会」（汉字），
+#: 没有边界时会被当成候选 ``学生`` —— 它**恰好是内置表的键**（相等命中），
+#: 于是一套**具体皮肤**（皮肤表里的「学生会长制服」）会被拆成"学生装"、用错关键词
+#: （回归用例 C91 守的就是这条）。带上边界之后：``的婚纱～`` / ``的居家服，`` 照旧命中，
+#: ``的学生会长制服`` / ``的学生证`` / ``的居家环境`` 一律不算。
+_OUTFIT_POSSESSIVE_WEAR_PATTERN = re.compile(
+    rf"的({_WEAR_WORD_ALTERNATION})"
+    r"(?![0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af])"
+)
 
 
 @dataclass(frozen=True)
@@ -773,9 +916,34 @@ def wear_type_table(raw_text: str = "") -> dict[str, WearTypeMatch]:
 def find_wear_type(
     name: str, table: dict[str, WearTypeMatch] | None = None
 ) -> WearTypeMatch | None:
-    """候选里**包含**某个穿着类型词 → 命中（1.0.28）；没有返回 ``None``。
+    """候选**恰好是**某个穿着类型词、或以它**结尾** → 命中（1.0.29 收紧）；否则 ``None``。
 
-    - 匹配是**包含**式：``学生装`` / ``居家服`` / ``泳衣`` 都算命中（需求里的容错口径）；
+    判定就是一行（都过 :func:`_outfit_key` 归一）：``target == key or
+    target.endswith(key)``。
+
+    - **为什么收紧（1.0.28 → 1.0.29）**：1.0.28 是"候选**包含**表中词即命中"，
+      于是**不含穿着意图**的话也会被吞掉 —— 「学生会」「学生时代」「学生会长」
+      里都有「学生」→ **零模型调用**地注入 ``school uniform, pleated skirt``
+      （同一个候选在 1.0.27 会走模型兜底，模型答 ``unknown`` → 什么都不注入）；
+    - **收紧后照旧命中的写法**：本身**就是键**（``学生`` / ``学生装`` / ``校服`` /
+      ``居家服`` / ``泳衣`` / ``婚服`` / ``和服`` …，相等命中 —— C89/C90 走的就是
+      这条）与**后缀**写法（``穿学生装``、``我想看你的学生``、``男生学生``）；
+    - **不再命中**：前缀 / 中缀的无关话（``学生会`` / ``学生时代``）—— 它们按
+      "两张表都没命中"继续往下走 ③ / ④ 模型兜底（穿着类候选走 ④，日志
+      ``穿着解析(模型)``），模型说不是穿着就什么都不注入；
+      **1.0.30 起这条路真的走得通了**：1.0.29 时 ``学生会`` 在**抽取**那一步就被虚词
+      「会」截断成恰好是键的 ``学生``（这里根本见不到完整候选）；只把句式抽取那一侧
+      改掉的话，完整的 ``学生会`` 又会在**候选过滤**那一步被整条丢掉 ——
+      1.0.30 把两张虚词表合并成一张（见 :data:`_OUTFIT_STOP_CHARS`），
+      所以候选真的是 ``学生会``，才谈得上"这里不命中"；
+      （``学生会长制服`` 这类**以别的键结尾**的写法照旧命中，只是命中的是
+      ``制服`` 而不是 ``学生`` —— 而且它本来就由 ① 皮肤表优先，见 C91）；
+    - **残余盲区**（1.0.29 的代价，**1.0.30 起大部分补上**）：``学生服`` / ``校服外套`` /
+      ``婚纱照`` 这类"表里的词 + 别的后缀"的写法在 1.0.29 **不再零模型调用命中**，
+      会多问一次模型（④）—— 这是收紧口径换来的代价（宁可多问一次模型，也不要把
+      「学生会」当成穿着）；1.0.30 把这些**常见写法各自补成表里的键**
+      （见 :data:`WEAR_TYPE_KEYWORDS` 的 1.0.30 说明），于是它们又是零模型调用了；
+      真正剩下的盲区只有"没被补进表里的、键 + 任意后缀"的写法；
     - 多个词同时命中时取**最长的**那个（``结婚礼服`` 压过 ``礼服``、``运动服``
       压过 ``运动``）；同样长时取表里**先出现**的那个；
     - ``table`` 为空（``None``）时用内置表 :data:`WEAR_TYPE_KEYWORDS`；
@@ -798,7 +966,7 @@ def find_wear_type(
     best_len = 0
     for word, match in lookup.items():
         key = _outfit_key(word)
-        if not key or key not in target:
+        if not key or not (target == key or target.endswith(key)):
             continue
         if len(key) > best_len:
             best = match
@@ -834,13 +1002,15 @@ WEAR_LOOK_CHARS: tuple[str, ...] = (
 
 #: 1.0.28：「这次说的是穿着」的**句式**信号（需求原话：「穿 X」「换上 X」「X 服/装/衣」）。
 #:
-#: ``X`` 与皮肤名候选用的是同一个字符类（:data:`_OUTFIT_NAME_CLASS`），因此这里认的
-#: 就是"皮肤名识别真正会抓到的那些说法"。候选本身没有穿着特征字时（例如「换上战甲」），
-#: 靠它把候选归到"穿着类"。
+#: ``X`` 与皮肤名候选用的是同一个字符类（:data:`_OUTFIT_SENTENCE_NAME_CLASS`，1.0.30
+#: 起两边都不把 ``会`` 当虚词）—— 这里认的就是"皮肤名识别真正会抓到的那些说法"。
+#: 候选本身没有穿着特征字时（例如「换上战甲」），靠它把候选归到"穿着类"。
 _WEAR_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"穿(?:上)?{_OUTFIT_NAME_CLASS}{{2,16}}"),
-    re.compile(rf"换上{_OUTFIT_NAME_CLASS}{{2,16}}"),
-    re.compile(rf"{_OUTFIT_NAME_CLASS}{{2,16}}(?:衣服|服装|衣装|服饰)"),
+    re.compile(rf"穿(?:上)?{_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}}"),
+    re.compile(rf"换上{_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}}"),
+    re.compile(
+        rf"{_OUTFIT_SENTENCE_NAME_CLASS}{{2,16}}(?:衣服|服装|衣装|服饰)"
+    ),
 )
 
 
@@ -894,9 +1064,12 @@ class ResolvedOutfit:
     Attributes:
         name: 皮肤名（表里的正式名 / 模型给的中文名 / 用户说法）；**1.0.28 的穿着
             两条路**分别填命中的中文词（``学生``）与用户的**原词**（``雨衣``）
-        character: 归属角色名（表里的第 2 列 / 焦点范围内的角色线索；可空）。
-            **穿着类型没有归属列**，因此穿着那两条路一律留空（见
-            ``handler._apply_outfit`` 的归属校验）
+        character: 归属角色名（皮肤表第 2 列 / 角色线索；可空）。
+            **1.0.29 起穿着那两条路也会填**：穿着类型表没有归属列，所以由
+            ``handler._wear_character_hint`` 从"说这句话的那条消息"里取角色表内
+            角色（**唯一**时才填，多个 / 没有留空）。归属校验对穿着同样生效
+            （见 ``handler._apply_outfit``）：非空且与本次判定角色不一致 →
+            不注入 + WARNING ``穿着跳过：…``
         keywords: 英文关键词（已逐条过 :func:`validate_outfit_keyword`）
         description: 中文描述（表里的第 4 列；模型与穿着那两条路都不提供）
         source: ``表`` / ``模型`` / ``缓存``（失败时为空串）

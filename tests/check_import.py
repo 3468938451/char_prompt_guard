@@ -350,7 +350,7 @@ def main() -> int:
         )
         # 1.0.28 新增：泛指的穿着类型（学生 / 居家 / 泳衣 …）——**默认留空** =
         # 只用内置表 WEAR_TYPE_KEYWORDS；填了与内置表**合并**、同名覆盖内置
-        # （行为见 check_logic.py 的 C89~C103）。
+        # （行为见 check_logic.py 的 C89~C106）。
         check(
             "1.0.28 穿着类型表默认留空（只用内置表）",
             cfg.outfits.wear_types == "",
@@ -913,8 +913,10 @@ def main() -> int:
     # ③ unknown / confidence 太低 / 没有可用关键词一律判失败（什么都不注入）。
     # 1.0.23 再补：解析结构多一个可选字段 `inferred`、「<角色>的那一套皮肤」的识别、
     # 推断入口与缓存键都在（默认关见上面的配置默认值断言）。
-    # 1.0.28 再补：内置「穿着类型 → 关键词」表（含同义写法）、包含匹配、用户补充表
+    # 1.0.28 再补：内置「穿着类型 → 关键词」表（含同义写法）、容错匹配、用户补充表
     # 与内置表的合并（同名覆盖）与丢弃规则、穿着模型入口与 `<原词>|__wear__` 缓存键。
+    # 1.0.29：匹配口径由"包含"收紧为"**相等或后缀**"（见下面那条断言的新措辞）——
+    # 这是按新语义**收紧**断言（多钉两条否定样例），不是放宽。
     try:
         from .. import handler as outfit_handler
         from ..character import parse_roster
@@ -1103,7 +1105,7 @@ def main() -> int:
         )
 
         # 1.0.28：泛指的穿着 —— 内置「穿着类型 → 关键词」表 + 容错匹配 + 模型入口。
-        # 完整的端到端行为在 check_logic.py 的 C89~C103，这里只做"装得上、调得动"冒烟。
+        # 完整的端到端行为在 check_logic.py 的 C89~C106，这里只做"装得上、调得动"冒烟。
         wear_hits = {
             word: find_wear_type(f"我想看你的{word}") for word in ("学生", "居家", "泳衣")
         }
@@ -1111,12 +1113,20 @@ def main() -> int:
             word: getattr(match, "word", None) for word, match in wear_hits.items()
         }
         check(
-            "1.0.28 内置穿着类型表：至少含 学生/居家/泳衣，且包含匹配（学生装 / 居家服 / 泳衣）",
+            "1.0.29 内置穿着类型表：至少含 学生/居家/泳衣，且匹配口径是「相等或后缀」"
+            "（学生装 / 居家服 / 学生 / 穿学生装 命中；学生会 / 学生时代 不命中）",
             {"学生", "居家", "泳衣"} <= set(WEAR_TYPE_KEYWORDS)
             and all(match is not None for match in wear_hits.values())
             and find_wear_type("学生装") is not None
             and find_wear_type("居家服") is not None
             and find_wear_type("穿学生装") is not None
+            # 1.0.29：**本身是键**（相等）也照旧命中（「我想看你的学生」这种后缀写法
+            # 已经在 wear_hits 里断言过了）—— 这一条是防"收紧收过头"。
+            and find_wear_type("学生") is not None
+            # 1.0.29：只有前缀 / 中缀含表中词的话**不再命中**（审计 🟠1 的两条样例），
+            # 否则「学生会」「学生时代」会被零模型调用地注入 school uniform。
+            and find_wear_type("学生会") is None
+            and find_wear_type("学生时代") is None
             and find_wear_type("画花火吧") is None
             and all(
                 validate_outfit_keyword(keyword)[0]
