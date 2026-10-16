@@ -536,6 +536,11 @@ def validate_outfit_keyword(word: str) -> tuple[bool, str]:
         return False, f"关键词含非法字符 {' '.join(repr(char) for char in illegal)}"
     if text != text.lower():
         return False, "关键词含大写字母（必须全小写）"
+    if "\\(" in text or "\\)" in text:
+        # 1.0.26：`\\(…\\)` 是**角色标签**的形状（如 hanabi \\(honkai: star rail\\)），
+        # 皮肤关键词绝不该长这样 —— 否则模型可以借"衣服关键词"这条通道把角色标签塞进
+        # 画面，而两条一致性检查跑在皮肤注入**之前**，本轮结构上看不到它。
+        return False, "关键词形如角色标签（含 \\( … \\)），已丢弃"
     if text.count("\\(") != text.count("\\)"):
         return False, "关键词里的括号没有成对转义"
     remainder = text.replace("\\(", "").replace("\\)", "")

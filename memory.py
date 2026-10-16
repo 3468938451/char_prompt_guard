@@ -39,8 +39,13 @@
 - **不引入第三方依赖**：标准库 ``urllib.request`` 包在 ``asyncio.to_thread`` 里
   执行（保持异步不阻塞）；宿主 / 用例可以用 :func:`set_transport` 或直接替换
   :func:`_http_get_json` / :func:`_http_post_json` 来注入假传输层；
-- **失败后短暂退避**：连续失败时 :data:`FAILURE_COOLDOWN_SECONDS` 秒内不再请求，
-  免得记忆库挂掉时每次生图都白等一个 ``memory.timeout``。
+- **失败后短暂退避**：同一**用途**连续失败时 :data:`FAILURE_COOLDOWN_SECONDS` 秒内
+  不再请求，免得记忆库挂掉时每次生图都白等一个 ``memory.timeout``；
+  「服务通、只是这次没查到」用短得多的 :data:`EMPTY_COOLDOWN_SECONDS`。
+  **1.0.25 起退避按 ``(base_url, 用途)`` 分别计时**（见 :data:`_LAST_ATTEMPT`）——
+  「不确定再确认」失败**不会**连带跳过「描述点名对账」
+  （:data:`RECONCILE_UNCERTAINTY`）：那是本该报警的一张图（描述写花火、实际该画
+  爱莉希雅），被别人的退避挡住就等于一张都不报。
 
 与 :mod:`monitor` / :mod:`character` 的关系
 -------------------------------------------
@@ -84,16 +89,28 @@ SNIPPET_MAX_CHARS = 200
 #: 检索条数上限（``memory.limit`` 超过它也按它处理）
 LIMIT_MAX = 20
 
-#: 失败后的退避秒数：连续失败时这段时间内不再请求记忆库。
+#: **请求失败**（超时 / 连不上 / 非 200 / JSON 坏）后的退避秒数：
+#: 这段时间内**同一个用途**不再请求记忆库。
 #:
 #: 没有它的话，记忆库挂掉时**每次生图**都要白等一个 ``memory.timeout``
 #: （默认 2 秒）—— 直接违背「绝不拦住生图」。
+#:
+#: 1.0.25 起窗口是**按用途分键**的（``(base_url, uncertainty)``，见
+#: :data:`_LAST_ATTEMPT`）：「描述点名对账」不会被「不确定再确认」的失败连带跳过。
 FAILURE_COOLDOWN_SECONDS = 60.0
 
-#: 「检索成功但没命中」后的退避秒数（短得多）。
+#: **检索成功但没命中**（服务正常、只是这次没查到）后的退避秒数（短得多）。
 #:
 #: 与「连不上」分开：没命中往往只是这次的关键词不好，不该让记忆库**一分钟内**
 #: 完全用不了（用户的下一句很可能就查得到）。
+#:
+#: .. note::
+#:    1.0.25 之前这一档**从未生效过**：失败类型记在 :class:`MemoryClient`
+#:    实例上（``last_failure_kind``），而客户端是每次 :func:`build_client`
+#:    **新建**的实例 —— 退避判断处读到的永远是空串，于是「服务通但没查到」
+#:    也被按 :data:`FAILURE_COOLDOWN_SECONDS` 退避 60 秒。现在类型记在模块级
+#:    :data:`_LAST_KIND`（与 :data:`_LAST_ATTEMPT` **同一个分键**），退避判断处
+#:    按 ``(client.base_url, 本次用途)`` 读。
 EMPTY_COOLDOWN_SECONDS = 15.0
 
 #: 触发词（与自我指代词一致的那几个，外加角色扮演场景常用的两个）。
@@ -438,8 +455,14 @@ class MemoryClient:
     bucket: str = "memory"
     memory_type: str = "knowledge"
     invalid_base_url: bool = False
-    #: 最近一次检索的「没拿到结果」类型：``error``（连不上/超时/非 200/JSON 坏）
-    #: 或 ``empty``（服务正常但没命中）—— 两者用不同的退避窗口
+    #: **本次**检索的「没拿到结果」类型：``error``（连不上/超时/非 200/JSON 坏）
+    #: 或 ``empty``（服务正常但没命中）—— 两者用不同的退避窗口。
+    #:
+    #: .. note::
+    #:    退避状态**不在这个实例上**：客户端每次 :func:`build_client` 都是**新建**
+    #:    实例，写在这里的字段下一次调用就没了（1.0.25 修的正是这个坑 —— 退避判断
+    #:    处曾经读它，于是永远读到空串）。读取失败时 :func:`lookup` 立刻把类型抄进
+    #:    模块级的 :data:`_LAST_KIND`；这里保留它只为「本次调用」的观测与日志。
     last_failure_kind: str = ""
 
     # ── 检索 ──────────────────────────────────────────────────────────
@@ -450,7 +473,9 @@ class MemoryClient:
         Returns:
             命中的记忆条目（已截断，最多 :attr:`limit` 条）；
             **任何失败都返回空列表**，只打 DEBUG ``记忆库不可用，跳过（原因）``，
-            并把 :attr:`last_failure_kind` 记成 ``error`` / ``empty``（供退避用）。
+            并把 :attr:`last_failure_kind` 记成 ``error`` / ``empty``（**本次调用**
+            的观测值；退避状态由 :func:`lookup` 按 ``(base_url, 用途)`` 记在模块级，
+            见 :data:`_LAST_ATTEMPT` / :data:`_LAST_KIND`）。
         """
         keyword = (keyword or "").strip()
         if not keyword:

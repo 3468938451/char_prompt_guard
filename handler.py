@@ -1337,6 +1337,12 @@ class UserNamingScope:
 OUTFIT_NATURAL_TEMPLATE = "（皮肤/时装：“{name}”：{keywords}）"
 OUTFIT_NATURAL_TEMPLATE_WITH_DESC = "（皮肤/时装：“{name}”：{keywords}；{description}）"
 
+#: natural 模式皮肤说明的**固定前缀**：用于"已经追加过就不再追加"的幂等判断（1.0.26）
+#:
+#: 只匹配模板开头（``（皮肤/时装：“``）而不是裸的 ``皮肤/时装：`` —— 后者会和用户自己在
+#: 画面描述里写的同样五个字撞车，导致本张该补的皮肤被静默跳过（窄审计 1.0.26 发现）。
+OUTFIT_NATURAL_MARKER = "（皮肤/时装：“"
+
 
 @dataclass(frozen=True)
 class OutfitScope:
@@ -1561,8 +1567,11 @@ class CharacterGuardHandler(BaseEventHandler):
         # 这里放在 _collect_candidates **之前**是有意的：命中时省掉一次 LLM 调用
         # （确定性记忆比模型猜测更可信），命中不了时 _collect_candidates 会照旧
         # 把命中片段的 title + snippet 作为参考材料喂给 LLM。
+        # 1.0.26：口径与 present_keys 统一 —— 用同一个 `texts`（含 tags 模式的
+        # `characters` 槽位），否则"角色标签只写在槽位里"时会被当成"画面里没有角色"，
+        # 于是多跑一次记忆库再确认、并跳过 1.0.19 的「描述点名对账」。
         description_characters = [
-            entry for entry in roster if character_in_texts(entry, [content])
+            entry for entry in roster if character_in_texts(entry, texts)
         ]
         description_has_character = bool(description_characters)
         memory_context = await self._memory_lookup(
@@ -2687,7 +2696,7 @@ class CharacterGuardHandler(BaseEventHandler):
         当成「角色表外的角色名」—— 用户说「画粉色妖精小姐这套」时，「粉色妖精小姐」
         是**一套皮肤**，不是角色；被误当成角色时不仅会多问一次模型（1.0.21 的角色
         解析），``fix`` 还会去替换 / 删除画面里正确角色的标签。豁免口径与「表内」判定
-        一致（完全相同或互为子串，忽略大小写 / 空白），被豁免的候选会记一条 DEBUG
+        一致（归一后**完全相等**（1.0.24 起；早先的互为子串已废弃），忽略大小写 / 空白），被豁免的候选会记一条 DEBUG
         ``皮肤名豁免: …``，方便核对"是不是把真的表外角色名也豁免掉了"。
         没有皮肤名（``exclude`` 为空）时行为与 1.0.22 逐字一致。
 
@@ -3207,11 +3216,22 @@ class CharacterGuardHandler(BaseEventHandler):
         )
         if result is None or not result.ok or result.entry is None:
             return None
-        await self._write_resolved_to_memory(
-            config=config,
-            resolved=result,
-            trigger=self._resolve_trigger(name, naming_scope),
-        )
+        # 1.0.26：**写回只在真正会用到解析结果时发生**。
+        # `warn`（默认）只会把结论写进日志与"建议加入角色表"，却会把**未被验证过的
+        # 模型结论**写进记忆库 —— 既白花一次写入，又可能被后续"再确认"当成明确证据。
+        # 因此默认档不写回；`fix` 才会用解析结果去替换/补入，此时写回才是有意义的记忆。
+        mode = str(getattr(config.general, "consistency_check", "") or "").strip().lower()
+        if mode == "fix":
+            await self._write_resolved_to_memory(
+                config=config,
+                resolved=result,
+                trigger=self._resolve_trigger(name, naming_scope),
+            )
+        else:
+            logger.debug(
+                f"角色解析结果不入记忆库（consistency_check={mode or 'warn'}："
+                "本次仅用于日志/建议加入角色表）"
+            )
         return result.entry
 
     async def _resolve_with_cache(
@@ -4204,6 +4224,24 @@ class CharacterGuardHandler(BaseEventHandler):
         """
         if outfit is None or not outfit.ok:
             return content
+        # 1.0.26：**归属校验** —— 皮肤表第 2 列（或推断结果）写明"这套衣服属于谁"时，
+        # 若本次判定的角色里没有它，就**不注入**（否则会出现"流萤的招牌衣服被贴到爱莉
+        # 身上"这种错图，而插件既不报也不拦）。判不出角色（decided 为空）时保持原行为：
+        # 照样注入，只打一条 DEBUG。
+        if outfit.character and decided:
+            wanted = str(outfit.character).strip().casefold()
+            owners = {
+                str(value).strip().casefold()
+                for entry in decided
+                for value in (entry.name, entry.tag, *entry.aliases)
+                if value
+            }
+            if wanted and wanted not in owners:
+                logger.warning(
+                    f"皮肤跳过：皮肤「{outfit.name}」属于「{outfit.character}」，"
+                    f"但本张判定角色是「{'、'.join(entry.name for entry in decided)}」"
+                )
+                return content
         owner = next((entry.name for entry in decided if entry.name), "")
         if owner:
             logger.debug(f"皮肤注入: {outfit.name}（搭配角色={owner}）")
@@ -4228,7 +4266,11 @@ class CharacterGuardHandler(BaseEventHandler):
             return merged
 
         clause = self._outfit_clause(outfit)
-        if clause in content:
+        # 1.0.26：**幂等** —— 单次多图（「画三张」）时第 2、3 张的入参 content 里已经带着
+        # 第 1 张追加过的皮肤说明，而它们由**同一轮**触发、_scan_outfit_names 对它们拿不到
+        # 候选，所以整段 clause 比对不上、会被重复追加（提示词膨胀 + 关键词权重叠加）。
+        # 这里改成"只要已有 `皮肤/时装：` 段就不再追加"。
+        if clause in content or OUTFIT_NATURAL_MARKER in content:
             return content
         merged = f"{content.rstrip()}\n{clause}" if content.strip() else clause
         logger.info(

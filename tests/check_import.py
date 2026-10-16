@@ -943,11 +943,12 @@ def main() -> int:
             }.items()
         }
         check(
-            "1.0.22 关键词规范：大写 / 中文 / 未转义与全角括号 / 空 / 含逗号全部拦下，"
-            "合法关键词通过",
+            "1.0.22/1.0.26 关键词规范：大写 / 中文 / 未转义与全角括号 / 空 / 含逗号 / "
+            "形如角色标签（含 \\( … \\)）全部拦下，纯描述性关键词通过",
             all(rejected.values())
             and validate_outfit_keyword("pink elf dress")[0] is True
-            and validate_outfit_keyword(r"ribbon \(hair\)")[0] is True,
+            # 1.0.26：`\\(…\\)` 是角色标签的形状 —— 皮肤通道绝不能把它带进画面
+            and validate_outfit_keyword(r"ribbon \(hair\)")[0] is False,
             f"逐项 = {rejected!r}",
         )
         check(
