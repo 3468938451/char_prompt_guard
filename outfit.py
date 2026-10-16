@@ -42,6 +42,27 @@
   关掉时一次模型都不问、一条日志都不打，行为与 1.0.22 逐字一致；
 - **作品名去重**（同一次日志里的 ``… (Honkai: Star Rail) (Honkai: Star Rail)``）
   落在 :mod:`character`（``_normalize_game_field``），与本模块无关。
+
+**1.0.28 把「泛指的穿着类型」和「具体皮肤名」分开**（需求原话：「当说的是
+『我想看你的 xxx』（如**学生**、**居家**、**泳衣**），判断**不是皮肤**，转成
+『穿对应的衣服』；否则衣服这个产出有时相当于黑箱，只能由 bot 决定 —— 要能
+**看到注入了什么样的衣服**」）：
+
+- **内置表** :data:`WEAR_TYPE_KEYWORDS`（中文词 → 2~5 个小写 ASCII 关键词，
+  含常见同义写法：``学生`` / ``学生装`` / ``校服`` / ``JK`` / ``水手服`` →
+  ``school uniform, pleated skirt``），用户可在 ``[outfits] wear_types`` 里
+  按同样写法补充 / 覆盖（同名覆盖内置，见 :func:`wear_type_table`）；
+- **识别** :func:`find_wear_type`：候选**包含**表中某个词即命中（``学生装`` /
+  ``居家服`` / ``泳衣``），多个词命中时取**最长**的那个；**具体皮肤名优先**
+  由调用方（``handler._resolve_outfit``：皮肤表 → 穿着类型 → 模型）保证，
+  所以皮肤表里的「学生会长制服」不会被拆成"学生装"；
+- **模型兜底** :func:`looks_like_wear` / :func:`looks_like_wear_sentence` 认出
+  「看起来是穿着」的候选（含 ``衣/服/装/裙/…`` 或句式「穿 X」「换上 X」），
+  它既不在皮肤表也不在内置表时，交给 :func:`resolve_wear_via_llm` 用
+  **穿着专用提示词**转成服装关键词（不是穿着就让模型回 ``unknown=true``）；
+- 校验口径与皮肤解析**完全相同**（:func:`parse_outfit_resolution_payload`：
+  只收小写 ASCII 关键词，``unknown`` / JSON 坏 / ``confidence < 0.5`` /
+  没有可用关键词 → **什么都不注入**），日志 ``穿着解析(LLM)失败：<原因>``。
 """
 
 from __future__ import annotations
@@ -85,6 +106,16 @@ OUTFIT_SOURCE_CACHE = "缓存"
 #: ``模型`` / ``缓存``，日志前缀才是区分点），只作为 :class:`ResolvedOutfit.inferred`
 #: 为真时日志里的「来源=…」文案与语义标识。
 OUTFIT_SOURCE_INFER = "模型推断"
+
+#: 1.0.28：「泛指的穿着类型」的两条路（**不进** ``source`` 字段，理由与
+#: :data:`OUTFIT_SOURCE_INFER` 完全相同 —— ``source`` 那一列仍然写
+#: ``模型`` / ``缓存``，日志前缀才是区分点）。它们填在
+#: :attr:`ResolvedOutfit.wear` 上：
+#:
+#: - ``类型``：命中内置 / 配置的**穿着类型表**（零模型调用）；
+#: - ``模型``：穿着类候选交给**穿着专用提示词**解析出来的。
+OUTFIT_WEAR_TYPE = "类型"
+OUTFIT_WEAR_MODEL = "模型"
 
 #: 皮肤表条目里「角色名」这一列缺失时，写回记忆库用的兜底归属名（不好看但保证三元组非空）
 OUTFIT_UNKNOWN_CHARACTER = "未知角色"
@@ -574,18 +605,300 @@ def validate_outfit_tag(tag: str) -> tuple[bool, str]:
     return True, ""
 
 
+# ── 泛指的「穿着类型」（1.0.28）────────────────────────────────────────
+#
+# 需求原话：「当说的是『我想看你的 xxx』（如**学生**、**居家**、**泳衣**），
+# 判断**不是皮肤**，转成"穿对应的衣服"；否则衣服这个产出有时相当于黑箱，
+# 只能由 bot 决定 —— 要能**看到注入了什么样的衣服**。」
+#
+# 也就是说：用户说的不是**具体皮肤名**（「粉色妖精小姐」），而是**泛指的穿着
+# 类型**（学生 / 居家 / 泳衣 / 睡衣 …）时，插件应当**确定性地**给出英文关键词，
+# 而不是把这件事交给模型 —— 模型可能解析不出、也可能解析成别的东西，而且用户
+# 在日志里看不到"到底注入了什么"。
+#
+# 最终优先级（见 ``handler._resolve_outfit``，注释与 README 都按这一份写）：
+#   ① 皮肤表命中（``outfits.entries``，零模型调用）
+#   ② 内置 / 配置的穿着类型表（:data:`WEAR_TYPE_KEYWORDS` + ``outfits.wear_types``，零模型调用）
+#   ③ 皮肤模型解析（``outfits.auto_resolve``，针对**具体皮肤名**）
+#   ④ 穿着模型解析（同样 ``auto_resolve``，针对**穿着类候选**，见 :func:`looks_like_wear`）
+#   ⑤ ``outfits.infer_unnamed``（用户没说名字时由模型推断一套，**默认关**）
+# ③ 与 ④ 互斥：候选"看起来是穿着"时走④（穿着专用提示词），否则走③（皮肤提示词）。
+
+#: 内置的「穿着类型 → 英文关键词」表（1.0.28）。
+#:
+#: 键是**中文词**（用户会说的那种），值是 2~5 个**小写 ASCII** 英文关键词，风格与
+#: 皮肤关键词一致（写成 NovelAI / Danbooru 能直接用的外观词）。匹配是**包含**式的
+#: （:func:`find_wear_type`）：候选里出现该词就算命中（``学生装`` / ``居家服`` /
+#: ``泳衣``），因此这里只放"指向明确、不会与具体皮肤名混淆"的词 —— **宁缺勿滥**。
+#:
+#: 常见**同义写法**都列进来了（``学生`` / ``学生装`` / ``校服`` / ``JK`` / ``水手服``
+#: 映射到同一组关键词），免得同一个意思换个说法就白跑一次模型；命中的是**最长的**
+#: 那个词，所以日志里写的是用户实际说的那个（``穿着类型解析(内置表): 学生装 → …``）。
+#: 用户可以按同样的写法在 ``[outfits] wear_types`` 里补充 / 覆盖（同名覆盖内置，
+#: 见 :func:`wear_type_table`）。
+WEAR_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    # 学生 / 校服（5 种同义写法 → 同一组关键词）
+    "学生": ("school uniform", "pleated skirt"),
+    "学生装": ("school uniform", "pleated skirt"),
+    "校服": ("school uniform", "pleated skirt"),
+    "JK": ("school uniform", "pleated skirt"),
+    "水手服": ("sailor dress", "school uniform"),
+    # 制服（泛指的制服；「学生会长制服」这种具体皮肤名由皮肤表优先）
+    "制服": ("uniform", "military uniform", "necktie"),
+    # 居家（4 种同义写法）
+    "居家": ("loungewear", "casual", "home wear", "t-shirt"),
+    "家居": ("loungewear", "casual", "home wear", "t-shirt"),
+    "居家服": ("loungewear", "casual", "home wear", "t-shirt"),
+    "家居服": ("loungewear", "casual", "home wear", "t-shirt"),
+    # 睡衣
+    "睡衣": ("pajamas", "sleepwear"),
+    "睡裙": ("nightgown", "sleepwear"),
+    # 泳装
+    "泳衣": ("swimsuit",),
+    "泳装": ("swimsuit",),
+    "比基尼": ("bikini", "swimsuit"),
+    # 传统服饰
+    "浴衣": ("yukata", "japanese clothes", "floral print"),
+    "和服": ("kimono", "japanese clothes", "obi"),
+    "汉服": ("hanfu", "chinese clothes", "long sleeves"),
+    "旗袍": ("qipao", "chinese clothes", "side slit"),
+    # 职业 / 风格
+    "女仆": ("maid", "maid headdress", "apron"),
+    "女仆装": ("maid", "maid headdress", "apron"),
+    "护士": ("nurse uniform", "nurse cap"),
+    "护士服": ("nurse uniform", "nurse cap"),
+    "西装": ("suit", "necktie", "blazer"),
+    "运动": ("sportswear", "track suit", "sneakers"),
+    "运动服": ("tracksuit", "sportswear", "sneakers"),
+    "洛丽塔": ("lolita fashion", "frilled dress", "petticoat"),
+    "兔女郎": ("bunny girl", "leotard", "rabbit ears"),
+    # 婚服（4 种同义写法 → 同一组关键词；「礼服」是更泛的那一档）
+    "婚纱": ("wedding dress", "bridal veil", "white dress"),
+    "婚服": ("wedding dress", "bridal veil", "white dress"),
+    "结婚礼服": ("wedding dress", "bridal veil", "white dress"),
+    "新娘装": ("wedding dress", "bridal veil", "white dress"),
+    "礼服": ("evening dress", "formal dress", "gown"),
+}
+
+#: 穿着类型的**来源**（只进日志括注）：命中 :data:`WEAR_TYPE_KEYWORDS` 写 ``内置表``，
+#: 命中 ``[outfits] wear_types`` 写 ``配置表``。
+WEAR_SOURCE_BUILTIN = "内置表"
+WEAR_SOURCE_CONFIG = "配置表"
+
+
+@dataclass(frozen=True)
+class WearTypeMatch:
+    """一次「穿着类型」命中（1.0.28）。
+
+    Attributes:
+        word: 命中的中文词（**表里的那一列**，不是用户的原话；进日志与注入说明）
+        keywords: 对应的英文关键词（已过 :func:`validate_outfit_keyword`）
+        source: :data:`WEAR_SOURCE_BUILTIN` / :data:`WEAR_SOURCE_CONFIG`
+            （日志里写明这次命中来自哪张表）
+    """
+
+    word: str
+    keywords: tuple[str, ...]
+    source: str = WEAR_SOURCE_BUILTIN
+
+
+def parse_wear_types(raw_text: str) -> dict[str, tuple[str, ...]]:
+    """解析 ``[outfits] wear_types`` 文本（1.0.28）。
+
+    每行 ``中文词 | 英文关键词, 英文关键词``（第二列中英文逗号都认）；多行或分号
+    （``;`` / ``；``）分隔、整行 ``#`` 开头为注释 —— 分隔与注释规则与角色表 /
+    皮肤表**完全一致**（共用 :func:`character.iter_config_entries`）。
+
+    第二列逐条过 :func:`validate_outfit_keyword`（只留小写 ASCII 的安全词），
+    **一个合法关键词都不剩的行整行丢弃** —— 用户写错一行不会把这条链路弄坏，
+    也不会把内置项顶掉（见 :func:`wear_type_table`）。
+    """
+    table: dict[str, tuple[str, ...]] = {}
+    for line in iter_config_entries(raw_text):
+        line = line.strip()
+        if not line:
+            continue
+        # 兼容中文输入法打出的全角分隔符
+        line = line.replace("｜", "|")
+        parts = [part.strip() for part in line.split("|")]
+        word = parts[0] if parts else ""
+        if not word:
+            continue
+        keywords: list[str] = []
+        for keyword in split_outfit_keywords(parts[1] if len(parts) > 1 else ""):
+            ok, reason = validate_outfit_keyword(keyword)
+            if not ok:
+                logger.debug(f"穿着类型关键词被丢弃（{reason}）：{keyword!r}（{word}）")
+                continue
+            if keyword not in keywords:
+                keywords.append(keyword)
+        if not keywords:
+            logger.debug(f"穿着类型「{word}」没有可用的英文关键词，整行丢弃")
+            continue
+        table[word] = tuple(keywords)
+    return table
+
+
+def wear_type_table(raw_text: str = "") -> dict[str, WearTypeMatch]:
+    """内置表 + 用户配置**合并**后的穿着类型表（1.0.28）。
+
+    ``raw_text`` 为空（``[outfits] wear_types`` 留空，默认）时只有内置表。
+    合并口径：**同名（忽略大小写与空白）由用户配置覆盖内置**，其余内置项照旧 ——
+    所以"留空则只用内置表"与"填了就合并"是同一条路径的两个端点。
+    来源标记（:data:`WEAR_SOURCE_BUILTIN` / :data:`WEAR_SOURCE_CONFIG`）在这里定下来，
+    日志才能写清 ``穿着类型解析(内置表)`` / ``穿着类型解析(配置表)``。
+    """
+    merged: dict[str, WearTypeMatch] = {
+        word: WearTypeMatch(word=word, keywords=keywords)
+        for word, keywords in WEAR_TYPE_KEYWORDS.items()
+    }
+    if not raw_text:
+        return merged
+    by_key = {_outfit_key(word): word for word in merged}
+    for word, keywords in parse_wear_types(raw_text).items():
+        key = _outfit_key(word)
+        if not key:
+            continue
+        old = by_key.get(key)
+        if old is not None:
+            logger.debug(f"穿着类型「{word}」覆盖内置项「{old}」")
+            merged.pop(old, None)
+        by_key[key] = word
+        merged[word] = WearTypeMatch(
+            word=word, keywords=keywords, source=WEAR_SOURCE_CONFIG
+        )
+    return merged
+
+
+def find_wear_type(
+    name: str, table: dict[str, WearTypeMatch] | None = None
+) -> WearTypeMatch | None:
+    """候选里**包含**某个穿着类型词 → 命中（1.0.28）；没有返回 ``None``。
+
+    - 匹配是**包含**式：``学生装`` / ``居家服`` / ``泳衣`` 都算命中（需求里的容错口径）；
+    - 多个词同时命中时取**最长的**那个（``结婚礼服`` 压过 ``礼服``、``运动服``
+      压过 ``运动``）；同样长时取表里**先出现**的那个；
+    - ``table`` 为空（``None``）时用内置表 :data:`WEAR_TYPE_KEYWORDS`；
+      调用方（``handler``）传的是"内置 + 配置合并"后的表（带缓存）；
+    - **具体皮肤名优先**由调用方保证（``handler._resolve_outfit`` 先查皮肤表）：
+      这里只负责"像不像一个穿着类型"，不做任何猜测。
+    """
+    target = _outfit_key(name)
+    if not target:
+        return None
+    lookup = (
+        {
+            word: WearTypeMatch(word=word, keywords=keywords)
+            for word, keywords in WEAR_TYPE_KEYWORDS.items()
+        }
+        if table is None
+        else table
+    )
+    best: WearTypeMatch | None = None
+    best_len = 0
+    for word, match in lookup.items():
+        key = _outfit_key(word)
+        if not key or key not in target:
+            continue
+        if len(key) > best_len:
+            best = match
+            best_len = len(key)
+    return best
+
+
+#: 1.0.28：候选里的「穿着特征字」—— 命中任一个字就认为这次说的**可能是穿着**，
+#: 于是走「穿着模型解析」（提示词要求模型把它转成服装关键词），而不是「皮肤解析」。
+#:
+#: 需求里列的多字词（``礼服`` / ``装束`` / ``制服``）都被这里的单字覆盖
+#: （``服`` / ``装`` / ``制``），句式信号见 :func:`looks_like_wear_sentence`。
+WEAR_LOOK_CHARS: tuple[str, ...] = (
+    "衣",
+    "服",
+    "装",
+    "裙",
+    "裤",
+    "袜",
+    "鞋",
+    "帽",
+    "泳",
+    "袍",
+    "衫",
+    "校",
+    "居",
+    "睡",
+    "浴",
+    "婚",
+    "制",
+    "套",
+)
+
+#: 1.0.28：「这次说的是穿着」的**句式**信号（需求原话：「穿 X」「换上 X」「X 服/装/衣」）。
+#:
+#: ``X`` 与皮肤名候选用的是同一个字符类（:data:`_OUTFIT_NAME_CLASS`），因此这里认的
+#: 就是"皮肤名识别真正会抓到的那些说法"。候选本身没有穿着特征字时（例如「换上战甲」），
+#: 靠它把候选归到"穿着类"。
+_WEAR_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"穿(?:上)?{_OUTFIT_NAME_CLASS}{{2,16}}"),
+    re.compile(rf"换上{_OUTFIT_NAME_CLASS}{{2,16}}"),
+    re.compile(rf"{_OUTFIT_NAME_CLASS}{{2,16}}(?:衣服|服装|衣装|服饰)"),
+)
+
+
+def looks_like_wear(name: str) -> bool:
+    """候选本身**看起来是穿着**吗（1.0.28）：命中任一 :data:`WEAR_LOOK_CHARS`。
+
+    只是"归到哪一条模型提示词"的判据（穿着词 vs 具体皮肤名），**不是**命中判定：
+    命中之后照样要过 :func:`validate_outfit_keyword`，模型说不是穿着（``unknown``）
+    就什么都不注入。
+    """
+    text = _outfit_key(name)
+    if not text:
+        return False
+    return any(char in text for char in WEAR_LOOK_CHARS)
+
+
+def looks_like_wear_sentence(text: str) -> bool:
+    """用户这句话是不是「穿 X」/「换上 X」/「X 服(装|衣)」这种说法（1.0.28）。
+
+    ``text`` 应当是**用户消息正文**（调用方传 ``OutfitScope.source``：
+    抓到候选的那条消息）。没有这些说法时返回 ``False`` —— 此时按"具体皮肤名"处理。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return any(pattern.search(raw) is not None for pattern in _WEAR_SENTENCE_PATTERNS)
+
+
+def wear_like_candidate(name: str, source_text: str = "") -> bool:
+    """这次识别到的候选是不是**穿着类**（1.0.28）—— ③/④ 两条模型路的分岔口。
+
+    命中任一条即算穿着类：
+
+    1. 候选本身含穿着特征字（:func:`looks_like_wear`，例如「雨衣」「白色长裙」）；
+    2. 抓到候选的那条用户消息是「穿 X」/「换上 X」这种说法
+       （:func:`looks_like_wear_sentence`，例如「换上战甲」）。
+
+    **具体皮肤名不会被误判**：皮肤表（①）与穿着类型表（②）都在它之前，
+    走不到这里；走到这里的候选本来就要问模型，只是问哪一套提示词的问题。
+    """
+    return looks_like_wear(name) or looks_like_wear_sentence(source_text)
+
+
 # ── 解析结果 ─────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class ResolvedOutfit:
-    """一次「皮肤/时装解析」的结果（1.0.22）。
+    """一次「皮肤/时装 / 穿着」解析的结果（1.0.22；1.0.23 与 1.0.28 各加字段）。
 
     Attributes:
-        name: 皮肤名（表里的正式名 / 模型给的中文名 / 用户说法）
-        character: 归属角色名（表里的第 2 列 / 焦点范围内的角色线索；可空）
+        name: 皮肤名（表里的正式名 / 模型给的中文名 / 用户说法）；**1.0.28 的穿着
+            两条路**分别填命中的中文词（``学生``）与用户的**原词**（``雨衣``）
+        character: 归属角色名（表里的第 2 列 / 焦点范围内的角色线索；可空）。
+            **穿着类型没有归属列**，因此穿着那两条路一律留空（见
+            ``handler._apply_outfit`` 的归属校验）
         keywords: 英文关键词（已逐条过 :func:`validate_outfit_keyword`）
-        description: 中文描述（表里的第 4 列；模型不提供）
+        description: 中文描述（表里的第 4 列；模型与穿着那两条路都不提供）
         source: ``表`` / ``模型`` / ``缓存``（失败时为空串）
         confidence: 模型自评的把握（0~1；表命中按 1.0）
         reason: 失败原因（成功时为空串）
@@ -593,6 +906,16 @@ class ResolvedOutfit:
         inferred: 1.0.23 —— 这一套是**模型推断**出来的（用户没说皮肤名，
             只说了「<角色>的那一套皮肤」）。日志前缀与「来源=」都据此变化，
             调用方也用它决定「不写回记忆库」（见 ``handler._resolve_outfit_with_cache``）
+        wear: 1.0.28 —— 这一套是**泛指的穿着**，不是具体皮肤名。
+            ``""`` = 不是穿着；:data:`OUTFIT_WEAR_TYPE` = 命中内置 / 配置的穿着
+            类型表（零模型调用）；:data:`OUTFIT_WEAR_MODEL` = 穿着专用提示词
+            解析出来的。它决定日志前缀（``穿着类型解析`` / ``穿着解析``）与注入
+            措辞（``（穿着：“…”：…）``），也是**归属校验**与幂等标记的判据。
+            为什么不用 ``source``：命中缓存时 ``source`` 会被改写成 ``缓存``，
+            而"这是穿着"必须能挺过改写（否则缓存命中会打出 ``皮肤解析(缓存)``）
+        wear_source: 1.0.28 —— 穿着类型命中来自哪张表
+            （:data:`WEAR_SOURCE_BUILTIN` / :data:`WEAR_SOURCE_CONFIG`），
+            只用于 ``穿着类型解析(<来源>)`` 那个括注
     """
 
     name: str = ""
@@ -604,11 +927,23 @@ class ResolvedOutfit:
     reason: str = ""
     raw_name: str = ""
     inferred: bool = False
+    wear: str = ""
+    wear_source: str = ""
 
     @property
     def ok(self) -> bool:
         """是否有可注入的内容（关键词非空才算成功）。"""
         return bool(self.keywords)
+
+    @property
+    def is_wear(self) -> bool:
+        """是不是「泛指的穿着」（1.0.28 的两条路之一）。"""
+        return bool(self.wear)
+
+    @property
+    def is_wear_type(self) -> bool:
+        """是不是命中**穿着类型表**（1.0.28 第 ② 档，零模型调用）。"""
+        return self.wear == OUTFIT_WEAR_TYPE
 
     def keywords_text(self) -> str:
         """关键词合成一行英文（逗号分隔）。"""
@@ -621,14 +956,33 @@ class ResolvedOutfit:
         ``皮肤解析(模型): 粉色妖精小姐 → pink elf dress, fairy wings（角色=爱莉希雅，confidence=0.9）``
         成功（1.0.23 模型推断，用户没点名）：
         ``皮肤推断(模型): 流萤 → 白色花嫁 → white dress（来源=模型推断，confidence=0.8）``
-        失败：``皮肤解析(LLM)失败：<原因>``（推断路径是 ``皮肤推断(LLM)失败：<原因>``）
+        成功（1.0.28 命中穿着类型表，零模型调用）：
+        ``穿着类型解析(内置表): 学生 → school uniform, pleated skirt``
+        成功（1.0.28 穿着类候选交给模型）：
+        ``穿着解析(模型): 雨衣 → raincoat（confidence=0.9）``（命中缓存写 ``穿着解析(缓存)``）
+        失败：``皮肤解析(LLM)失败：<原因>``（推断路径 ``皮肤推断(LLM)失败：…``，
+        穿着模型路径 ``穿着解析(LLM)失败：…``）
 
-        「模型推断」必须一眼可见：这条结果是**猜**出来的（用户没说具体是哪一套），
-        与「表命中」「用户点名后解析」是两种可信度，用户据此决定要不要写进皮肤表。
+        「模型推断」与「穿着」都必须一眼可见：前者是**猜**出来的（用户没说具体是
+        哪一套），后者是**泛指的穿着**（不是某一套皮肤）—— 与「表命中」「用户点名
+        后解析」都是不同的可信度 / 语义，用户据此核对"到底注入了什么衣服"。
         """
         if not self.ok:
+            if self.is_wear:
+                return f"穿着解析(LLM)失败：{self.reason or '未知原因'}"
             kind = "皮肤推断" if self.inferred else "皮肤解析"
             return f"{kind}(LLM)失败：{self.reason or '未知原因'}"
+        if self.is_wear_type:
+            return (
+                f"穿着类型解析({self.wear_source or WEAR_SOURCE_BUILTIN}): "
+                f"{self.name or self.raw_name} → {self.keywords_text()}"
+            )
+        if self.is_wear:
+            return (
+                f"穿着解析({self.source or OUTFIT_SOURCE_MODEL}): "
+                f"{self.raw_name or self.name} → {self.keywords_text()}"
+                f"（confidence={self.confidence:g}）"
+            )
         if self.inferred:
             return (
                 f"皮肤推断({self.source or OUTFIT_SOURCE_MODEL}): "
@@ -1040,6 +1394,149 @@ async def infer_outfit_via_llm(
     )
 
 
+# ── 解析（LLM）：把「穿着类候选」转成服装关键词（1.0.28）──────────────
+#
+# 需求：内置词表与皮肤表都**没有**的穿着词（「雨衣」「白色长裙」「换上战甲」），
+# 也要自动用大模型找出提示词并注入 —— 这条是 1.0.28 的第 ④ 档，**只在候选
+# "看起来是穿着"**（:func:`wear_like_candidate`）时走，且同样受
+# ``outfits.auto_resolve`` 管；具体皮肤名仍然走 ③（:func:`resolve_outfit_via_llm`）。
+#
+# 提示词与皮肤那套**刻意分开**：任务从「这是哪一套皮肤」变成「把这次说的穿着
+# 转成 nai_artist 能用的服装关键词」，并明确要求"**不是穿着就返回 unknown=true**"
+# —— 两者的失败口径都是"什么都不注入"（绝不瞎编）。
+
+_WEAR_SYSTEM_PROMPT = """你是服装 / 穿着资料助手，服务于 NovelAI 生图提示词补全。
+
+任务：用户说了一个**泛指的穿着**（**不是**某个角色的皮肤 / 时装名），例如
+「学生装」「居家服」「白色长裙」「雨衣」「换上战甲」。请把它转成可以直接写进
+NovelAI（Danbooru）提示词的**英文服装关键词**。
+
+输出格式（**只输出一个 JSON 对象**，不要 markdown 代码块，不要任何解释文字）：
+{"unknown": false, "tag": "关键词1, 关键词2", "keywords": ["关键词1", "关键词2"], "confidence": 0.9}
+
+字段说明：
+- unknown：布尔值。**用户说的不是穿着、或你看不出这是什么衣服时填 true**，
+  其余字段留空即可 —— 宁可不答，也不要猜。
+- tag：把关键词写成**一段逗号分隔的字符串**（与 keywords 等价，写一种即可）。
+- keywords：把这次说的穿着转成英文服装关键词（款式 / 材质 / 颜色 / 配饰），
+  例如 学生装 → ["school uniform", "pleated skirt"]、
+  居家服 → ["loungewear", "casual", "t-shirt"]、
+  白色长裙 → ["white dress", "long skirt"]、雨衣 → ["raincoat", "hood"]。
+  硬性要求：**全部小写 ASCII**，只用小写字母、数字、空格、下划线、连字符、
+  冒号与单引号；**不要**写角色标签（形如 `\\(…\\)` 的括号一律不要）、
+  不要写画质词（masterpiece / best quality 之类）。
+  错误示例（一律不要）：["雨衣"]（非 ASCII）、["Raincoat"]（大写）、
+  ["raincoat (yellow)"]（括号未转义）。
+- confidence：你对这次判断的把握，0 到 1 之间的小数。
+
+硬性规则：
+- 只输出 JSON，不要 markdown 代码块，不要前后缀说明；
+- 只描述**服装外观**，不要编造出处作品、不要把角色名当关键词、不要输出中文关键词；
+- 不确定就 unknown=true —— 猜错会让下游把衣服画错，比不答更糟。"""
+
+_WEAR_USER_TEMPLATE = """用户说的穿着：{name}
+{context}请按要求输出 JSON。"""
+
+
+async def resolve_wear_via_llm(
+    name: str,
+    *,
+    translate_model: str = "",
+    timeout: float = 0.0,
+    context_text: str = "",
+) -> ResolvedOutfit:
+    """把「穿着类候选」交给模型转成服装关键词（1.0.28，第 ④ 档）。
+
+    与 :func:`resolve_outfit_via_llm` / :func:`infer_outfit_via_llm` **共用同一套
+    管道**：同一个 ``llm_api``、同一个模型（``general.translate_model``，留空回退
+    ``UTILS_SMALL``）、同一个超时（``general.llm_timeout``）、同一套 JSON 提取与
+    :func:`parse_outfit_resolution_payload` 校验（只收小写 ASCII 关键词；
+    ``unknown=true`` / JSON 坏 / ``confidence`` 低于
+    :data:`OUTFIT_RESOLVE_MIN_CONFIDENCE` / 无有效关键词 → **解析失败**）。
+    差别只有提示词（:data:`_WEAR_SYSTEM_PROMPT`：**不是穿着就 unknown=true**）
+    与返回结果的 :attr:`ResolvedOutfit.wear`（一律 :data:`OUTFIT_WEAR_MODEL`，
+    于是日志前缀是 ``穿着解析(模型)`` / ``穿着解析(LLM)失败``）。
+
+    与另外两个一样：**本函数只做「纯解析」**（不读缓存、不写缓存、不打日志），
+    缓存与日志都在调用方（``handler._resolve_wear_with_cache``）—— 用例替换
+    （打桩）的就是本函数，缓存写在它内部时会一起被替换掉（与 C75 同一条理由）。
+
+    Args:
+        name: 用户消息里的原词（原始写法，进日志与注入说明）
+        translate_model: 解析用模型名；空字符串回退 ``UTILS_SMALL``
+        timeout: 超时秒数；``<=0`` 表示不限时
+        context_text: 可选的用户原话（提供线索）
+
+    Returns:
+        :class:`ResolvedOutfit`（``ok`` 为假表示解析失败，``reason`` 写明原因）
+    """
+    raw_name = (name or "").strip()
+    if not raw_name:
+        return ResolvedOutfit(reason="穿着词为空", wear=OUTFIT_WEAR_MODEL)
+
+    def _failure(reason: str, confidence: float = 0.0) -> ResolvedOutfit:
+        return ResolvedOutfit(
+            name=raw_name,
+            reason=reason,
+            confidence=confidence,
+            raw_name=raw_name,
+            wear=OUTFIT_WEAR_MODEL,
+        )
+
+    async def _run() -> str:
+        request = llm_api.create_llm_request(
+            model_set=_prepare_model_set(translate_model),
+            request_name="char_prompt_guard_wear",
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_WEAR_SYSTEM_PROMPT)))
+        context = (context_text or "").strip()
+        request.add_payload(
+            LLMPayload(
+                ROLE.USER,
+                Text(
+                    _WEAR_USER_TEMPLATE.format(
+                        name=raw_name,
+                        context=(
+                            f"用户原话（线索）：{context[:200]}\n" if context else ""
+                        ),
+                    )
+                ),
+            )
+        )
+        response = await request.send(stream=False)
+        return await _resolve_response_text(response)
+
+    try:
+        if timeout and timeout > 0:
+            raw_text = await asyncio.wait_for(_run(), timeout=timeout)
+        else:
+            raw_text = await _run()
+    except TimeoutError:
+        return _failure(f"模型超时（{timeout:g}s）")
+    except Exception as e:  # noqa: BLE001 —— 解析失败只返回失败结果（放行生图）
+        return _failure(f"调用失败({type(e).__name__}: {e})")
+
+    try:
+        payload = json.loads(_strip_json_object(raw_text))
+    except Exception as e:  # noqa: BLE001 —— JSON 坏 = 解析失败
+        return _failure(f"JSON 解析失败({type(e).__name__}: {e})")
+
+    outfit, reason, confidence = parse_outfit_resolution_payload(payload)
+    if outfit is None:
+        return _failure(reason, confidence)
+    # 穿着这条路**不用**模型给的中文 / 英文名：注入说明里写用户的原词
+    # （`（穿着：“雨衣”：raincoat）`），用户对着日志与画面就能核对。
+    return replace(
+        outfit,
+        name=raw_name,
+        character="",
+        raw_name=raw_name,
+        inferred=False,
+        wear=OUTFIT_WEAR_MODEL,
+        wear_source="",
+    )
+
+
 # ── 解析结果的进程内缓存（存储与 TTL 在本模块，读写在调用方）──────────
 
 #: 成功结果的缓存有效期（秒）：24 小时。皮肤外观是**静态知识**，同一天里没必要
@@ -1059,6 +1556,13 @@ OUTFIT_CACHE_LIMIT = 128
 #: 分开存只会多一套要维护的过期逻辑；后缀保证它与「皮肤名|角色名」两类键
 #: **永远不会互相覆盖**（「流萤」这个角色名不会与任何一套皮肤名撞键）。
 OUTFIT_INFER_CACHE_SUFFIX = "__infer__"
+
+#: 1.0.28：「穿着类候选交给模型」的缓存键后缀 —— ``<原词>|__wear__``。
+#:
+#: 与 :data:`OUTFIT_INFER_CACHE_SUFFIX` 同一个理由（共用一张缓存表、同一套 TTL，
+#: 后缀保证三类键互不覆盖）；但要与「皮肤名 + 角色名」分开：同一个词
+#: （例如「学生装」）在穿着这条路上是按**原词**缓存的，不掺角色。
+OUTFIT_WEAR_CACHE_SUFFIX = "__wear__"
 
 #: 缓存：``(皮肤名 + 角色名)`` 归一化键 → ``(写入时间, 结果)``
 _outfit_cache: dict[str, tuple[float, ResolvedOutfit]] = {}
@@ -1085,6 +1589,17 @@ def outfit_infer_cache_key(character: str) -> str:
     """
     owner = normalize_prompt_text(character) or (character or "").strip().lower()
     return f"{owner}|{OUTFIT_INFER_CACHE_SUFFIX}"
+
+
+def outfit_wear_cache_key(name: str) -> str:
+    """「穿着类候选交给模型」的缓存键：``<原词>|__wear__``（1.0.28）。
+
+    与 :func:`outfit_infer_cache_key` 同一套写法（归一化口径一致，但后缀固定成
+    下划线包起来的 ``__wear__``，好认也便于排查）。穿着关键词是**通用服装词**
+    （「雨衣 → raincoat」与角色无关），因此键里只有原词、不带角色。
+    """
+    key = normalize_prompt_text(name) or (name or "").strip().lower()
+    return f"{key}|{OUTFIT_WEAR_CACHE_SUFFIX}"
 
 
 def outfit_cache_get(
@@ -1223,23 +1738,39 @@ __all__ = [
     "OUTFIT_SOURCE_MODEL",
     "OUTFIT_SOURCE_TABLE",
     "OUTFIT_UNKNOWN_CHARACTER",
+    "OUTFIT_WEAR_CACHE_SUFFIX",
+    "OUTFIT_WEAR_MODEL",
+    "OUTFIT_WEAR_TYPE",
+    "WEAR_LOOK_CHARS",
+    "WEAR_SOURCE_BUILTIN",
+    "WEAR_SOURCE_CONFIG",
+    "WEAR_TYPE_KEYWORDS",
     "OutfitEntry",
     "ResolvedOutfit",
+    "WearTypeMatch",
     "extract_outfit_names",
     "find_outfit_entry",
     "find_unnamed_outfit_owner",
+    "find_wear_type",
     "infer_outfit_via_llm",
+    "looks_like_wear",
+    "looks_like_wear_sentence",
     "outfit_cache_get",
     "outfit_cache_key",
     "outfit_cache_put",
     "outfit_infer_cache_key",
+    "outfit_wear_cache_key",
     "outfit_write_title",
     "parse_outfit_resolution_payload",
     "parse_outfits",
+    "parse_wear_types",
     "reset_outfit_cache",
     "resolve_outfit_via_llm",
+    "resolve_wear_via_llm",
     "split_outfit_keywords",
     "validate_outfit_keyword",
     "validate_outfit_tag",
+    "wear_like_candidate",
+    "wear_type_table",
     "write_outfit_to_memory",
 ]

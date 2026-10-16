@@ -186,6 +186,42 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
 **C77~C88 的 ``make_config`` 需要皮肤功能时显式传 ``outfits_enabled=True`` 与
 ``outfits=...``**（1.0.23 的 ``outfits_infer_unnamed`` 默认 false，与插件默认值一致）。
 
+1.0.28 起把**「泛指的穿着类型」**和**「具体皮肤名」**分开（C89~C103），起因是用户
+需求：「当说的是『我想看你的 xxx』（如**学生**、**居家**、**泳衣**），判断**不是
+皮肤**，转成"穿对应的衣服"；否则衣服这个产出有时相当于黑箱，只能由 bot 决定 ——
+要能**看到注入了什么样的衣服**」；随后追加两条：「内置词表和皮肤表都没有的'穿着词'，
+也要自动用大模型找出提示词并注入」「判断逻辑这一步加上，防止和之前的打架；打到没有
+架可打再上传」。最终**优先级**（写进注释与 README）：
+
+**① 皮肤表命中**（零模型调用）→ **② 内置 / 配置的穿着类型表**
+（``outfit.WEAR_TYPE_KEYWORDS`` + ``[outfits] wear_types``，零模型调用）
+→ **③ 皮肤模型解析**（具体皮肤名，``auto_resolve``）→ **④ 穿着模型解析**
+（"看起来是穿着"的候选，穿着专用提示词，同样 ``auto_resolve``）
+→ **⑤ ``infer_unnamed``**（没说名字时由模型推断一套，默认关）。
+
+| 用例 | 钉住什么（冲突矩阵第几条） |
+| --- | --- |
+| C89 | 「学生装」命中**内置表**→ 零模型调用、注入 ``school uniform, pleated skirt``、日志 ``穿着类型解析(内置表)``、措辞是 ``（穿着：“…”：…）``（不是「皮肤/时装」），皮肤表内容一个字都不进来 |
+| C90 | 内置表的**同义写法**：「泳衣」/「居家服」各自命中并注入，日志可核对，0 次模型调用 |
+| C91 | **#1 皮肤表 ↔ 穿着类型**：皮肤表里的「学生会长制服」（本身也含穿着特征字）仍按**皮肤名**走 |
+| C92 | **#10 穿着 ↔ `outfits.enabled=false`**：零开销、不注入、无穿着日志；1.0.26 那条**纯字符串豁免识别**仍在 |
+| C93 | **④ 穿着模型解析**：「雨衣」（两张表都没有）→ 模型返回 ``raincoat`` → 注入、**恰好 1 次**调用、日志 ``穿着解析(模型)`` |
+| C94 | **④ 的降级**：模型 ``unknown=true`` → 不注入、日志 ``穿着解析(LLM)失败``、内容与关掉 ``[outfits]`` 时逐字一致 |
+| C95 | **#2 皮肤名 ↔ 穿着词同句**：只处理一个（皮肤表优先）、日志写明**被忽略的候选** |
+| C96 | **#3 穿着名 ↔ 表外点名豁免**：「画「雨衣」这套」→ 穿着名进豁免集，角色侧 0 次解析、``fix`` 不动画面里的角色标签、穿着照常注入 |
+| C97 | **#4 穿着词 ↔ 角色表内名字**：角色表里有「雨衣」时那是**角色**，绝不注入穿着关键词 |
+| C98 | **#5 穿着 ↔ 拆单**：角色仍按拆单规则（LLM 按画面判定补花火），穿着关键词仍追加 |
+| C99 | **#6 穿着 ↔ 一致性检测 fix**：替换角色标签时 ``（穿着：“…”：…）`` 段**原样保留** |
+| C100 | **#7 穿着 ↔ 幂等**：同类（穿着）不重复追加；不同类（皮肤 + 穿着）**可以共存** |
+| C101 | **#8 穿着 ↔ 记忆库写回**：穿着解析**不写回**（对照组：同一个配置下皮肤解析照旧写回 1 次） |
+| C102 | **#9 穿着 ↔ `infer_unnamed`**：识别到穿着时**绝不进推断**（推断调用 0 次） |
+| C103 | **穿着模型解析的缓存**：同一个穿着词连问两次 → 第二次命中缓存（0 次新调用）、注入逐字一致、日志 `穿着解析(缓存)` |
+
+``FakeOutfit`` 1.0.28 起再多一条桩：``outfit.resolve_wear_via_llm``（``wear`` 方法，
+用 ``wear_payload`` / ``wear_error`` 决定返回什么、调用记在 ``wear_calls``）——
+三条模型路（皮肤解析 / 皮肤推断 / 穿着解析）各自的 payload 与计数器互相独立。
+``make_config`` 的 ``[outfits]`` 默认值与 1.0.27 相同（C1~C88 一个字都没改）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -298,9 +334,11 @@ def make_config(
     1.0.19 的 C64~C67 同理（也都是 ``memory=True`` + :class:`FakeMemory`）。
     1.0.22 起 ``[outfits]``（皮肤/时装）**同样默认关掉**：C1~C76 是 1.0.21 及以前的
     行为回归，不该因为本机恰好配了皮肤表或可用模型而变红；需要皮肤功能的用例
-    （C77~C88）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
+    （C77~C102）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
     1.0.23 的 ``outfits_infer_unnamed``（「没说名字的那一套」）**默认 false**，
     与插件配置类的默认值一致（见 tests/check_import.py 的断言）。
+    1.0.28 的穿着类型表 ``outfits.wear_types`` 同样**默认留空**（= 只用内置表），
+    用例里没有额外开关要传。
     （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
     """
     cfg = CharPromptGuardConfig()
@@ -646,6 +684,11 @@ class FakeOutfit:
     完全独立**（各自的 payload 与计数器），因此 C83~C85 能分别断言
     「推断问了几次模型」「解析问了几次模型」。
 
+    1.0.28 起再多一条「穿着模型解析」：``outfit.resolve_wear_via_llm``
+    （同样两个位置）换成 :meth:`wear`，用 ``wear_payload`` / ``wear_error`` 决定
+    返回什么，调用记在 ``wear_calls`` —— 三条路各自独立，C93/C94 据此断言
+    「穿着那条路恰好问了一次」「皮肤那条路一次都没问」。
+
     退出 with 块时恢复原函数，并清掉解析缓存 —— 免得上一条用例的缓存把下一条
     用例的「该不该问模型」判断带偏。
     """
@@ -657,6 +700,8 @@ class FakeOutfit:
         error: BaseException | None = None,
         infer_payload: dict | None = None,
         infer_error: BaseException | None = None,
+        wear_payload: dict | None = None,
+        wear_error: BaseException | None = None,
     ) -> None:
         self.payload = payload if payload is not None else {"unknown": True}
         self.error = error
@@ -667,10 +712,18 @@ class FakeOutfit:
         )
         self.infer_error = infer_error
         self.infer_calls: list[str] = []
+        #: 1.0.28「穿着模型解析」那条路的假结果与调用记录
+        self.wear_payload = (
+            wear_payload if wear_payload is not None else {"unknown": True}
+        )
+        self.wear_error = wear_error
+        self.wear_calls: list[str] = []
         self._original_outfit = None
         self._original_handler = None
         self._original_infer_outfit = None
         self._original_infer_handler = None
+        self._original_wear_outfit = None
+        self._original_wear_handler = None
 
     async def __call__(self, name: str, *, character: str = "", **kwargs):
         """假解析函数：记录调用，再按 payload / error 返回。"""
@@ -730,6 +783,41 @@ class FakeOutfit:
             inferred=True,
         )
 
+    async def wear(self, name: str, **kwargs):
+        """假「穿着模型解析」函数（1.0.28）：记录调用，再按 wear_payload 返回。
+
+        校验链与皮肤解析**完全相同**（同一个 ``parse_outfit_resolution_payload``），
+        只是结果一定带 ``wear="模型"``、名字用用户的原词 —— 与
+        ``outfit.resolve_wear_via_llm`` 的真实行为一致。
+        """
+        from ..outfit import (
+            OUTFIT_WEAR_MODEL,
+            ResolvedOutfit,
+            parse_outfit_resolution_payload,
+        )
+
+        self.wear_calls.append(name)
+        if self.wear_error is not None:
+            raise self.wear_error
+        outfit, reason, confidence = parse_outfit_resolution_payload(self.wear_payload)
+        if outfit is None:
+            return ResolvedOutfit(
+                name=name,
+                reason=reason,
+                confidence=confidence,
+                raw_name=name,
+                wear=OUTFIT_WEAR_MODEL,
+            )
+        return ResolvedOutfit(
+            name=name,
+            keywords=outfit.keywords,
+            description=outfit.description,
+            source="模型",
+            confidence=confidence,
+            raw_name=name,
+            wear=OUTFIT_WEAR_MODEL,
+        )
+
     def __enter__(self) -> Self:
         from .. import handler as handler_module
         from .. import outfit as outfit_module
@@ -743,6 +831,11 @@ class FakeOutfit:
         self._original_infer_handler = handler_module.infer_outfit_via_llm
         outfit_module.infer_outfit_via_llm = self.infer  # type: ignore[assignment]
         handler_module.infer_outfit_via_llm = self.infer  # type: ignore[assignment]
+        # 1.0.28：穿着那条路同样一起替换（否则 C93/C94 会真的去问模型）
+        self._original_wear_outfit = outfit_module.resolve_wear_via_llm
+        self._original_wear_handler = handler_module.resolve_wear_via_llm
+        outfit_module.resolve_wear_via_llm = self.wear  # type: ignore[assignment]
+        handler_module.resolve_wear_via_llm = self.wear  # type: ignore[assignment]
         # 清缓存放在**替换之后**：这里清的是上一条用例留下的结果
         outfit_module.reset_outfit_cache()
         return self
@@ -759,6 +852,10 @@ class FakeOutfit:
             outfit_module.infer_outfit_via_llm = self._original_infer_outfit
         if self._original_infer_handler is not None:
             handler_module.infer_outfit_via_llm = self._original_infer_handler
+        if self._original_wear_outfit is not None:
+            outfit_module.resolve_wear_via_llm = self._original_wear_outfit
+        if self._original_wear_handler is not None:
+            handler_module.resolve_wear_via_llm = self._original_wear_handler
         outfit_module.reset_outfit_cache()
         return False
 
@@ -797,6 +894,32 @@ INFER_PAYLOAD = {
 }
 #: 期望出现在提示词里的「推断出来的」关键词
 INFER_KEYWORDS = ("firefly's outfit", "white dress")
+
+# ── 1.0.28：泛指的穿着（内置表 / 穿着模型解析）用例的夹具 ──────────────
+#: 「学生装」——命中**内置穿着类型表**的「学生装」（同义写法之一），零模型调用
+WEAR_STUDENT_REQUEST = "我想看你的学生装～"
+#: 内置表里「学生 / 学生装 / 校服 / JK / 水手服」映射到的那组关键词
+STUDENT_KEYWORDS = ("school uniform", "pleated skirt")
+#: 「泳衣」/「居家服」——同样是内置表的同义写法（C90 两条）
+WEAR_SWIM_REQUEST = "我想看你的泳衣～"
+WEAR_HOME_REQUEST = "我想看你的居家服～"
+SWIM_KEYWORDS = ("swimsuit",)
+HOME_KEYWORDS = ("loungewear", "casual", "home wear", "t-shirt")
+#: 「雨衣」——**内置表与皮肤表都没有**，但含穿着特征字「衣」→ 走穿着模型解析（C93/C94）
+WEAR_REQUEST = "我想看你的雨衣～"
+#: 穿着模型解析的假结果（只给小写 ASCII 服装关键词，与需求里的例子同形）
+WEAR_PAYLOAD = {
+    "unknown": False,
+    "tag": "raincoat, hood",
+    "keywords": ["raincoat", "hood"],
+    "confidence": 0.9,
+}
+WEAR_KEYWORDS = ("raincoat", "hood")
+#: 「学生会长制服」——**皮肤表里的具体皮肤名**，同时也是穿着特征词（C91 防误判）
+COUNCIL_OUTFIT = (
+    "学生会长制服 | 爱莉希雅 | student council uniform | 爱莉希雅的学生会长制服"
+)
+COUNCIL_REQUEST = "我想看你的学生会长制服"
 
 
 def natural_params(
@@ -4457,7 +4580,741 @@ async def run_cases() -> int:
             f"{type(e).__name__}: {e}",
         )
 
+    # ── C89 泛指的穿着类型（内置表命中）→ 零模型调用，注入穿着关键词（1.0.28）──
+    # 需求原话：「当说的是『我想看你的 xxx』（如**学生**、**居家**、**泳衣**），
+    # 判断**不是皮肤**，转成"穿对应的衣服"；否则衣服这个产出有时相当于黑箱，
+    # 只能由 bot 决定 —— 要能**看到注入了什么样的衣服**。」
+    # 「学生装」不在皮肤表里（皮肤表里只有「粉色妖精小姐」），但命中**内置穿着类型
+    # 表** → 直接用表里的关键词，一次模型都不问；日志必须能看出"命中哪张表、
+    # 命中哪个词、注入了什么"，注入措辞必须是「穿着」而不是「皮肤/时装」。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_STUDENT_REQUEST)
+        params["stream_id"] = "s-c89"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in STUDENT_KEYWORDS)  # ★ 穿着关键词进来了
+            and "（穿着：“学生装”：school uniform, pleated skirt）" in c  # ★ 措辞是"穿着"
+            and "皮肤/时装" not in c  # ★ 不与皮肤说明混淆
+            and all(keyword not in c for keyword in PINK_KEYWORDS)  # 皮肤表内容一个字没进来
+            and "粉色妖精小姐" not in c
+            and "爱莉希雅" in c  # ★ 角色注入照旧
+            and TAG_ELYSIA in c
+            and stub.calls == []  # ★ 皮肤模型 0 次
+            and stub.wear_calls == []  # ★ 穿着模型 0 次（内置表命中）
+            and stub.infer_calls == []
+            and "穿着类型解析(内置表): 学生装 → school uniform, pleated skirt" in records
+            and "已追加穿着（share_visual / natural）: 学生装 → school uniform, pleated skirt"
+            in records
+            and "皮肤解析" not in records
+        )
+        check(
+            "C89 学生装 → 内置穿着类型表命中，零模型调用并注入",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r} / 穿着调用 = "
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C89 学生装 → 内置穿着类型表命中，零模型调用并注入",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C90 内置表的同义写法（泳衣 / 居家服）→ 各自命中并注入（1.0.28）────────
+    # 需求追加：「内置穿着类型表要覆盖同义词，避免常见词白跑一次模型」——
+    # 「泳衣」「居家服」都不在皮肤表里，但分别命中内置表的「泳衣」「居家服」
+    # （包含匹配：居家服 里含 居家，取**最长**的那个词 → 命中「居家服」）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        for label, request, keywords in (
+            ("泳衣", WEAR_SWIM_REQUEST, SWIM_KEYWORDS),
+            ("居家服", WEAR_HOME_REQUEST, HOME_KEYWORDS),
+        ):
+            params = natural_params(PINK_SCENE, text=request)
+            params["stream_id"] = f"s-c90-{label}"
+            with (
+                FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+                FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+                LogCapture() as logs,
+            ):
+                out = await fire(cfg, params)
+            content = out["args"]["content"]
+            records = logs.records_text()
+            hit = (
+                all(keyword in content for keyword in keywords)  # ★ 关键词进来了
+                and f"穿着类型解析(内置表): {label} → {', '.join(keywords)}" in records
+                and f"（穿着：“{label}”" in content
+                and "爱莉希雅" in content  # 角色注入照旧
+                and "穿着解析(模型)" not in records  # 没有白跑一次模型
+                and all(keyword not in content for keyword in PINK_KEYWORDS)
+                and stub.calls == []
+                and stub.wear_calls == []
+            )
+            runs.append((label, hit, f"content={content!r} 日志={records!r}"))
+        check(
+            "C90 泳衣 / 居家服 → 内置表同义词各自命中并注入（0 次模型调用）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C90 泳衣 / 居家服 → 内置表同义词各自命中并注入（0 次模型调用）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C91（防误判）皮肤表里的「学生会长制服」→ 仍按**皮肤名**走（1.0.28）────
+    # 冲突矩阵第 1 条：**皮肤表命中优先**。皮肤表里的「学生会长制服」本身也含穿着
+    # 特征字（学生 / 制服），若优先级反了就会被拆成"学生装"、用错关键词。
+    # 单元级先钉住"候选确实同时是穿着特征词"（否则这条用例是空转）。
+    try:
+        from ..outfit import find_wear_type, looks_like_wear
+
+        cfg = make_config(roster=RS3, outfits=COUNCIL_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=COUNCIL_REQUEST)
+        params["stream_id"] = "s-c91"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            find_wear_type("学生会长制服") is not None  # ★ 它确实"像穿着"（不是空转）
+            and looks_like_wear("学生会长制服")
+            and "student council uniform" in c  # ★ 走的是皮肤表的关键词
+            and "学生会长制服" in c
+            and "school uniform" not in c  # ★ 没有被拆成"学生装"
+            and "（穿着：" not in c
+            and "皮肤解析(表)" in records
+            and "穿着类型解析" not in records  # ★ 没有走穿着那条路
+            and stub.calls == []
+            and stub.wear_calls == []
+        )
+        check(
+            "C91 皮肤表里的「学生会长制服」仍按皮肤名走（含穿着特征字也不拆）",
+            ok,
+            f"content = {c!r}\n        穿着调用 = {stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C91 皮肤表里的「学生会长制服」仍按皮肤名走（含穿着特征字也不拆）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C92 [outfits] enabled=false → 穿着整条链路零开销（1.0.28）────────────
+    # 冲突矩阵第 10 条：关掉时**不注入、不调模型、日志里没有 `穿着类型解析`**，
+    # 但 1.0.26 那条**纯字符串识别**（只为把皮肤名从"表外角色名"里豁免掉）仍在。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=False)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_STUDENT_REQUEST)
+        params["stream_id"] = "s-c92"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            stub.calls == []  # ★ 0 次模型调用
+            and stub.wear_calls == []
+            and stub.infer_calls == []
+            and "穿着类型解析" not in records  # ★ 没有穿着日志
+            and "已追加穿着" not in records
+            and "（穿着：" not in c  # ★ 没有注入
+            and all(keyword not in c for keyword in STUDENT_KEYWORDS)
+            and all(keyword not in c for keyword in PINK_KEYWORDS)
+            and "爱莉希雅" in c  # 角色注入照旧
+            and "皮肤/时装=仅豁免识别（outfits.enabled=false）" in records  # ★ 豁免识别仍在
+        )
+        check(
+            "C92 outfits.enabled=false → 穿着零开销、不注入、豁免识别仍在",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r} / 穿着调用 = "
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C92 outfits.enabled=false → 穿着零开销、不注入、豁免识别仍在",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C93 内置表与皮肤表都没有的穿着词（雨衣）→ 穿着模型解析（1.0.28 第 ④ 档）──
+    # 需求追加：「内置词表和皮肤表都没有的'穿着词'，也要自动用大模型找出提示词并注入」。
+    # 「雨衣」含穿着特征字「衣」→ 走**穿着专用提示词**（假模型返回 raincoat / hood），
+    # 恰好问一次模型；皮肤那条路一次都不问，日志是 `穿着解析(模型)` 而不是皮肤解析。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_REQUEST)
+        params["stream_id"] = "s-c93"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in WEAR_KEYWORDS)  # ★ 模型给的穿着关键词进来了
+            and "（穿着：“雨衣”：raincoat, hood）" in c
+            and "皮肤/时装" not in c
+            and all(keyword not in c for keyword in PINK_KEYWORDS)
+            and "爱莉希雅" in c
+            and stub.wear_calls == ["雨衣"]  # ★ 穿着那条路恰好问一次
+            and stub.calls == []  # ★ 皮肤那条路一次都没问
+            and stub.infer_calls == []
+            and "穿着解析(模型): 雨衣 → raincoat, hood" in records
+            and "建议加入穿着类型表：雨衣 | raincoat, hood" in records
+            and "皮肤解析" not in records
+            and "已追加穿着（share_visual / natural）: 雨衣 → raincoat, hood" in records
+        )
+        check(
+            "C93 雨衣（两张表都没有）→ 穿着模型解析注入、恰好 1 次调用",
+            ok,
+            f"content = {c!r}\n        穿着调用 = {stub.wear_calls!r} / 皮肤调用 = "
+            f"{stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C93 雨衣（两张表都没有）→ 穿着模型解析注入、恰好 1 次调用",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C94 穿着模型解析返回 unknown=true → 什么都不注入（1.0.28 第 ④ 档降级）──
+    # 校验口径与皮肤解析完全相同：模型说"这不是穿着 / 我不知道"（或 JSON 坏 /
+    # confidence 低于 0.5 / 没有可用关键词）时**什么都不注入** —— 绝不瞎编一套衣服；
+    # 内容与关掉 [outfits] 时**逐字一致**。
+    try:
+        cfg_on = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg_on.general.history_cache_ttl = 0.0
+        cfg_off = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=False)
+        cfg_off.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_REQUEST)
+        params["stream_id"] = "s-c94"
+        history = [history_message("我们来聊爱莉希雅吧", 1.0)]
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload={"unknown": True}) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out_on = await fire(cfg_on, params)
+        with FakeHistory(history):
+            out_off = await fire(cfg_off, params)
+        c = out_on["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword not in c for keyword in WEAR_KEYWORDS)  # ★ 没有穿着关键词
+            and "（穿着：" not in c
+            and "皮肤/时装" not in c
+            and all(keyword not in c for keyword in PINK_KEYWORDS)
+            and stub.wear_calls == ["雨衣"]  # 问过一次（模型说不知道）
+            and stub.calls == []
+            and "穿着解析(LLM)失败" in records  # ★ 失败也标明是「穿着」那条路
+            and "unknown" in records  # ★ 失败原因写清楚
+            and "建议加入穿着类型表" not in records
+            and c == out_off["args"]["content"]  # ★ 与关掉 [outfits] 时逐字一致
+            and "爱莉希雅" in c
+            and TAG_ELYSIA in c
+        )
+        check(
+            "C94 穿着解析 unknown=true → 不注入、日志写明失败原因、内容与关掉时一致",
+            ok,
+            f"content = {c!r}\n        关掉 [outfits] 的 content = "
+            f"{out_off['args']['content']!r}\n        穿着调用 = {stub.wear_calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C94 穿着解析 unknown=true → 不注入、日志写明失败原因、内容与关掉时一致",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C95（冲突矩阵第 2 条）同一句里既有穿着词又有皮肤名 → 只处理一个 ────────
+    # 规则：保持"一图一套"语义 —— 只处理**一个**（取最新一条消息里最长的候选，
+    # 与 1.0.22 的皮肤选择规则一致），皮肤表命中仍然优先；**被忽略的候选写进日志**
+    # （否则用户从画面里根本看不出"这次为什么加了这套衣服"）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        request = "穿学生装，再看粉色妖精小姐这套"
+        params = natural_params(PINK_SCENE, text=request)
+        params["stream_id"] = "s-c95"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "pink elf dress" in c  # ★ 皮肤表命中 → 走 ①
+            and "粉色妖精小姐" in c
+            and all(keyword not in c for keyword in STUDENT_KEYWORDS)  # ★ 穿着词被忽略
+            and "（穿着：" not in c
+            and "皮肤解析(表)" in records
+            and "穿着类型解析" not in records
+            and "皮肤/穿着候选: 本次只处理「粉色妖精小姐」" in records  # ★ 一图一套
+            and "被忽略的候选：学生装" in records  # ★ 被忽略的那个写明
+            and stub.calls == []
+            and stub.wear_calls == []
+        )
+        check(
+            "C95 同句皮肤名 + 穿着词 → 只处理一个（皮肤优先），日志写明被忽略的候选",
+            ok,
+            f"content = {c!r}\n        穿着调用 = {stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C95 同句皮肤名 + 穿着词 → 只处理一个（皮肤优先），日志写明被忽略的候选",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C96（冲突矩阵第 3 条）穿着名与皮肤名一样进**豁免集** → 不被当成表外角色名 ──
+    # 「画「雨衣」这套」的引号写法一定会被 1.0.20 的"表外点名"提取链抓到；若穿着名
+    # 不进豁免集，1.0.21 的角色解析就会为此多问一次模型，`fix` 时还会去动画面里
+    # 那个"用户这批消息没提过"的表内标签。这里断言：角色侧 0 次解析、日志有
+    # `皮肤名豁免`、画面里的 elysia 标签原样保留，而穿着照常注入。
+    try:
+        from ..character import extract_outside_names, parse_roster
+
+        request = "画「雨衣」这套"
+        raw = f"{TAG_ELYSIA}, 粉色长发的少女站在雨中"
+        extracted = extract_outside_names(request, parse_roster(RS3))
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"  # 最能暴露风险的模式
+        params = natural_params(raw, text=request)
+        params["stream_id"] = "s-c96"
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as resolve_stub,
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as outfit_stub,
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            extracted == ["雨衣"]  # ★ 提取链真的会抓到它（不是空转）
+            and all(keyword in c for keyword in WEAR_KEYWORDS)  # ★ 穿着照常注入
+            and outfit_stub.wear_calls == ["雨衣"]
+            and resolve_stub.calls == []  # ★ 角色侧一次解析都没问
+            and "角色解析(模型)" not in records
+            and "角色解析(LLM)" not in records
+            and "用户点名「雨衣」" not in records  # ★ 没被当成表外角色名
+            and "皮肤名豁免" in records  # ★ 日志里能看到"确实豁免了"
+            and TAG_ELYSIA in c  # 画面里的角色标签原样保留（fix 没动它）
+            and c.startswith(raw)
+        )
+        check(
+            "C96「画「雨衣」这套」→ 穿着名进豁免集（角色侧 0 次解析、穿着照常注入）",
+            ok,
+            f"提取(不豁免) = {extracted!r}\n        content = {c!r}\n"
+            f"        角色解析调用 = {resolve_stub.calls!r} / 穿着调用 = "
+            f"{outfit_stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C96「画「雨衣」这套」→ 穿着名进豁免集（角色侧 0 次解析、穿着照常注入）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C97（冲突矩阵第 4 条）候选命中**角色表** → 一律按角色处理，绝不当穿着 ────
+    # 角色表里加一行「雨衣」：用户说「我想看你的雨衣」时那是**角色名**，
+    # 不该被解析成穿着关键词（`extract_outfit_names` 的"不在角色表里"那道过滤）。
+    try:
+        roster_rain = (
+            RS3
+            + "\n"
+            + r"雨衣 | 崩坏三 (Honkai Impact 3rd) | ame,雨衣 | ame \(honkai impact 3rd\)"
+        )
+        cfg = make_config(roster=roster_rain, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_REQUEST)
+        params["stream_id"] = "s-c97"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "雨衣" in c  # ★ 作为**角色**补进来
+            and all(keyword not in c for keyword in WEAR_KEYWORDS)  # ★ 没有穿着关键词
+            and "（穿着：" not in c
+            and "穿着类型解析" not in records
+            and "穿着解析" not in records
+            and stub.calls == []
+            and stub.wear_calls == []
+        )
+        check(
+            "C97 候选命中角色表（雨衣是角色名）→ 不注入任何穿着关键词",
+            ok,
+            f"content = {c!r}\n        穿着调用 = {stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C97 候选命中角色表（雨衣是角色名）→ 不注入任何穿着关键词",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C98（冲突矩阵第 5 条）穿着 ↔ 拆单：角色照旧按拆单规则，穿着照样注入 ─────
+    # 与 C54 完全同一个拆单场景（历史里那条「本尊看看，然后穿着爱莉来看看～」），
+    # 触发消息换成本次要穿的「学生装」：角色仍然由**拆单 → LLM 按画面判定**给出
+    # （补花火、不补爱莉希雅），而穿着关键词**不参与角色判定**、照常追加。
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(
+            roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True, use_llm=True
+        )
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.description_first = False  # 旧条件全不成立 → 只能靠拆单强制问
+        cfg.multi.llm_mode = "fallback"
+        raw = "清晨室内明亮柔和的光线。白发少女刚起床，站在镜头前，粉色眼睛看向镜头"
+        calls = {"n": 0}
+
+        async def fake_extract(**kwargs):
+            calls["n"] += 1
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(
+                        name="花火", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    )
+                ],
+                multi=False,
+            )
+
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            history = [
+                history_message("本尊看看，然后穿着爱莉来看看～", 1.0),
+                history_message("穿学生装～", 0.5),
+            ]
+            with (
+                FakeHistory(history),
+                FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+                LogCapture() as logs,
+            ):
+                out = await fire(
+                    cfg,
+                    {
+                        "signature": "nai_artist:action:share_photo",
+                        "action_name": "share_photo",
+                        "args": {"content": raw},
+                        "message": FakeMessage("嗯～"),
+                        "stream_id": "s-c98",
+                    },
+                )
+        finally:
+            handler_module.extract_characters_via_llm = original
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        ok = (
+            "花火" in c  # ★ 角色仍按拆单规则（LLM 按画面判定）
+            and "爱莉希雅" not in c  # 拆单时绝不回退到上文那个爱莉希雅
+            and all(keyword in c for keyword in STUDENT_KEYWORDS)  # ★ 穿着照常注入
+            and "（穿着：“学生装”" in c
+            and "拆单" in debugs
+            and calls["n"] == 1  # 拆单强制走 LLM
+            and stub.calls == []  # 穿着走内置表，一次模型都没问
+            and stub.wear_calls == []
+        )
+        check(
+            "C98 穿着 ↔ 拆单：角色按拆单规则（补花火），穿着关键词仍追加",
+            ok,
+            f"content = {c!r}\n        LLM 调用次数 = {calls['n']} / 穿着调用 = "
+            f"{stub.wear_calls!r}\n        日志 = {debugs!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C98 穿着 ↔ 拆单：角色按拆单规则（补花火），穿着关键词仍追加",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C99（冲突矩阵第 6 条）fix 替换角色标签时**不得**动穿着段 ──────────────
+    # 穿着关键词只过 `validate_outfit_keyword`（含 1.0.26 那条"拒收 \\(…\\)"），
+    # 所以它不可能被当成角色标签；而且注入本来就排在两条一致性检查之后。
+    # 这里用最狠的场景：画面里**已经有**一段穿着说明，用户点名了一个表外角色，
+    # fix 把画面里的 hanabi 标签替换掉 —— 穿着段必须**原样保留**。
+    try:
+        cfg = make_config(roster=RS3, outfits="", outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        clause = "（穿着：“学生装”：school uniform, pleated skirt）"
+        raw = f"{TAG_HANABI}, 银白色长发的少女站在镜头前，一身蓝裙。{clause}"
+        params = natural_params(raw, text="扮演刻律德拉")
+        params["stream_id"] = "s-c99"
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as stub,
+            FakeOutfit({"unknown": True}) as outfit_stub,
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            TAG_HANABI not in c  # ★ 画面里的错误角色标签被替换掉
+            and TAG_KLEIDRA in c
+            and clause in c  # ★ 穿着段原样保留（一个字没动）
+            and c.count("（穿着：“") == 1
+            and "已追加穿着" not in records  # 已经有一段 → 同类幂等，不重复追加
+            and "一致性检查=冲突已修正（fix）" in records
+            and outfit_stub.wear_calls == []
+        )
+        check(
+            "C99 fix 替换角色标签时穿着段原样保留（两者互不干扰）",
+            ok,
+            f"content = {c!r}\n        角色解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C99 fix 替换角色标签时穿着段原样保留（两者互不干扰）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C100（冲突矩阵第 7 条）幂等：同类不重复追加、**不同类可以共存** ────────
+    # ① 画面里已经有**穿着**说明 + 这次又要穿「学生装」→ 不再追加第二段（多图轮
+    #    的第 2、3 张就是这种入参）；
+    # ② 画面里已经有**皮肤**说明 + 这次要穿「学生装」→ 穿着说明**照样追加**
+    #    （两类各有各的标记，互不吞并）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        wear_clause = "（穿着：“学生装”：school uniform, pleated skirt）"
+        skin_clause = "（皮肤/时装：“粉色妖精小姐”：pink elf dress, fairy wings）"
+        runs: list[tuple[str, str, str, list[str], list[str]]] = []
+        for label, raw in (
+            ("同类", f"帮我画一张她战斗的样子。{wear_clause}"),
+            ("不同类", f"帮我画一张她战斗的样子。{skin_clause}"),
+        ):
+            params = natural_params(raw, text=WEAR_STUDENT_REQUEST)
+            params["stream_id"] = f"s-c100-{label}"
+            with (
+                FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+                FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+                LogCapture() as logs,
+            ):
+                out = await fire(cfg, params)
+            runs.append(
+                (
+                    label,
+                    out["args"]["content"],
+                    logs.records_text(),
+                    list(stub.calls),
+                    list(stub.wear_calls),
+                )
+            )
+        same_content, same_records = runs[0][1], runs[0][2]
+        diff_content, diff_records = runs[1][1], runs[1][2]
+        ok = (
+            same_content.count("（穿着：“") == 1  # ★ 同类：没有追加第二段
+            and "已追加穿着" not in same_records
+            and same_content.startswith("帮我画一张她战斗的样子。")  # 原文没被改写
+            and wear_clause in same_content  # 那一段还在原处
+            and runs[0][3] == []  # 内置表命中：0 次模型调用
+            and runs[0][4] == []
+            and diff_content.count("（穿着：“") == 1  # ★ 不同类：穿着段照样追加
+            and diff_content.count("（皮肤/时装：“") == 1  # 皮肤段原样留着
+            and "已追加穿着" in diff_records
+            and "school uniform" in diff_content
+            and runs[1][3] == []
+            and runs[1][4] == []
+        )
+        check(
+            "C100 幂等：同类（穿着）不重复追加，不同类（皮肤+穿着）可以共存",
+            ok,
+            f"同类 content = {same_content!r}\n        不同类 content = {diff_content!r}\n"
+            f"        同类日志 = {same_records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C100 幂等：同类（穿着）不重复追加，不同类（皮肤+穿着）可以共存",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C101（冲突矩阵第 8 条）穿着解析结果**不写回记忆库** ────────────────────
+    # 记忆库写回那条通道写的是"某一套皮肤属于谁"（标题「皮肤指向：…」）；穿着关键词
+    # 是**通用服装词**（雨衣 → raincoat），记下来既没有复用价值，也不该被当成"用户
+    # 确认过的身份事实"。对照组：同一个配置下皮肤解析**照旧写回 1 次**（证明假传输层
+    # 真的挂上了、写回通道是通的 —— 否则"0 次"毫无意义）。
+    try:
+        cfg = make_config(roster=RS3, outfits="", outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.memory.enabled = True
+        cfg.memory.write_back = True
+        cfg.outfits.write_back = True
+        history = [history_message("我们来聊爱莉希雅吧", 1.0)]
+        params_skin = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params_skin["stream_id"] = "s-c101-skin"
+        params_wear = natural_params(PINK_SCENE, text=WEAR_REQUEST)
+        params_wear["stream_id"] = "s-c101-wear"
+        with (
+            FakeMemory() as mem,
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out_skin = await fire(cfg, params_skin)
+            skin_posts = len(mem.post)
+            out_wear = await fire(cfg, params_wear)
+            wear_posts = len(mem.post) - skin_posts
+        c_skin = out_skin["args"]["content"]
+        c_wear = out_wear["args"]["content"]
+        records = logs.records_text()
+        skin_title = str(mem.post[0][1].get("title") or "") if mem.post else ""
+        ok = (
+            skin_posts == 1  # ★ 皮肤那条路写回 1 次（通道是通的）
+            and "皮肤指向" in skin_title
+            and "粉色妖精小姐" in skin_title
+            and wear_posts == 0  # ★ 穿着那条路 0 次
+            and "pink elf dress" in c_skin
+            and all(keyword in c_wear for keyword in WEAR_KEYWORDS)
+            and stub.calls == ["粉色妖精小姐"]
+            and stub.wear_calls == ["雨衣"]
+            and "皮肤解析结果已写回记忆库" in records
+        )
+        check(
+            "C101 穿着解析结果不写回记忆库（皮肤那条路照旧写 1 次）",
+            ok,
+            f"皮肤 POST = {skin_posts}（title={skin_title!r}）/ 穿着 POST = {wear_posts}\n"
+            f"        content(皮肤) = {c_skin!r}\n        content(穿着) = {c_wear!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C101 穿着解析结果不写回记忆库（皮肤那条路照旧写 1 次）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C102（冲突矩阵第 9 条）穿着 ↔ infer_unnamed（默认关）：两者互斥 ────────
+    # 「没说名字的那一套」只在**一个候选都没识别到**时才走；这次既说了穿着
+    # （学生装）、又说了「流萤的那一套皮肤」，规则是：穿着照常注入，
+    # **推断那条路一次都不问**（否则同一次生图会同时塞进两套衣服）。
+    try:
+        cfg = make_config(
+            roster=RS3,
+            outfits=RS_OUTFIT,
+            outfits_enabled=True,
+            outfits_infer_unnamed=True,  # 推断开关**开着**，仍然不该被走到
+        )
+        cfg.general.history_cache_ttl = 0.0
+        request = "穿学生装，然后来一张流萤的那一套皮肤"
+        params = natural_params(PINK_SCENE, text=request)
+        params["stream_id"] = "s-c102"
+        with (
+            FakeOutfit(
+                OUTFIT_PAYLOAD,
+                infer_payload=INFER_PAYLOAD,
+                wear_payload=WEAR_PAYLOAD,
+            ) as stub,
+            FakeHistory([history_message("我们来聊流萤吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in STUDENT_KEYWORDS)  # ★ 穿着照常注入
+            and "（穿着：“学生装”" in c
+            and all(keyword not in c for keyword in INFER_KEYWORDS)  # ★ 推断那条路没走
+            and "流萤·花嫁" not in c
+            and stub.infer_calls == []  # ★ 推断调用 0 次
+            and stub.wear_calls == []  # 穿着走内置表
+            and stub.calls == []
+            and "皮肤推断" not in records
+            and "穿着类型解析(内置表): 学生装" in records
+        )
+        check(
+            "C102 穿着 ↔ infer_unnamed：识别到穿着时绝不进推断（推断调用 0 次）",
+            ok,
+            f"content = {c!r}\n        推断调用 = {stub.infer_calls!r} / 穿着调用 = "
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C102 穿着 ↔ infer_unnamed：识别到穿着时绝不进推断（推断调用 0 次）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C103（缓存）穿着模型解析命中缓存 → 第二次不再问模型（1.0.28）──────────
+    # 冲突矩阵没单列这条，但它是同一类"架"：单次多图（「画三张」）/ 用户连问两次时，
+    # 同一个穿着词**不该问两遍模型**。缓存键 ``<原词>|__wear__``（成功 24 小时），
+    # 命中日志 ``穿着解析(缓存)``，两次注入的内容逐字一致。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=WEAR_REQUEST)
+        params["stream_id"] = "s-c103"
+        history = [history_message("我们来聊爱莉希雅吧", 1.0)]
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, wear_payload=WEAR_PAYLOAD) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out_first = await fire(cfg, params)
+            out_second = await fire(cfg, params)
+        c_first = out_first["args"]["content"]
+        c_second = out_second["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            stub.wear_calls == ["雨衣"]  # ★ 只问了一次（第二次命中缓存）
+            and all(keyword in c_first for keyword in WEAR_KEYWORDS)
+            and c_first == c_second  # ★ 两次注入逐字一致
+            and "穿着解析(缓存): 雨衣 → raincoat, hood" in records
+            and "穿着解析(模型): 雨衣 → raincoat, hood" in records
+        )
+        check(
+            "C103 穿着解析命中缓存 → 第二次 0 次模型调用、注入一致",
+            ok,
+            f"穿着调用 = {stub.wear_calls!r}\n        content(第一次) = {c_first!r}\n"
+            f"        content(第二次) = {c_second!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C103 穿着解析命中缓存 → 第二次 0 次模型调用、注入一致",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
     # ── C14/C15 需要真调小模型 ─────────────────────────────────────
+
     if RUN_LLM:
         try:
             from src.core.config.model_config import init_model_config

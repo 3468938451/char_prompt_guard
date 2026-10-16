@@ -208,6 +208,43 @@ off/warn/fix，与期望集合那套互不影响）：
   ``皮肤推断(模型): 流萤 → <皮肤名> → <关键词>（来源=模型推断，confidence=…）``；
   **默认关**时一次模型都不问、一条相关日志都不打，行为与 1.0.22 逐字一致；
   推断结果**不写回记忆库**（它是模型猜的，不该当成"用户确认过的事实"记住）。
+
+1.0.28 起把**「泛指的穿着类型」**和**「具体皮肤名」**分开（需求原话：「当说的是
+『我想看你的 xxx』（如**学生**、**居家**、**泳衣**），判断**不是皮肤**，转成
+『穿对应的衣服』；否则衣服这个产出有时相当于黑箱，只能由 bot 决定 —— 要能
+**看到注入了什么样的衣服**」）。角色那一侧**依然一个字没改**，变的只有"这次要穿
+什么、由谁决定"：
+
+- **最终优先级**（①→⑤，见 :meth:`CharacterGuardHandler._resolve_outfit`）：
+  **① 皮肤表命中**（零模型调用）→ **② 内置 / 配置的穿着类型表**
+  （``[outfits] wear_types`` + ``outfit.WEAR_TYPE_KEYWORDS``，**零模型调用**）
+  → **③ 皮肤模型解析**（``outfits.auto_resolve``，针对具体皮肤名）
+  → **④ 穿着模型解析**（同样 ``auto_resolve``，针对"看起来是穿着"的候选，
+  穿着专用提示词）→ **⑤ ``infer_unnamed``**（默认关）。③ 与 ④ 互斥、
+  ⑤ 与"已识别到穿着 / 皮肤"互斥；
+- **穿着类型表**：候选**包含**表中某个词即命中（``学生装`` / ``居家服`` / ``泳衣``），
+  多个词命中取**最长**的；命中日志
+  ``穿着类型解析(内置表): 学生 → school uniform, pleated skirt``
+  （用户补充的表写 ``(配置表)``），注入日志
+  ``已追加穿着（share_visual / natural）: 学生 → school uniform, pleated skirt``；
+- **穿着模型解析**：候选既不在皮肤表也不在穿着类型表、但**看起来是穿着**
+  （含 ``衣/服/装/裙/…`` 或句式「穿 X」「换上 X」）时，用穿着专用提示词
+  （"不是穿着就 ``unknown=true``"）转成服装关键词；缓存键 ``<原词>|__wear__``
+  （成功 24 小时 / 失败 10 分钟，读写在调用方
+  :meth:`CharacterGuardHandler._resolve_wear_with_cache`），日志
+  ``穿着解析(模型): 雨衣 → raincoat`` / ``穿着解析(缓存)`` /
+  ``穿着解析(LLM)失败：<原因>``；成功额外给一条
+  ``建议加入穿着类型表：雨衣 | raincoat``（只打日志），**不写回记忆库**；
+- **措辞与幂等**：穿着那条路在 natural 模式写 ``（穿着：“雨衣”：raincoat）``
+  （与 ``（皮肤/时装：“…”：…）`` **刻意分开**）；幂等按**同类**判
+  （皮肤看 ``（皮肤/时装：“``、穿着看 ``（穿着：“``），同类不重复追加、
+  **不同类可以共存**；
+- **豁免与候选选择**：本次识别到的**全部候选**（含被"一图一套"规则忽略的那些）
+  都进豁免集 —— 穿着词与皮肤名一样不会被当成"角色表外的角色名"（否则角色解析会
+  多问一次模型、``fix`` 还可能误删画面里的正确标签）；多个候选时照旧只处理
+  **最新一条消息里最长的那个**，日志写明被忽略的候选；
+  ``outfits.enabled = false`` 时仍然只做 1.0.26 那条**纯字符串**识别（只为豁免，
+  皮肤表里确实有的才豁免），不注入、不调模型、日志里也没有 ``穿着类型解析``。
 """
 
 from __future__ import annotations
@@ -264,18 +301,26 @@ from .config import CharPromptGuardConfig
 from .monitor import SubjectTrack, track_subject
 from .outfit import (
     OUTFIT_SOURCE_TABLE,
+    OUTFIT_WEAR_MODEL,
+    OUTFIT_WEAR_TYPE,
     OutfitEntry,
     ResolvedOutfit,
+    WearTypeMatch,
     extract_outfit_names,
     find_outfit_entry,
     find_unnamed_outfit_owner,
+    find_wear_type,
     infer_outfit_via_llm,
     outfit_cache_get,
     outfit_cache_key,
     outfit_cache_put,
     outfit_infer_cache_key,
+    outfit_wear_cache_key,
     parse_outfits,
     resolve_outfit_via_llm,
+    resolve_wear_via_llm,
+    wear_like_candidate,
+    wear_type_table,
     write_outfit_to_memory,
 )
 
@@ -735,6 +780,8 @@ _targets_cache: dict[str, list[TargetSpec]] = {}
 _roster_cache: dict[str, list[CharacterEntry]] = {}
 #: 皮肤表（``[outfits] entries``）的解析缓存（1.0.22），与角色表同一套做法
 _outfits_cache: dict[str, list[OutfitEntry]] = {}
+#: 穿着类型表（``[outfits] wear_types`` **合并**内置表，1.0.28）的解析缓存
+_wear_types_cache: dict[str, dict[str, WearTypeMatch]] = {}
 
 # 历史消息缓存：stream_id → (写入时间, 消息列表)
 _HISTORY_CACHE_LIMIT = 32
@@ -785,6 +832,30 @@ def _outfit_entries(config: CharPromptGuardConfig) -> list[OutfitEntry]:
     return _cached_parse(
         str(getattr(section, "entries", "") or ""), _outfits_cache, parse_outfits
     )
+
+
+def _wear_types(config: CharPromptGuardConfig) -> dict[str, WearTypeMatch]:
+    """内置 + 配置合并后的**穿着类型表**（1.0.28，带配置文本缓存）。
+
+    ``outfits.wear_types`` 留空（默认）时就是内置表 :data:`outfit.WEAR_TYPE_KEYWORDS`
+    本身；填了就与内置表**合并**（同名覆盖内置）。缓存键是配置文本，配置一改
+    文本就变、自动失效 —— 与 :func:`_outfit_entries` 同一套做法。
+    """
+    section = getattr(config, "outfits", None)
+    return _cached_parse(
+        str(getattr(section, "wear_types", "") or ""),
+        _wear_types_cache,
+        wear_type_table,
+    )
+
+
+def _outfit_scope_key(text: str) -> str:
+    """皮肤 / 穿着候选比较用的键：忽略大小写与**所有空白**。
+
+    与 ``outfit._outfit_key`` 同一口径（``粉色 妖精`` 与 ``粉色妖精`` 等价）——
+    这里只用它把"被选中的那个候选"从"被忽略的候选"里摘出去（1.0.28 的日志）。
+    """
+    return re.sub(r"\s+", "", (text or "").lower())
 
 
 # ── 「本尊身份」解析（1.0.13）─────────────────────────────────────
@@ -1313,25 +1384,28 @@ class UserNamingScope:
         )
 
 
-# ── 皮肤/时装（1.0.22）────────────────────────────────────────────────
+# ── 皮肤/时装 与 泛指的穿着（1.0.22 / 1.0.28）─────────────────────────
 #
 # 需求原话：「当说『我想看看你的 xxxx（皮肤）』，可以搜索并加进去」——
 # **角色那一侧一个字都没改**（描述点名 > 主题跟踪 > LLM 仲裁 > 不补），
-# 这里只是多出「皮肤/时装」这一维：
+# 这里只是多出「这次要穿什么」这一维：
 #
 #   ① 识别（``_scan_outfit_names`` + ``outfit.extract_outfit_names``）：
 #      只在**用户消息**里找（触发消息 + 触发前最近 N 条用户消息，bot 消息跳过；
 #      与表外点名 / 自我指代同一个焦点范围），**不扫画面描述**；
-#   ② 解析（``_resolve_outfit``）：皮肤表命中 → 零模型调用；表未命中且
-#      ``outfits.auto_resolve`` → 问一次模型（``outfit.resolve_outfit_via_llm``，
-#      与角色解析同一套 llm_api / translate_model / llm_timeout），失败**什么都不注入**；
+#   ② 解析（``_resolve_outfit``，1.0.28 的最终优先级）：
+#      **① 皮肤表命中**（零模型调用）→ **② 穿着类型表命中**（内置 + 配置，
+#      零模型调用）→ **③ 皮肤模型解析**（具体皮肤名，``auto_resolve``）
+#      → **④ 穿着模型解析**（"看起来是穿着"的候选，穿着专用提示词）
+#      → **⑤ ``infer_unnamed``**（用户没说名字时由模型推断一套，默认关）；
 #   ③ 注入（``_apply_outfit``，在 ``_finalize`` 的最后一步）：
-#      按目标的 natural / tags 模式把关键词**追加**在角色之后。
+#      按目标的 natural / tags 模式把关键词**追加**在角色之后；
+#      措辞分两种：皮肤 ``（皮肤/时装：“…”：…）``、穿着 ``（穿着：“…”：…）``。
 #
-# 为什么注入放在 ``_finalize`` 的最后（两条一致性检查**之后**）：皮肤关键词是
-# 「多一层外观」，它不该参与角色对账（那两条检查只认角色表内的字符串），
-# 也不该被任何角色修正逻辑顺手删掉 —— 追加在最后既保证「角色在前、皮肤在后」，
-# 又保证「角色链路失败/修正时皮肤那条链路一个字都不受影响」。
+# 为什么注入放在 ``_finalize`` 的最后（两条一致性检查**之后**）：皮肤 / 穿着关键词是
+# 「多一层外观」，它们不该参与角色对账（那两条检查只认角色表内的字符串），
+# 也不该被任何角色修正逻辑（fix 替换 / 删除）顺手删掉 —— 追加在最后既保证
+# 「角色在前、衣服在后」，又保证「角色链路失败 / 修正时衣服那条链路一个字都不受影响」。
 
 #: natural 模式追加的皮肤说明模板（皮肤名 + 关键词必须都在里面；中文描述可选）
 OUTFIT_NATURAL_TEMPLATE = "（皮肤/时装：“{name}”：{keywords}）"
@@ -1342,6 +1416,21 @@ OUTFIT_NATURAL_TEMPLATE_WITH_DESC = "（皮肤/时装：“{name}”：{keywords
 #: 只匹配模板开头（``（皮肤/时装：“``）而不是裸的 ``皮肤/时装：`` —— 后者会和用户自己在
 #: 画面描述里写的同样五个字撞车，导致本张该补的皮肤被静默跳过（窄审计 1.0.26 发现）。
 OUTFIT_NATURAL_MARKER = "（皮肤/时装：“"
+
+#: 1.0.28：natural 模式追加的**穿着**说明模板（「泛指的穿着类型」那两条路）。
+#:
+#: 措辞与「皮肤/时装」**刻意分开**：用户说「我想看你的学生装」时产出的是"穿对应的
+#: 衣服"（泛指的穿着），而不是"点名了一套皮肤"—— 日志与画面里都要能一眼看出区别。
+WEAR_NATURAL_TEMPLATE = "（穿着：“{name}”：{keywords}）"
+
+#: natural 模式穿着说明的**固定前缀**，与 :data:`OUTFIT_NATURAL_MARKER` 同一口径
+#: （只匹配模板开头，避免和用户自己写的「穿着：」撞车）。
+#:
+#: **两个标记各管各的**（1.0.28 冲突矩阵第 7 条）：同类说明不重复追加
+#: （多图轮里第 2、3 张已经带着第 1 张的说明 → 跳过），**不同类可以共存** ——
+#: 画面里已经有皮肤说明时，穿着说明照样追加（反之亦然）；它们本来就不是同一个
+#: 识别结果（一次识别只选一个候选），能同时出现只可能是别处已经写过一段。
+WEAR_NATURAL_MARKER = "（穿着：“"
 
 
 @dataclass(frozen=True)
@@ -2807,6 +2896,18 @@ class CharacterGuardHandler(BaseEventHandler):
 
         ``[outfits] enabled = false`` 或任何异常 → 返回空结果：这条链路是「多一层
         外观」，绝不允许影响角色判定或拦住生图。
+
+        **1.0.28**：识别到的东西不再只有"皮肤名"，还包括**泛指的穿着词**
+        （「学生装」「雨衣」…）。两者的识别口径**完全相同**（同一批候选），
+        区别只在解析那一侧（``_resolve_outfit``）。这里同时保证两件事：
+
+        - 被选中的名字与**被忽略的候选**都写在日志里（一图一套：取最新一条消息里
+          最长的那个，与 1.0.22 的皮肤选择规则一致）；
+        - 豁免集（``names``）**包含本次识别到的全部候选**，不只命中皮肤表的那些 ——
+          穿着词（「雨衣」）与皮肤名一样不能被当成"角色表外的角色名"，
+          否则角色解析会多问一次模型、``fix`` 还可能误删画面里的正确标签
+          （1.0.23 的皮肤豁免同一条理由；关闭皮肤功能时仍按 1.0.26 的窄口径，
+          只有"皮肤表里确实有"的名字才豁免）。
         """
         # 1.0.24：`enabled=false` 时**仍然**做一次纯字符串识别 —— 只为给"表外点名"供豁免集
         # （否则皮肤名又会被当成角色表外的角色名：多花一次模型调用，fix 模式下还会误删
@@ -2838,8 +2939,25 @@ class CharacterGuardHandler(BaseEventHandler):
             name = ""
             source = ""
             names: list[str] = []
+            # 1.0.28：本次识别到的**全部**候选（含被"一图一套"规则忽略的那些），
+            # 只用于两件事：豁免集、以及日志里写明"被忽略的候选是哪些"。
+            candidates: list[str] = []
             for text in focus:
                 hits = extract_outfit_names(text, entries, roster)
+                # 候选的原始集合（不带皮肤表）—— 命中皮肤表时 extract_outfit_names
+                # **只**返回表里那条，被它压掉的其它候选要靠这一次调用才看得到。
+                # 关闭皮肤功能（`exempt_only`）时用不到，就不做这一次多余扫描。
+                extra = (
+                    extract_outfit_names(text, [], roster)
+                    if entries and not exempt_only
+                    else hits
+                )
+                for candidate in [*hits, *extra]:
+                    if (
+                        candidate not in candidates
+                        and not find_roster_identity(candidate, roster)
+                    ):
+                        candidates.append(candidate)
                 if not hits:
                     continue
                 if not name:
@@ -2871,6 +2989,22 @@ class CharacterGuardHandler(BaseEventHandler):
             if not name:
                 logger.debug("皮肤/时装=跳过（用户最近的几条消息里没有皮肤/时装的说法）")
                 return OutfitScope(texts=focus, names=names)
+            # 1.0.28：豁免集补上"没被选中"的候选（穿着词常常落在这里）——
+            # 它们同样是穿着/皮肤名，不该被表外点名那条链路当成角色名。
+            for candidate in candidates:
+                if candidate not in names and not find_roster_identity(candidate, roster):
+                    names.append(candidate)
+            ignored = [
+                candidate
+                for candidate in candidates
+                if _outfit_scope_key(candidate) != _outfit_scope_key(name)
+            ]
+            if ignored:
+                logger.debug(
+                    f"皮肤/穿着候选: 本次只处理「{name}」"
+                    f"（一图一套：取最新一条消息里最长的候选；"
+                    f"被忽略的候选：{'、'.join(ignored[:4])}）"
+                )
             scope = OutfitScope(texts=focus, name=name, source=source, names=names)
             logger.debug(f"皮肤/时装扫描: {scope.label()}")
             return scope
@@ -2886,22 +3020,33 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         scope: OutfitScope | None = None,
     ) -> ResolvedOutfit | None:
-        """识别并解析本次的皮肤/时装（1.0.22）；没有或失败时返回 ``None``。
+        """识别并解析本次的皮肤/时装 / 穿着（1.0.22；1.0.23 与 1.0.28 各加一档）。
 
-        流程（**表优先 → 模型兜底**）：
+        流程（1.0.28 的**最终优先级**，注释与 README 都按这一份写）：
 
         1. ``outfits.enabled = false`` → **立刻返回**（不解析皮肤表、不读上文、不调模型）；
         2. 解析皮肤表（``outfits.entries``，带配置文本缓存）；``scope`` 由调用方
            （``execute``）先跑 :meth:`_scan_outfit_names` 备好时直接复用，
            没给（本方法被单独调用）才自己扫一次；
-        3. 命中皮肤表 → 直接用表里的关键词 / 中文描述，**零模型调用**；表里的那一行
-           没写关键词时按「表未命中」处理（继续走第 4 步，用户少填一列也能用）；
-        4. 表未命中且 ``outfits.auto_resolve`` → 问一次模型（:meth:`_resolve_outfit_with_cache`，
-           与角色解析同一套缓存策略）；``auto_resolve = false`` → 只留一条 DEBUG
-           ``皮肤解析=跳过（…不在皮肤表里…）``；
-        5. **1.0.23**：这次**一个皮肤名都没有**（``scope.name`` 为空）时，若
+        3. **① 皮肤表命中** → 直接用表里的关键词 / 中文描述，**零模型调用**；表里的
+           那一行没写关键词时按「表未命中」处理（继续往下走，用户少填一列也能用）；
+        4. **② 穿着类型命中**（1.0.28）→ 内置表 :data:`outfit.WEAR_TYPE_KEYWORDS`
+           与 ``outfits.wear_types`` 合并后的表里**包含**候选即命中（``学生装`` /
+           ``居家服`` / ``泳衣``），直接用表里的关键词，**同样零模型调用**
+           —— 需求原话：「判断不是皮肤，转成'穿对应的衣服'……要能**看到注入了
+           什么样的衣服**」；
+        5. **③/④ 模型解析**（``outfits.auto_resolve``，默认开）：候选**看起来是
+           穿着**（:func:`outfit.wear_like_candidate`：含 ``衣/服/装/裙/…`` 或句式
+           「穿 X」「换上 X」）→ **④ 穿着模型解析**（:meth:`_resolve_wear_with_cache`
+           → :func:`outfit.resolve_wear_via_llm`，穿着专用提示词）；否则 →
+           **③ 皮肤模型解析**（:meth:`_resolve_outfit_with_cache` → 皮肤提示词）。
+           两条路互斥（同一次只走一条），校验口径完全相同；``auto_resolve = false``
+           时只留一条 DEBUG ``…解析=跳过（…）``；
+        6. **⑤** 这次**一个候选都没有**（``scope.name`` 为空）时，若
            ``outfits.infer_unnamed`` 为真 → 交给 :meth:`_infer_unnamed_outfit`
-           去认「<角色>的那一套皮肤」并让模型推断（默认关，关掉时那一步立刻返回）。
+           去认「<角色>的那一套皮肤」并让模型推断（默认关）。
+           **与穿着互斥**：已经识别到穿着词 / 皮肤名（``scope.name`` 非空）时
+           绝不进这一步。
 
         **本函数不抛异常**：任何失败都只记日志并返回 ``None``，由调用方什么都不注入。
         """
@@ -2914,8 +3059,9 @@ class CharacterGuardHandler(BaseEventHandler):
                 params=params, config=config, roster=roster, entries=entries
             )
         if not scope.name:
-            # 用户没点名具体的皮肤名 —— 1.0.23：只有显式开了 infer_unnamed 才继续，
-            # 默认关时这里与 1.0.22 完全一致（返回 None，什么都不注入）
+            # 用户没点名具体的皮肤名 / 穿着 —— 1.0.23：只有显式开了 infer_unnamed 才继续，
+            # 默认关时这里与 1.0.22 完全一致（返回 None，什么都不注入）。
+            # 1.0.28：上面已经识别到穿着词时走不到这里（穿着与推断互斥）。
             return await self._infer_unnamed_outfit(
                 config=config, roster=roster, texts=scope.texts
             )
@@ -2935,12 +3081,38 @@ class CharacterGuardHandler(BaseEventHandler):
             return outfit
         if entry is not None:
             logger.debug(f"皮肤表条目「{entry.name}」没有填英文关键词，按表未命中处理")
+        # ② 穿着类型（1.0.28）：泛指的「学生 / 居家 / 泳衣 / 睡衣」…… 直接用表里的
+        # 关键词，**一次模型都不问** —— 这一批词是"确定答案"，不该交给模型去猜。
+        # 放在皮肤表**之后**是有意的：具体皮肤名（例如表里的「学生会长制服」）
+        # 永远压过类型词，不会因为候选里含「学生」两个字就被拆成"学生装"。
+        wear_type = find_wear_type(scope.name, _wear_types(config))
+        if wear_type is not None:
+            outfit = ResolvedOutfit(
+                name=wear_type.word,
+                keywords=list(wear_type.keywords),
+                source=OUTFIT_SOURCE_TABLE,
+                confidence=1.0,
+                raw_name=scope.name,
+                wear=OUTFIT_WEAR_TYPE,
+                wear_source=wear_type.source,
+            )
+            logger.debug(outfit.log_line())
+            return outfit
+        wear_like = wear_like_candidate(scope.name, scope.source)
         if not bool(getattr(section, "auto_resolve", True)):
             logger.debug(
-                f"皮肤解析=跳过（{scope.name} 不在皮肤表里，"
+                f"{'穿着' if wear_like else '皮肤'}解析=跳过（{scope.name} 不在"
+                f"{'皮肤表 / 穿着类型表' if wear_like else '皮肤表'}里，"
                 "且 outfits.auto_resolve=false）"
             )
             return None
+        if wear_like:
+            # ④ 穿着模型解析（1.0.28）：候选"看起来是穿着"（「雨衣」「白色长裙」
+            # 「换上战甲」…），但内置表与皮肤表都没有 → 交给穿着专用提示词。
+            return await self._resolve_wear_with_cache(
+                config=config, name=scope.name, context_text=scope.source
+            )
+        # ③ 皮肤模型解析（1.0.22 起的原路，一个字没改）
         return await self._resolve_outfit_with_cache(
             config=config,
             name=scope.name,
@@ -3141,6 +3313,94 @@ class CharacterGuardHandler(BaseEventHandler):
         line = outfit.table_line()
         if line:
             logger.info(f"建议加入皮肤表：{line}")
+
+    # ── 穿着解析（LLM，1.0.28 第 ④ 档）──────────────────────────────
+
+    async def _resolve_wear_with_cache(
+        self,
+        *,
+        config: CharPromptGuardConfig,
+        name: str,
+        context_text: str = "",
+    ) -> ResolvedOutfit | None:
+        """把「穿着类候选」交给模型转成服装关键词（1.0.28 第 ④ 档，带调用方缓存）。
+
+        场景：用户说的既不在皮肤表（①）、也不在内置 / 配置的穿着类型表（②），
+        但**看起来是穿着**（「雨衣」「白色长裙」「换上战甲」…，判据见
+        :func:`outfit.wear_like_candidate`）—— 需求要求这种词也自动找出关键词并
+        注入，而不是留给"黑箱"。解析用**穿着专用提示词**
+        （:func:`outfit.resolve_wear_via_llm`，明确要求"不是穿着就 unknown=true"），
+        与 ③ 皮肤模型解析互斥。
+
+        缓存与皮肤解析**同一套分层**（存储与 TTL 常量在 :mod:`outfit`，读写在调用方）：
+
+        - 缓存键 ``<原词>|__wear__``（:func:`outfit.outfit_wear_cache_key`；
+          穿着关键词是通用服装词，与角色无关，所以键里不带角色）；
+        - 成功 24 小时、失败负缓存 10 分钟；命中 → ``穿着解析(缓存)``，**不再问模型**；
+        - 未命中 → 问一次模型：成功 INFO ``穿着解析(模型): <原词> → <关键词>``
+          + ``建议加入穿着类型表：…``（只打日志，下次就能零模型调用）；
+          失败 DEBUG ``穿着解析(LLM)失败：<原因>``（异常则 WARNING）。
+
+        **不写回记忆库**（冲突矩阵第 8 条）：记忆库那条通道写的是"某一套皮肤属于谁"
+        （标题「皮肤指向：…」），穿着关键词是**通用服装词**（「雨衣 → raincoat」），
+        记下来既没有复用价值，也不该被当成"用户确认过的身份事实"。
+        ``outfits.write_back`` 因此对这条链路无效（皮肤那条路照旧）。
+
+        **本函数不抛异常**（异常一律转成失败结果并写负缓存）；调用方拿到 ``None``
+        或 ``ok`` 为假的结果时**什么都不注入**。
+        """
+        cache_key = outfit_wear_cache_key(name)
+        cached = outfit_cache_get(name, key=cache_key)
+        if cached is not None:
+            logger.info(cached.log_line())
+            if cached.ok:
+                self._log_wear_suggestion(cached)
+                return cached
+            return None
+
+        try:
+            result = await resolve_wear_via_llm(
+                name,
+                translate_model=str(config.general.translate_model or ""),
+                timeout=float(config.general.llm_timeout or 0.0),
+                context_text=context_text,
+            )
+        except Exception as e:  # noqa: BLE001 —— 解析是「多一层外观」，不许拦住生图
+            logger.warning(f"穿着解析(LLM)失败：{type(e).__name__}: {e}（穿着={name!r}）")
+            # 异常也要进负缓存：同一个词不必为每一张图都再等一次超时
+            outfit_cache_put(
+                name,
+                ResolvedOutfit(
+                    name=name,
+                    reason=f"调用失败({type(e).__name__}: {e})",
+                    raw_name=name,
+                    wear=OUTFIT_WEAR_MODEL,
+                ),
+                key=cache_key,
+            )
+            return None
+
+        outfit_cache_put(name, result, key=cache_key)
+        if not result.ok:
+            logger.debug(f"{result.log_line()}（穿着={name!r}）")
+            return None
+        logger.info(result.log_line())
+        self._log_wear_suggestion(result)
+        return result
+
+    @staticmethod
+    def _log_wear_suggestion(outfit: ResolvedOutfit) -> None:
+        """打一条「建议加入穿着类型表：…」的 INFO（**只打日志，绝不自动改配置文件**）。
+
+        形如 ``建议加入穿着类型表：雨衣 | raincoat`` —— 直接粘进
+        ``outfits.wear_types`` 就再也不用问模型了（这正好呼应需求里的
+        "要能**看到注入了什么样的衣服**"）。
+        """
+        if not outfit.ok:
+            return
+        word = (outfit.raw_name or outfit.name or "").strip()
+        if word:
+            logger.info(f"建议加入穿着类型表：{word} | {outfit.keywords_text()}")
 
     # ── 角色解析（LLM，1.0.21）────────────────────────────────────
 
@@ -3713,6 +3973,11 @@ class CharacterGuardHandler(BaseEventHandler):
         见 :meth:`_infer_unnamed_outfit`）—— 注入路径与 1.0.22 **完全相同**，
         这里一个字都不需要改。
 
+        **1.0.28**：``outfit`` 也可能是**泛指的穿着**（穿着类型表命中 / 穿着模型解析，
+        见 :meth:`_resolve_outfit`）—— 注入位置与顺序同样不变，只是措辞换成
+        ``（穿着：“…”：…）``、幂等标记换成 :data:`WEAR_NATURAL_MARKER`。
+        「穿着不参与角色对账 / 不被 fix 碰」这一点由下面这个**调用顺序**直接保证。
+
         .. note::
            1.0.21 修正（实测回归）：解析结果**不再并进第 1 条的判定集合**。
            并进去时 ``fix`` 模式的对账会抢在入口①之前做替换，日志依据被写成
@@ -4190,8 +4455,13 @@ class CharacterGuardHandler(BaseEventHandler):
 
         皮肤名与关键词**必须在里面**（用户对着日志和画面就能核对"到底加没加进去"）；
         中文描述有就一并带上（下游翻译模型还能据此补细节），没有就只写关键词。
+
+        **1.0.28**：泛指的穿着用另一套措辞 —— ``（穿着：“学生装”：school uniform,
+        pleated skirt）``（穿着那两条路没有中文描述，模板里也就不带描述位）。
         """
         keywords = outfit.keywords_text()
+        if outfit.is_wear:
+            return WEAR_NATURAL_TEMPLATE.format(name=outfit.name, keywords=keywords)
         if outfit.description:
             return OUTFIT_NATURAL_TEMPLATE_WITH_DESC.format(
                 name=outfit.name, keywords=keywords, description=outfit.description
@@ -4206,28 +4476,45 @@ class CharacterGuardHandler(BaseEventHandler):
         outfit: ResolvedOutfit | None,
         decided: list[CharacterEntry],
     ) -> str:
-        """把皮肤/时装**追加**在角色之后（1.0.22）；没有可注入内容时原样返回。
+        """把皮肤/时装 / 穿着**追加**在角色之后（1.0.22；1.0.28 起两种措辞）。
 
         这是 1.0.22 新增的**唯一**改动点：角色那一侧一个字都没改，皮肤只是
         「多追加一层」。规则：
 
         - ``natural``（nai_artist）：另起一行追加
           ``（皮肤/时装：“<皮肤名>”：<关键词>）``，位置在角色中文说明之后；
+          **1.0.28 的穿着**写 ``（穿着：“<穿着词>”：<关键词>）``（措辞刻意分开，
+          不与"皮肤/时装"混淆）；
         - ``tags``（image_generator_plugin-neo）：把解析出的关键词追加进**同一个**
           参数字符串（``content_description``）末尾（``, pink elf dress, fairy wings``），
           与角色标签同处一个槽位；已经在提示词里的关键词不重复追加；
         - **没有解析出角色**（``decided`` 为空）时照样注入关键词，只打一条 DEBUG
-          说明「无角色，仅注入皮肤关键词」—— 用户说「穿这套」时外观描述里通常
+          说明「无角色，仅注入…关键词」—— 用户说「穿这套」时外观描述里通常
           已经写了角色（此时角色在画面里、只是判定链没给结论）；
         - 注入失败 / 解析失败 / 开关关掉时 ``outfit`` 为 ``None``，本方法原样返回，
           **绝不影响角色注入，也绝不拦住生图**。
+
+        **1.0.28 的三条冲突裁决**（冲突矩阵第 6、7 条）：
+
+        - **归属校验**只对**有归属列**的结果生效（皮肤表第 2 列 / 推断结果）；
+          穿着那两条路一律没有归属（穿着类型表只有两列），因此照常注入 ——
+          这正是需求说的"多数情况无归属 → 照常注入"。
+        - 穿着关键词**只走** :func:`outfit.validate_outfit_keyword`（含 1.0.26 那条
+          "拒收 ``\\(…\\)`` 形状"），所以它**不可能**被角色对账 / ``fix`` 当成角色
+          标签 —— 而本方法本来就跑在两条一致性检查**之后**，``fix`` 替换 / 删除
+          角色标签时也碰不到这里追加的内容。
+        - **幂等按"同类"判**：皮肤说明看 :data:`OUTFIT_NATURAL_MARKER`、穿着说明看
+          :data:`WEAR_NATURAL_MARKER`，同类不重复追加（多图轮的第 2、3 张），
+          **不同类可以共存**（画面里已经有皮肤说明时，穿着说明照样追加）。
         """
         if outfit is None or not outfit.ok:
             return content
+        kind = "穿着" if outfit.is_wear else "皮肤"
         # 1.0.26：**归属校验** —— 皮肤表第 2 列（或推断结果）写明"这套衣服属于谁"时，
         # 若本次判定的角色里没有它，就**不注入**（否则会出现"流萤的招牌衣服被贴到爱莉
         # 身上"这种错图，而插件既不报也不拦）。判不出角色（decided 为空）时保持原行为：
         # 照样注入，只打一条 DEBUG。
+        # 1.0.28：穿着那两条路没有归属列（character 恒为空串）→ 这一关自然不触发。
         if outfit.character and decided:
             wanted = str(outfit.character).strip().casefold()
             owners = {
@@ -4238,15 +4525,15 @@ class CharacterGuardHandler(BaseEventHandler):
             }
             if wanted and wanted not in owners:
                 logger.warning(
-                    f"皮肤跳过：皮肤「{outfit.name}」属于「{outfit.character}」，"
+                    f"{kind}跳过：{kind}「{outfit.name}」属于「{outfit.character}」，"
                     f"但本张判定角色是「{'、'.join(entry.name for entry in decided)}」"
                 )
                 return content
         owner = next((entry.name for entry in decided if entry.name), "")
         if owner:
-            logger.debug(f"皮肤注入: {outfit.name}（搭配角色={owner}）")
+            logger.debug(f"{kind}注入: {outfit.name}（搭配角色={owner}）")
         else:
-            logger.debug(f"皮肤注入: {outfit.name}（无角色，仅注入皮肤关键词）")
+            logger.debug(f"{kind}注入: {outfit.name}（无角色，仅注入{kind}关键词）")
 
         if spec.append_mode == APPEND_MODE_TAGS:
             missing = [
@@ -4255,26 +4542,31 @@ class CharacterGuardHandler(BaseEventHandler):
                 if not content_contains_tag(content, keyword)
             ]
             if not missing:
-                logger.debug(f"皮肤关键词已在提示词里，不重复追加: {outfit.name}")
+                logger.debug(f"{kind}关键词已在提示词里，不重复追加: {outfit.name}")
                 return content
             joined = ", ".join(missing)
             stripped = content.rstrip().rstrip(",").rstrip()
             merged = f"{stripped}, {joined}" if stripped else joined
             logger.info(
-                f"已追加皮肤/时装（{spec.action} / tags）: {outfit.name} → {joined}"
+                f"已追加{'穿着' if outfit.is_wear else '皮肤/时装'}"
+                f"（{spec.action} / tags）: {outfit.name} → {joined}"
             )
             return merged
 
         clause = self._outfit_clause(outfit)
         # 1.0.26：**幂等** —— 单次多图（「画三张」）时第 2、3 张的入参 content 里已经带着
-        # 第 1 张追加过的皮肤说明，而它们由**同一轮**触发、_scan_outfit_names 对它们拿不到
+        # 第 1 张追加过的说明，而它们由**同一轮**触发、_scan_outfit_names 对它们拿不到
         # 候选，所以整段 clause 比对不上、会被重复追加（提示词膨胀 + 关键词权重叠加）。
-        # 这里改成"只要已有 `皮肤/时装：` 段就不再追加"。
-        if clause in content or OUTFIT_NATURAL_MARKER in content:
+        # 这里改成"只要已有**同类**说明段就不再追加"（皮肤看 `（皮肤/时装：“`、
+        # 穿着看 `（穿着：“`）—— 1.0.28 起两类**各自**判：不同类可以共存
+        # （画面里已有皮肤说明时，穿着说明照样追加，反之亦然）。
+        marker = WEAR_NATURAL_MARKER if outfit.is_wear else OUTFIT_NATURAL_MARKER
+        if clause in content or marker in content:
             return content
         merged = f"{content.rstrip()}\n{clause}" if content.strip() else clause
         logger.info(
-            f"已追加皮肤/时装（{spec.action} / natural）: "
+            f"已追加{'穿着' if outfit.is_wear else '皮肤/时装'}"
+            f"（{spec.action} / natural）: "
             f"{outfit.name} → {outfit.keywords_text()}"
         )
         return merged

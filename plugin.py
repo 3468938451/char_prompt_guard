@@ -87,6 +87,19 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
   （:func:`outfit.find_unnamed_outfit_owner` + :func:`outfit.infer_outfit_via_llm`，
   校验口径与 1.0.22 完全相同，日志标注「来源=模型推断」，推断结果不写回记忆库）；
   默认关时 0 次模型调用、无相关日志，行为与 1.0.22 逐字一致。
+
+1.0.28 起把**「泛指的穿着类型」**和**「具体皮肤名」**分开（``[outfits] wear_types``，
+见 :mod:`outfit` 与 :mod:`handler`）：用户说「我想看你的**学生装 / 居家服 / 泳衣 /
+雨衣**」时，判断这不是某一套皮肤，而是**泛指的穿着** —— 插件**确定性**地给出英文
+关键词并注入，日志与提示词里都能看到"到底穿了什么"，不再让 bot 黑箱决定。
+**角色那一侧依然一个字没改**，优先级固定为：
+
+① 皮肤表命中（零模型调用）→ ② 内置 + 配置的**穿着类型表**（零模型调用，
+候选**包含**表中词即命中、取最长的那个）→ ③ 皮肤模型解析（``auto_resolve``）
+→ ④ **穿着模型解析**（既不在两张表、又看起来是穿着的候选，走穿着专用提示词）
+→ ⑤ ``infer_unnamed``（默认关）。穿着那两条路不写回记忆库、不参与角色对账
+（注入排在两条一致性检查之后），幂等按同类判；``enabled = false`` 时整条链路
+零开销（只保留 1.0.26 起那条纯字符串豁免识别）。
 """
 
 from __future__ import annotations
@@ -163,7 +176,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.27"
+    plugin_version: str = "1.0.28"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

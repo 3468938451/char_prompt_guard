@@ -348,6 +348,26 @@ def main() -> int:
             and "春婵丽娟" not in outfits_desc,
             f"entries.description={outfits_desc!r}",
         )
+        # 1.0.28 新增：泛指的穿着类型（学生 / 居家 / 泳衣 …）——**默认留空** =
+        # 只用内置表 WEAR_TYPE_KEYWORDS；填了与内置表**合并**、同名覆盖内置
+        # （行为见 check_logic.py 的 C89~C103）。
+        check(
+            "1.0.28 穿着类型表默认留空（只用内置表）",
+            cfg.outfits.wear_types == "",
+            f"outfits.wear_types={cfg.outfits.wear_types!r}",
+        )
+        wear_field = type(cfg.outfits).__dict__.get("wear_types")
+        if wear_field is None:
+            wear_field = type(cfg.outfits).model_fields.get("wear_types")
+        wear_desc = str(getattr(wear_field, "description", "") or "")
+        check(
+            "1.0.28 穿着类型表示例只留一行（照抄改掉即可，且写明不是具体皮肤名）",
+            "学生 | school uniform, pleated skirt" in wear_desc
+            and "\n" not in wear_desc
+            and "照抄改掉即可" in wear_desc
+            and "不是具体皮肤名" in wear_desc,
+            f"wear_types.description={wear_desc!r}",
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
 
@@ -887,12 +907,14 @@ def main() -> int:
 
     # ── 5.22 皮肤/时装（1.0.22）：皮肤表、关键词规范、严格校验与入口 ────────
     # 与 §5.21 同一口径：这里只做「装得上、调得动」的冒烟（完整的识别 / 注入行为
-    # 在 check_logic.py 的 C77~C88）。重点钉三件事：
+    # 在 check_logic.py 的 C77~C102）。重点钉三件事：
     # ① 皮肤表的四列能解析、"只写一部分"能命中；
     # ② 模型给的关键词真的会过规范（大写 / 中文 / 未转义括号一律不要）；
     # ③ unknown / confidence 太低 / 没有可用关键词一律判失败（什么都不注入）。
     # 1.0.23 再补：解析结构多一个可选字段 `inferred`、「<角色>的那一套皮肤」的识别、
     # 推断入口与缓存键都在（默认关见上面的配置默认值断言）。
+    # 1.0.28 再补：内置「穿着类型 → 关键词」表（含同义写法）、包含匹配、用户补充表
+    # 与内置表的合并（同名覆盖）与丢弃规则、穿着模型入口与 `<原词>|__wear__` 缓存键。
     try:
         from .. import handler as outfit_handler
         from ..character import parse_roster
@@ -900,17 +922,23 @@ def main() -> int:
             OUTFIT_CACHE_TTL_SECONDS,
             OUTFIT_FAILURE_TTL_SECONDS,
             OUTFIT_RESOLVE_MIN_CONFIDENCE,
+            WEAR_TYPE_KEYWORDS,
             find_outfit_entry,
             find_unnamed_outfit_owner,
+            find_wear_type,
             infer_outfit_via_llm,
             outfit_cache_get,
             outfit_cache_put,
             outfit_infer_cache_key,
+            outfit_wear_cache_key,
             parse_outfit_resolution_payload,
             parse_outfits,
+            parse_wear_types,
             reset_outfit_cache,
+            resolve_wear_via_llm,
             validate_outfit_keyword,
             validate_outfit_tag,
+            wear_type_table,
         )
 
         table = parse_outfits(
@@ -1072,6 +1100,76 @@ def main() -> int:
                 outfit_handler.CharacterGuardHandler, "_infer_unnamed_outfit"
             ),
             f"缓存键={outfit_infer_cache_key('流萤')!r}",
+        )
+
+        # 1.0.28：泛指的穿着 —— 内置「穿着类型 → 关键词」表 + 容错匹配 + 模型入口。
+        # 完整的端到端行为在 check_logic.py 的 C89~C103，这里只做"装得上、调得动"冒烟。
+        wear_hits = {
+            word: find_wear_type(f"我想看你的{word}") for word in ("学生", "居家", "泳衣")
+        }
+        wear_hit_words = {
+            word: getattr(match, "word", None) for word, match in wear_hits.items()
+        }
+        check(
+            "1.0.28 内置穿着类型表：至少含 学生/居家/泳衣，且包含匹配（学生装 / 居家服 / 泳衣）",
+            {"学生", "居家", "泳衣"} <= set(WEAR_TYPE_KEYWORDS)
+            and all(match is not None for match in wear_hits.values())
+            and find_wear_type("学生装") is not None
+            and find_wear_type("居家服") is not None
+            and find_wear_type("穿学生装") is not None
+            and find_wear_type("画花火吧") is None
+            and all(
+                validate_outfit_keyword(keyword)[0]
+                for keywords in WEAR_TYPE_KEYWORDS.values()
+                for keyword in keywords
+            ),
+            f"命中 = {wear_hit_words!r}",
+        )
+        wedding_match = find_wear_type("婚服")
+        student_match = find_wear_type("学生")
+        jk_match = find_wear_type("JK")
+        school_match = find_wear_type("校服")
+        check(
+            "1.0.28 同义写法映射到同一组关键词（婚纱 / 婚服 / 结婚礼服 / 新娘装）",
+            all(
+                find_wear_type(word) is not None
+                and find_wear_type(word).keywords  # type: ignore[union-attr]
+                == ("wedding dress", "bridal veil", "white dress")
+                for word in ("婚纱", "婚服", "结婚礼服", "新娘装")
+            )
+            and student_match is not None
+            and jk_match is not None
+            and school_match is not None
+            and student_match.keywords == jk_match.keywords == school_match.keywords,
+            f"婚服={wedding_match!r} 学生={student_match!r}",
+        )
+        user_wear = parse_wear_types("学生 | sailor uniform\n女警 | police uniform")
+        merged_wear = wear_type_table("学生 | sailor uniform\n女警 | police uniform")
+        check(
+            "1.0.28 用户补充的穿着类型与内置表合并、同名覆盖内置、非法关键词整行丢弃",
+            user_wear
+            == {"学生": ("sailor uniform",), "女警": ("police uniform",)}
+            and merged_wear["学生"].keywords == ("sailor uniform",)
+            and merged_wear["学生"].source == "配置表"
+            and merged_wear["居家"].keywords == WEAR_TYPE_KEYWORDS["居家"]
+            and merged_wear["居家"].source == "内置表"
+            and "女警" in merged_wear
+            and parse_wear_types("学生 | 中文关键词") == {}
+            and wear_type_table("学生 | 中文关键词")["学生"].keywords
+            == WEAR_TYPE_KEYWORDS["学生"],
+            f"user={user_wear!r} 学生={merged_wear['学生']!r} 女警={merged_wear.get('女警')!r}",
+        )
+        check(
+            "1.0.28 穿着模型解析入口 / 缓存键 / handler 那一层的方法都在",
+            callable(resolve_wear_via_llm)
+            and callable(outfit_handler.resolve_wear_via_llm)
+            and outfit_wear_cache_key("雨衣") == "雨衣|__wear__"
+            and hasattr(
+                outfit_handler.CharacterGuardHandler, "_resolve_wear_with_cache"
+            )
+            and hasattr(outfit_handler.CharacterGuardHandler, "_resolve_outfit")
+            and callable(outfit_handler.find_wear_type),
+            f"缓存键={outfit_wear_cache_key('雨衣')!r}",
         )
     except Exception as e:  # noqa: BLE001
         check("皮肤/时装模块可调用", False, f"{type(e).__name__}: {e}")
