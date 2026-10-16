@@ -2799,9 +2799,10 @@ class CharacterGuardHandler(BaseEventHandler):
         ``[outfits] enabled = false`` 或任何异常 → 返回空结果：这条链路是「多一层
         外观」，绝不允许影响角色判定或拦住生图。
         """
-        if not bool(getattr(getattr(config, "outfits", None), "enabled", False)):
-            # 整条链路零开销：不读上文、不调模型、不打日志
-            return OutfitScope()
+        # 1.0.24：`enabled=false` 时**仍然**做一次纯字符串识别 —— 只为给"表外点名"供豁免集
+        # （否则皮肤名又会被当成角色表外的角色名：多花一次模型调用，fix 模式下还会误删
+        # 画面里正确的角色标签）。此时不解析、不注入、不调模型。
+        exempt_only = not bool(getattr(getattr(config, "outfits", None), "enabled", False))
         if entries is None:
             entries = _outfit_entries(config)
         try:
@@ -2837,13 +2838,27 @@ class CharacterGuardHandler(BaseEventHandler):
                     name = max(hits, key=len)
                     source = text
                 for hit in hits:
-                    if hit not in names:
-                        names.append(hit)
-                    # 命中皮肤表的候选：把表里的**正式名**也记进来（1.0.23 的表外点名
-                    # 豁免要用它 —— 用户写「画粉色妖精」时抓到的候选与表里的名字并不相等）
                     matched = find_outfit_entry(hit, entries)
-                    if matched is not None and matched.name not in names:
+                    if exempt_only and matched is None:
+                        # 关闭皮肤功能时**只豁免"皮肤表里确实有"的名字**：否则句式抓到的
+                        # 普通候选（例如用户点名的角色名）会被误豁免，把真角色名吞掉。
+                        continue
+                    # 1.0.24：豁免集**只收"不在角色表里"的名字** —— 否则皮肤表里恰好与某个
+                    # 角色同名（或角色名是其子串）时，会把真角色名一起豁免掉。
+                    if hit not in names and not find_roster_identity(hit, roster):
+                        names.append(hit)
+                    # 命中皮肤表的候选：把表里的**正式名**也记进来（用户写「粉色妖精」时抓到的
+                    # 候选与表里的正式名并不相等，豁免与缓存都要按正式名走）
+                    if (
+                        matched is not None
+                        and matched.name not in names
+                        and not find_roster_identity(matched.name, roster)
+                    ):
                         names.append(matched.name)
+            if exempt_only:
+                # 关闭皮肤功能：识别只为豁免，不产生"本次皮肤" → 不解析、不注入
+                logger.debug(f"皮肤/时装=仅豁免识别（outfits.enabled=false）：{names}")
+                return OutfitScope(texts=focus, names=names)
             if not name:
                 logger.debug("皮肤/时装=跳过（用户最近的几条消息里没有皮肤/时装的说法）")
                 return OutfitScope(texts=focus, names=names)

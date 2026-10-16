@@ -1136,10 +1136,11 @@ def _in_roster(candidate: str, roster: list[CharacterEntry]) -> bool:
 def _excluded_name(candidate: str, exclude: Iterable[str]) -> bool:
     """候选是不是「本次已经认定为皮肤 / 时装」的名字（1.0.23 的豁免）。
 
-    用户说「画粉色妖精小姐这套」时，句式抓到的候选可能是「粉色妖精小姐这套」，
-    而皮肤表里的正式名是「粉色妖精小姐」—— 两者互为子串。所以比较口径与
-    :func:`_in_roster` 完全一致：**完全相同或互为子串**，忽略大小写 / 空白 /
-    反斜杠下划线（走 :func:`normalize_prompt_text`）。
+    1.0.24 起改为**完全相等**（走 :func:`normalize_prompt_text` 归一后比较）。
+    早先用"互为子串"时，皮肤表里写 `小春` 会把角色名 `小春子` 一起豁免掉 →
+    用户点名 `小春子` 时表外点名与冲突检测被静默跳过（错图且零告警）。
+    用户写法与皮肤表正式名不一致的情况（「粉色妖精」vs「粉色妖精小姐」）由调用方在
+    收集豁免集时用 `outfit.find_outfit_entry` 归一，不在这里做模糊匹配。
 
     ``exclude`` 由调用方（``handler._scan_user_naming``）传入**本次皮肤识别认定的
     皮肤 / 时装名**（``outfit.extract_outfit_names`` 的候选 + 命中的表内正式名）。
@@ -1150,7 +1151,7 @@ def _excluded_name(candidate: str, exclude: Iterable[str]) -> bool:
         return False
     for raw in exclude or ():
         known = normalize_prompt_text(str(raw or ""))
-        if known and (known in target or target in known):
+        if known and known == target:
             return True
     return False
 
