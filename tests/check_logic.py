@@ -249,6 +249,15 @@ C109~C111 新增；**原 C1~C103 与 C105/C106 的断言一个字都没改**）�
 ``FakeOutfit`` 1.0.30 起同样不用加桩：C107/C108 全部命中内置穿着类型表（0 次模型调用），
 断言里 ``stub.calls == []`` 与 ``stub.wear_calls == []`` 就是这条。
 
+**1.0.31 只修两条行为（C112/C113 新增；原 C1~C111 的断言一个字都没改、也没放宽）**：
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C112 | **触发消息没点名时照旧读得到前一条的点名**（目标 A）：``那画流萤吧``（2 分钟前）→ ``画爱莉的婚纱～``（1 分钟前）→ 触发 ``都试试？``（既含「都」＝追加语义词、又含「？」，**闸门①②全会命中**）。1.0.30 在触发消息那一条上先撞闸门 → 整条信号让位 → 退回旧粘性（可能仍按流萤 + ``穿着跳过``）；1.0.31 起触发消息**没点名**就跳过它的闸门①②，直接落到"触发前最近 1 条用户消息"上并按**全部**闸门判定 → 判定 = **爱莉希雅**、日志 ``判定依据=用户点名(最新消息):爱莉希雅``、婚纱关键词与 ``（穿着：“婚纱”：…）`` 都在、**无** ``穿着跳过``、0 次模型调用。候选表最多两格（触发消息 + ``_LATEST_NAMED_HISTORY_LIMIT`` = 1 条），所以**不会**往更早找 |
+| C113 | **归属句式容忍句末语气词**（目标 B）：「画爱莉的婚纱吧～」与「画爱莉的婚纱呢」**两跑** —— 判定 = **爱莉希雅**、``outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`` 照样抓到「婚纱」→ 关键词与 ``（穿着：“婚纱”：…）`` 都在、**无** ``穿着跳过``、0 次模型调用。1.0.30 的边界是"候选后面不能再接名字字符"，而 ``吧`` / ``呢`` 也是汉字 → 整条被挡掉（判定对、衣服没穿上）。``会`` **不在** ``outfit._OUTFIT_STOP_CHARS`` 里，所以「我想看你的学生会长制服」照旧拆不出「学生」（C91 语义不变） |
+
+``FakeOutfit`` 1.0.31 起同样不用加桩：C112/C113 走的都是内置穿着类型表（0 次模型调用）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -5979,6 +5988,116 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C111 引用/图片块里的名字不算用户最新点名（正文照旧算）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C112（1.0.31 目标 A）触发消息没点名时，照旧读得到前一条的点名 ────────────
+    # 需求场景：
+    #     你：那画流萤吧
+    #     你：画爱莉的婚纱～
+    #     你：都试试？                     ← 触发这次生图
+    # 触发消息**一个角色表内角色都没有**，却同时命中闸门①（「都」是追加语义词）与
+    # 闸门②（含「？」）—— 1.0.30 会在触发消息那一条上先撞闸门 → 整条信号让位 →
+    # 退回旧粘性（判定可能仍是流萤，婚纱再因归属冲突被 `穿着跳过` 拦下）。
+    # 1.0.31 的前置判断：触发消息没点名时**跳过它的闸门①②**，直接落到"触发前最近
+    # 1 条用户消息"（= `画爱莉的婚纱～`）上并按**全部**闸门判定 → 判定 = 爱莉希雅、
+    # 婚纱正常注入。候选表最多两格（触发消息 + `_LATEST_NAMED_HISTORY_LIMIT` = 1），
+    # 所以 `那画流萤吧`（2 分钟前）**根本不在候选里**（不会往更早找）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text="都试试？")
+        params["stream_id"] = "s-c112"
+        with (
+            FakeOutfit() as stub,
+            FakeHistory(
+                [
+                    history_message(LATEST_NAMED_STICKY_REQUEST, 2.0),
+                    history_message(LATEST_NAMED_OUTFIT_REQUEST, 1.0),
+                ]
+            ),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "爱莉希雅" in c  # ★ 判定 = 触发前最近 1 条用户消息里点名的爱莉希雅
+            and "流萤" not in c  # ★ 不是 2 分钟前那句 `那画流萤吧` 的粘性
+            and "判定依据=用户点名(最新消息):爱莉希雅" in records  # ★ 依据写明来源
+            and all(keyword in c for keyword in WEDDING_KEYWORDS)  # ★ 婚纱照旧注入
+            and "（穿着：“婚纱”：wedding dress, bridal veil, white dress）" in c
+            and "穿着跳过" not in records  # ★ 归属没有冲突
+            and "已追加穿着（share_visual / natural）: 婚纱" in records
+            and stub.calls == []  # ① 皮肤表未命中、② 内置表命中 → 0 次模型调用
+            and stub.wear_calls == []
+        )
+        check(
+            "C112 触发消息没点名（都试试？）→ 仍按前一条的点名判定并注入婚纱",
+            ok,
+            f"content = {c!r}\n        调用 = 皮肤{stub.calls!r} / 穿着"
+            f"{stub.wear_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C112 触发消息没点名（都试试？）→ 仍按前一条的点名判定并注入婚纱",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C113（1.0.31 目标 B）归属句式的边界容忍句末语气词 ─────────────────────
+    # 「画爱莉的婚纱吧～」/「画爱莉的婚纱呢」（两跑）：判定侧一直是**爱莉希雅**
+    # （触发消息里就点了名），但 1.0.30 的归属句式 `…的<穿着词>`
+    # （`outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`）边界是"候选后面不能再接名字字符"
+    # —— 「婚纱」后面紧跟的「吧」/「呢」也是汉字，于是整条句式被挡掉、**穿着什么都
+    # 不注入**（判定对、衣服没穿上）。1.0.31 把边界放宽为"后面**不是名字字符**，
+    # 或者**是虚词字符**"（`吧` / `呢` / `啊` … 都在 `outfit._OUTFIT_STOP_CHARS` 里）。
+    # `会` **不在**那张虚词表里（1.0.30 起就不在），所以
+    # 「我想看你的学生会长制服」照旧拆不出「学生」（C91 的语义一个字没变）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        for label, trigger in (
+            ("吧～", "画爱莉的婚纱吧～"),
+            ("呢", "画爱莉的婚纱呢"),
+        ):
+            params = natural_params(PINK_SCENE, text=trigger)
+            params["stream_id"] = f"s-c113-{label}"
+            with (
+                FakeOutfit() as stub,
+                # 上一条点的是**别人**：归属校验因此真的会被考验一次
+                # （穿着这条线索来自触发消息本身 → 爱莉希雅，与判定一致）
+                FakeHistory([history_message(LATEST_NAMED_STICKY_REQUEST, 2.0)]),
+                LogCapture() as logs,
+            ):
+                out = await fire(cfg, params)
+            c = out["args"]["content"]
+            records = logs.records_text()
+            runs.append(
+                (
+                    label,
+                    "爱莉希雅" in c
+                    and all(keyword in c for keyword in WEDDING_KEYWORDS)
+                    and "（穿着：“婚纱”：wedding dress, bridal veil, white dress）" in c
+                    and "穿着跳过" not in records
+                    and stub.calls == []
+                    and stub.wear_calls == [],
+                    (
+                        f"content={c!r} 调用=皮肤{stub.calls!r}/穿着{stub.wear_calls!r}"
+                        f" 日志={records!r}"
+                    ),
+                )
+            )
+        check(
+            "C113 归属句式容忍句末语气词（婚纱吧～ / 婚纱呢）→ 判定爱莉希雅并注入婚纱",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C113 归属句式容忍句末语气词（婚纱吧～ / 婚纱呢）→ 判定爱莉希雅并注入婚纱",
             False,
             f"{type(e).__name__}: {e}",
         )
