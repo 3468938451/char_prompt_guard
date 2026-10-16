@@ -300,7 +300,8 @@ off/warn/fix，与期望集合那套互不影响）：
   :data:`outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`）：用户说「画爱莉的婚纱～」时
   「婚纱」既不在皮肤表里、也不符合七条句式里的任何一条 —— 穿着这一层因此什么都
   识别不到（C107/C108 卡住的地方）。词表直接用内置穿着类型表的键 + 一个"后面不再
-  接名字字符"的边界（**1.0.31 起放宽为"不是名字字符或是虚词字符"**），所以抓到的候选**只可能是已知的穿着词**
+  接名字字符"的边界（**1.0.31 起放行句末语气词、1.0.32 起只放行句末语气词**），
+  所以抓到的候选**只可能是已知的穿着词**
   （``我想看你的学生会长制服`` 里的「学生」不会被拆出来，C91 守的就是这条）。
   同一版还把**候选过滤**的虚词表与**句式抽取**对齐（都不再拿 ``会`` 当虚词），
   「我想看学生会～」的候选因此是完整的 ``学生会``（详见 :mod:`outfit`）。
@@ -318,10 +319,32 @@ off/warn/fix，与期望集合那套互不影响）：
   （C107/C108/C109/C110/C111 的语义因此原样保留）；
 - **归属句式的边界容忍句末语气词**（:data:`outfit._OUTFIT_POSSESSIVE_WEAR_PATTERN`）：
   「画爱莉的婚纱吧～」/「画爱莉的婚纱呢」里「婚纱」后面紧跟的是语气词（``吧`` / ``呢``
-  / ``啊`` …，都在 :data:`outfit._OUTFIT_STOP_CHARS` 里），1.0.30 的硬边界把
-  "后面还有汉字"一律挡掉 → 判定对、衣服却没注入；1.0.31 起边界改成
-  "后面**不是名字字符**，**或**是虚词字符"。``会`` 不在那张虚词表里，
+  / ``啊`` …），1.0.30 的硬边界把"后面还有汉字"一律挡掉 → 判定对、衣服却没注入；
+  1.0.31 起边界改成"后面**不是名字字符**，**或**是虚词字符"。``会`` 不在那张虚词表里，
   「我想看你的学生会长制服」照旧拆不出 ``学生``（C91 语义不变，回归用例 C113）。
+
+1.0.32 起只收窄两处（**判定链的规则、优先级次序与四条闸门的语义都没动**；
+原 C1~C113 的断言一条都没改，新增回归用例 C114/C115）：
+
+- **归属句式的边界只放行句末语气词**（:data:`outfit._OUTFIT_TAIL_PARTICLES`，
+  见 :mod:`outfit` 的 1.0.32 说明）：1.0.31 放行的是**整张**
+  ``outfit._OUTFIT_STOP_CHARS``（``的`` / ``是`` / ``我`` / ``你`` / ``都`` … 全在里面），
+  于是「爱莉的**婚纱是**我挑的」「流萤的**校服被**雨淋了」「画的**婚纱的**话」这类
+  **不含穿着意图**的话也会被当成穿着候选（1.0.30 不会）—— 与"抓错会把衣服画错、
+  宁少勿多"相悖，而文档只承诺放行**句末语气词**。收窄之后
+  「画爱莉的**婚纱吧**～」/「画爱莉的**婚纱呢**」照旧命中（C113 不变），
+  ``会`` 照旧不在任何放行表里（C91 不变），回归用例 C114；
+- **触发消息是追加指令时，1.0.31 的让位不再"只看前一条的单名"**（审计 🟠2，
+  见 :meth:`CharacterGuardHandler._additive_trigger_needs_tracking`）：触发消息
+  **自己没点名**、却含**追加语义词**（``一起`` / ``都`` / ``还有`` …）且**不是疑问句**，
+  而 :meth:`CharacterGuardHandler._overtaken_conclusion` 算出的"原来会生效的结论"
+  **没定死一个人**（多人 ≥2 角色，或「换人还是追加不确定」＝会交 LLM 仲裁）时，
+  本次**不让位** —— 交回主题跟踪 / LLM 仲裁。用户场景
+  ``画爱莉和流萤一起`` → ``流萤这张不错`` → 触发 ``一起画吧``：1.0.30 会让位给
+  LLM 仲裁（可能两人），1.0.31 却直接按前一条的单名拍板并 ``return``
+  （``判定依据=用户点名(最新消息):流萤``），**压过**主题跟踪的"换人还是追加不确定"
+  与 LLM 仲裁 → **该画两人只画一人**；1.0.32 起这次不让位（回归用例 C115）。
+  疑问句照旧让位（C112 的 ``都试试？`` 不受影响），其余情形与 1.0.31 **一字不差**。
 """
 
 from __future__ import annotations
@@ -551,6 +574,17 @@ _MIN_FIX_CONTENT_CHARS = 4
 # 用户消息"、**不会**往更早找（**不是**全循环 `if not named: continue`）。
 # **例外**：触发消息含**自我指代**时照旧让位（「你自己也来一张～」是要本尊，
 # 交给拆单 / 本尊身份那条链路：C45/C110）。
+#
+# **1.0.32 给这条让位加一个兜底（审计 🟠2，不改上面任何一条闸门）**：触发消息是
+# **追加指令**（含 `character.ADDITIVE_WORDS`、**且不是疑问句**）、而"原来会生效的
+# 结论"**没定死一个人**（多人 ≥2 角色，或「换人还是追加不确定」＝会交 LLM 仲裁）时，
+# 本次**不让位** —— 本条信号整体不采用，交回主题跟踪 / LLM 仲裁
+# （见 `CharacterGuardHandler._additive_trigger_needs_tracking`）。用户场景
+# `画爱莉和流萤一起` → `流萤这张不错` → 触发 `一起画吧`：1.0.30 会让位给 LLM 仲裁
+# （可能两人），1.0.31 的让位却直接按前一条的单名拍板并 return，**压过**主题跟踪的
+# 「换人还是追加不确定」与 LLM 仲裁 → 该画两人只画一人（回归用例 C115）。
+# 疑问句照旧让位：`都试试？`（C112）走的就是那条路 —— `？` 是"征询/选择"，
+# 不是"把上一位一起画"的指令。
 #
 # 它压过主题跟踪的**粘性与代词回指**，但压不过描述点名 —— 与既有的
 # 「描述点名 > 主题跟踪 > …」总优先级一致（描述里写了角色时调用方早就放行了）。
@@ -1573,6 +1607,30 @@ class LatestNamedEntry:
         return f"{self.basis}（来源={self.source}，原文={self.text[:30]!r}）"
 
 
+@dataclass(frozen=True)
+class OvertakenConclusion:
+    """「用户最新点名」这条信号**压过的**那个结论（1.0.30 起）。
+
+    它由 :meth:`CharacterGuardHandler._overtaken_conclusion` 用**与正式判定链同一套
+    代码**算出来（``monitor.enabled`` 时是 :func:`monitor.track_subject`，关掉时是
+    :func:`character.resolve_naming_decision`），所以它同时也是「没有这条信号时本次
+    会怎么判」的自证。
+
+    Attributes:
+        text: 进日志的文案，形如 ``主题跟踪:流萤（换人还是追加不确定）`` /
+            ``主题跟踪:无(不补)`` / ``用户点名·粘性:爱莉希雅`` ——
+            **1.0.30/1.0.31 起逐字不变**（README 与用例都按它断言）；
+        unsettled: 这个结论**没有定死一个人** —— 多人（``≥2`` 角色）或
+            「换人还是追加不确定」（会交 LLM 仲裁，也可能画成两人）。
+            **1.0.32** 起它只参与**一处**前置判断
+            （:meth:`CharacterGuardHandler._additive_trigger_needs_tracking`）；
+            除此之外 ``text`` 仍然只进日志，不参与本次判定、也不改变既有输出。
+    """
+
+    text: str = ""
+    unsettled: bool = False
+
+
 # ── 皮肤/时装 与 泛指的穿着（1.0.22 / 1.0.28）─────────────────────────
 #
 # 需求原话：「当说『我想看看你的 xxxx（皮肤）』，可以搜索并加进去」——
@@ -2421,7 +2479,7 @@ class CharacterGuardHandler(BaseEventHandler):
         # **四条闸门**（追加语义/多人、自我指代/疑问语气、只读清洗后的正文、保留
         # 时间衰减与描述优先）全部在 `_latest_named_entry` 里 —— 被闸门挡掉的情形
         # 一律退回下面原来的判定链，一个字都不变。
-        # 命中时日志写明**被压过的那个结论**（`_overtaken_conclusion`，只进日志）。
+        # 命中时日志写明**被压过的那个结论**（`_overtaken_conclusion`）。
         if latest_named.usable and latest_named.entry is not None:
             entry = latest_named.entry
             basis = f"判定依据={latest_named.basis}"
@@ -2431,7 +2489,12 @@ class CharacterGuardHandler(BaseEventHandler):
             # ``判定依据=用户点名(最新消息):爱莉希雅（优先于主题跟踪:流萤）``）。
             # 括号里写的**一律是"原来会生效的那个结论"**（用**同一套代码**算出来的，
             # 见 :meth:`_overtaken_conclusion`），不是写死的角色名 —— 所以它同时也是
-            # 「没有这条信号时本次会怎么判」的自证。它**只进日志**，不参与本次判定。
+            # 「没有这条信号时本次会怎么判」的自证。
+            #
+            # **1.0.32**：这次调用提到"采用之前"（1.0.30/1.0.31 只在即将 return 时才算）
+            # —— ``text`` 照旧只进日志（逐字不变），新加的结构位 ``unsettled`` 只用于
+            # 一处前置判断：触发消息是**追加指令**、而它没定死一个人时，本次**不让位**，
+            # 交回主题跟踪 / LLM 仲裁（审计 🟠2：否则"该画两人只画一人"）。
             overtaken = self._overtaken_conclusion(
                 messages=messages,
                 config=config,
@@ -2439,28 +2502,40 @@ class CharacterGuardHandler(BaseEventHandler):
                 bot_ids=bot_ids,
                 description_has_character=description_has_character,
             )
-            logger.debug(
-                f"{basis}（优先于{overtaken}；来源={latest_named.source}，"
-                f"原文={latest_named.text[:30]!r}）"
-            )
-            return CandidateResult(
-                candidates=[entry],
-                decided=[entry],
-                llm_multi=False,
-                mentioned=mentioned,
-                naming=NamingDecision(
-                    kind="single",
-                    characters=[entry],
-                    basis=BASIS_LATEST_NAMED,
-                    note=(
-                        f"用户最新一条消息（{latest_named.source}）里点名，"
-                        f"优先于{overtaken}"
+            if self._additive_trigger_needs_tracking(
+                trigger_text=self._trigger_text(params),
+                roster=roster,
+                overtaken=overtaken,
+            ):
+                logger.debug(
+                    "用户最新点名不采用（1.0.32）：触发消息是追加指令"
+                    "（含追加语义词、不是疑问句），而原来会生效的结论是"
+                    f"「{overtaken.text}」—— 不让位，交回主题跟踪 / LLM 仲裁"
+                    "（避免「该画两人只画一人」）"
+                )
+            else:
+                logger.debug(
+                    f"{basis}（优先于{overtaken.text}；来源={latest_named.source}，"
+                    f"原文={latest_named.text[:30]!r}）"
+                )
+                return CandidateResult(
+                    candidates=[entry],
+                    decided=[entry],
+                    llm_multi=False,
+                    mentioned=mentioned,
+                    naming=NamingDecision(
+                        kind="single",
+                        characters=[entry],
+                        basis=BASIS_LATEST_NAMED,
+                        note=(
+                            f"用户最新一条消息（{latest_named.source}）里点名，"
+                            f"优先于{overtaken.text}"
+                        ),
                     ),
-                ),
-                basis=basis,
-                memory=memory_lookup,
-                track=track,
-            )
+                    basis=basis,
+                    memory=memory_lookup,
+                    track=track,
+                )
 
         monitor = getattr(config, "monitor", None)
         monitor_on = bool(getattr(monitor, "enabled", False)) and bool(roster)
@@ -2812,8 +2887,8 @@ class CharacterGuardHandler(BaseEventHandler):
         roster: list[CharacterEntry],
         bot_ids: set[str] | frozenset[str],
         description_has_character: bool,
-    ) -> str:
-        """「用户最新点名」这条信号**压过的**那个结论（1.0.30，**只用于日志**）。
+    ) -> OvertakenConclusion:
+        """「用户最新点名」这条信号**压过的**那个结论（1.0.30；``text`` 只用于日志）。
 
         为什么要算它：这条信号是最高优先，但"它压过的到底是什么"必须能一眼看出来 ——
         README / ``docs/multi-character-design.md`` 给的日志样例就是
@@ -2834,8 +2909,16 @@ class CharacterGuardHandler(BaseEventHandler):
           置信度不足 / 无信号）；
         - ``用户点名·粘性:…``：``monitor.enabled = false`` 时那条 1.0.13 链路。
 
-        **只读、只算、不写任何状态**：结果只进日志，绝不参与判定；任何异常都退成
-        ``…:未知``，绝不允许影响判定或拦住生图（这条信号本身就是"多一条证据"，
+        Returns:
+            :class:`OvertakenConclusion` —— ``text`` 的文案与 1.0.30/1.0.31
+            **逐字一致**（README 与用例都按它断言）；``unsettled`` 是 **1.0.32**
+            新加的结构位（多人 / 换人还是追加不确定），**只**用于
+            :meth:`_additive_trigger_needs_tracking` 那一处前置判断。
+
+        **只读、只算、不写任何状态**：``text`` 只进日志，``unsettled`` 只参与上面
+        那一处判断，**都不参与本次判定、也不改变既有输出**；任何异常都退成
+        ``…:未知``（``unsettled`` 保持假 = 不做兜底，与 1.0.31 行为一致），
+        绝不允许影响判定或拦住生图（这条信号本身就是"多一条证据"，
         它的诊断文案更加不能反过来把生图拦住）。
         """
         monitor = getattr(config, "monitor", None)
@@ -2858,11 +2941,18 @@ class CharacterGuardHandler(BaseEventHandler):
                     resolve_identity=lambda: resolve_true_self_identity(config),
                 )
             except Exception as e:  # noqa: BLE001 —— 只为日志，失败就写"未知"
-                return f"主题跟踪:未知（{type(e).__name__}）"
+                return OvertakenConclusion(
+                    text=f"主题跟踪:未知（{type(e).__name__}）"
+                )
             if track.usable:
                 note = "（换人还是追加不确定）" if track.ambiguous else ""
-                return f"主题跟踪:{track.subject_names()}{note}"
-            return "主题跟踪:无(不补)"
+                return OvertakenConclusion(
+                    text=f"主题跟踪:{track.subject_names()}{note}",
+                    # 多人（≥2 角色）或「换人还是追加不确定」（会交 LLM 仲裁、
+                    # 也可能画成两人）都算"**没定死一个人**"（1.0.32 的兜底用）
+                    unsettled=len(track.entries) >= 2 or track.ambiguous,
+                )
+            return OvertakenConclusion(text="主题跟踪:无(不补)")
         try:
             naming = resolve_naming_decision(
                 messages,
@@ -2872,10 +2962,78 @@ class CharacterGuardHandler(BaseEventHandler):
                 bot_ids=bot_ids,
             )
         except Exception as e:  # noqa: BLE001 —— 同上
-            return f"用户点名·粘性:未知（{type(e).__name__}）"
+            return OvertakenConclusion(
+                text=f"用户点名·粘性:未知（{type(e).__name__}）"
+            )
         if naming.kind in {"single", "multi", "uncertain"} and naming.characters:
-            return f"用户点名·粘性:{naming.names()}"
-        return "用户点名·粘性:无(不补)"
+            return OvertakenConclusion(
+                text=f"用户点名·粘性:{naming.names()}",
+                # ``uncertain`` 就是 1.0.13 那条链路的「换人还是追加不确定」
+                unsettled=naming.kind == "uncertain" or len(naming.characters) >= 2,
+            )
+        return OvertakenConclusion(text="用户点名·粘性:无(不补)")
+
+    @staticmethod
+    def _additive_trigger_needs_tracking(
+        *,
+        trigger_text: str,
+        roster: list[CharacterEntry],
+        overtaken: OvertakenConclusion,
+    ) -> bool:
+        """触发消息是**追加指令**、而"原来会生效的结论"没定死一个人 → **不让位**（1.0.32）。
+
+        背景（审计 🟠2）：1.0.31 的前置判断让「触发消息没点名」的整条信号**让位**给
+        "触发前最近 1 条用户消息"（见 :meth:`_latest_named_entry`）。触发消息自己含
+        **追加语义词**时，这个让位会把"追加语义"一起丢掉 —— 用户场景::
+
+            你：画爱莉和流萤一起
+            你：流萤这张不错
+            你：一起画吧          ← 触发这次生图
+
+        主题跟踪的结论是**流萤**、状态是「换人还是追加不确定」（与上一条点名间隔
+        < ``multi.multi_window_minutes``）：1.0.30 会让位给 LLM 仲裁（它读得到画面
+        描述，可能判定为**两人**），1.0.31 的让位却直接按前一条的单名拍板
+        （``判定依据=用户点名(最新消息):流萤``）并 ``return``，**压过**了主题跟踪的
+        「换人还是追加不确定」与 LLM 仲裁 → **该画两人只画一人**。
+
+        所以这里加一条**兜底**（只对"触发消息自己没点名"这条让位路径生效）：
+
+        1. 触发消息含 :data:`character.ADDITIVE_WORDS`（追加指令：一起 / 都 / 还有 …）、
+           **且不是疑问句** —— ``？`` / ``?`` 照旧让位：1.0.31 定下的 C112
+           （``都试试？`` 要读的是"用户刚说的那个人"）走的就是那条路，
+           ``？`` 是"征询 / 选择"，不是"把上一位一起画"的指令；
+        2. :meth:`_overtaken_conclusion` 算出的"原来会生效的结论"**没定死一个人**
+           （``unsettled``：多人 ≥2 角色，或「换人还是追加不确定」）——
+           这时"前一条那个单名"很可能只是追加的一支，必须交回主题跟踪 / LLM 仲裁。
+
+        两条都成立时才**不让位**（本条信号整体不采用），其余情形与 1.0.31 **一字不差**。
+        它**不改变任何既有输出**：不采用时走的正是既有判定链（主题跟踪 → LLM 仲裁 →
+        宁少勿多），命中时读到的 ``overtaken`` 依然只用于日志与这一处判断。
+
+        Args:
+            trigger_text: 触发本次生图的那条消息正文（:meth:`_trigger_text`）
+            roster: 角色表（用来确认"触发消息自己没点名"）
+            overtaken: 原来会生效的那个结论（调用方已算好）
+
+        Returns:
+            为真表示**本次不让位**：本条信号不采用，交回主题跟踪 / LLM 仲裁。
+        """
+        if not trigger_text:
+            return False
+        # 与 `_latest_named_entry` 同一口径：先剥掉 `[回复…]` / `[图片(…)]` 块
+        text = strip_quoted_blocks(trigger_text)
+        if not text:
+            return False
+        # 这条兜底只对"1.0.31 的前置让位"生效 —— 触发消息自己没点名、也没要本尊，
+        # 正是那处前置判断的两个前提（触发消息点了名时走的是闸门①，轮不到这里）。
+        if find_characters_in_text(text, roster) or find_self_reference_word(text):
+            return False
+        # 疑问句照旧让位（C112 的 `都试试？`：既含「都」又含「？」）
+        if "？" in text or "?" in text:
+            return False
+        if not contains_any_word(text, ADDITIVE_WORDS):
+            return False
+        return overtaken.unsettled
 
     @staticmethod
     def _latest_named_entry(
@@ -2952,6 +3110,15 @@ class CharacterGuardHandler(BaseEventHandler):
         **例外**：触发消息含**自我指代**时照旧让位（「你自己也来一张～」是"要本尊"的
         明确表达，必须交给拆单 / 本尊身份那条链路：C45/C110）。
 
+        **1.0.32 给这条让位加一个兜底（审计 🟠2）**：触发消息是**追加指令**
+        （含 ``character.ADDITIVE_WORDS``、**且不是疑问句**）、而
+        :meth:`_overtaken_conclusion` 算出的"原来会生效的结论"**没定死一个人**
+        （多人 ≥2 角色，或「换人还是追加不确定」＝会交 LLM 仲裁）时，调用方
+        （:meth:`_collect_candidates`，见 :meth:`_additive_trigger_needs_tracking`）
+        **不采用**本条信号 —— 让位会被"前一条的单名"按住，把可能的**两人**画成一人。
+        用户场景 ``画爱莉和流萤一起`` → ``流萤这张不错`` → 触发 ``一起画吧``
+        （回归用例 C115）。疑问句照旧让位（``都试试？``：C112 一字不改）。
+
         它压过主题跟踪的**粘性与代词回指**，也压过 ``monitor.enabled = false`` 时
         1.0.13 那条"用户点名·粘性"链路（所以调用方把它放在两条链路**之前**）；
         但**压不过描述点名** —— 画面描述里写了角色时调用方早就放行了，走不到这里。
@@ -3027,6 +3194,14 @@ class CharacterGuardHandler(BaseEventHandler):
             # （C45/C110 断言"内容一字不改"）。自我指代是"要本尊"的明确表达，
             # 不是"接着刚才那句说"的回指；而且此时触发消息**不是**"没点名"，
             # 它是"点名了另一件事（本尊）"。
+            #
+            # **1.0.32 的兜底**：这里让位之后，调用方（`_collect_candidates` →
+            # `_additive_trigger_needs_tracking`）还会看两件事 —— 触发消息是不是
+            # **追加指令**（含追加语义词、不是疑问句）、以及"原来会生效的结论"是不是
+            # **没定死一个人**（多人 / 换人还是追加不确定）。两条都成立时本次**不让位**
+            # （本条信号整体不采用），交回主题跟踪 / LLM 仲裁：`画爱莉和流萤一起`
+            # → `流萤这张不错` → 触发 `一起画吧` 若按前一条的单名拍板，
+            # 就会**该画两人只画一人**（审计 🟠2，回归用例 C115）。
             if (
                 message is None
                 and not find_characters_in_text(text, roster)

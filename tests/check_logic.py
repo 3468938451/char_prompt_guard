@@ -258,6 +258,13 @@ C109~C111 新增；**原 C1~C103 与 C105/C106 的断言一个字都没改**）�
 
 ``FakeOutfit`` 1.0.31 起同样不用加桩：C112/C113 走的都是内置穿着类型表（0 次模型调用）。
 
+**1.0.32 只收窄两处（C114/C115 新增；原 C1~C113 的断言一条都没改、也没放宽）**：
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C114 | **归属句式的边界只放行句末语气词**（审计 🟠1）：1.0.31 放行的是**整张** ``outfit._OUTFIT_STOP_CHARS``（``的`` / ``是`` / ``我`` / ``你`` / ``都`` … 全在里面），于是「爱莉的**婚纱是**我挑的」「流萤的**校服被**雨淋了」「画的**婚纱的**话」这类**不含穿着意图**的话也会被当成穿着候选（1.0.30 不会）—— 抓错会把衣服画错，与"宁少勿多"相悖，而文档只承诺放行**句末语气词**。1.0.32 起边界只用 ``outfit._OUTFIT_TAIL_PARTICLES``（``吧吗呢啊呀哦嘛呗啦咯喔``）。两跑合一：① **单元级** —— 模式在"虚词尾巴"上不匹配（``是`` / ``被`` / ``的`` / ``我``）、在 C113 的语气词尾巴与 C107 的标点/串尾上照旧匹配，并钉住语气词表是 ``_OUTFIT_STOP_CHARS`` 的**真子集**；② **端到端** —— 四段不含穿着意图的话判定角色照旧注入、但**不注入**穿着（无 ``（穿着：`` / ``已追加穿着`` / ``穿着类型解析`` / ``穿着解析(LLM)``）、0 次模型调用，另加一条 ``画爱莉的婚纱吧～`` 的**正例**（C113 的形状）防收窄过头 |
+| C115 | **触发消息是追加指令时不再"只看前一条的单名"**（审计 🟠2）：``画爱莉和流萤一起``（2 分钟前）→ ``流萤这张不错``（1 分钟前）→ 触发 ``一起画吧``。主题跟踪结论 = **流萤** + ``换人还是追加不确定``（间隔 1 分钟 < ``multi.multi_window_minutes``）。1.0.31 的让位会直接按前一条的单名拍板（``判定依据=用户点名(最新消息):流萤``）并 return，**压过**主题跟踪的不确定与 LLM 仲裁 → 该画两人只画一人；1.0.32 起 ``handler._additive_trigger_needs_tracking`` 判定"追加指令 + 原来会生效的结论没定死一个人"→ **不让位**，走跟踪 + LLM 仲裁（假模型给出两人）→ **两人同框**、日志出现 ``用户最新点名不采用（1.0.32）`` / ``换人还是追加不确定`` / ``判定依据=LLM 仲裁``，且**不出现** ``判定依据=用户点名(最新消息)``。反例（同一段上文、触发换成 ``都试试？``）：兜底只认"追加指令"，含 ``？`` 的疑问句照旧让位给 ``流萤这张不错``（``判定依据=用户点名(最新消息):流萤``）、一次模型都不问 —— 反例通过即证明没有"让位过头"。``FakeOutfit`` 在这条里同样不用加桩（本用例不开 ``[outfits]``） |
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -6098,6 +6105,240 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C113 归属句式容忍句末语气词（婚纱吧～ / 婚纱呢）→ 判定爱莉希雅并注入婚纱",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C114（1.0.32 收窄 🟠1）归属句式的边界**只**放行句末语气词 ────────────────
+    # 审计原文：1.0.31 的边界放行的是**整张** `outfit._OUTFIT_STOP_CHARS`
+    # （的 / 了 / 是 / 我 / 你 / 和 / 都 / 还 / 再 / 个 / 点 / 们 …），于是
+    #     爱莉的婚纱是我挑的   → 「的婚纱」后面是「是」（虚词）→ 注入 wedding dress
+    #     流萤的校服被雨淋了   → 「的校服」后面是「被」（虚词）→ 注入校服关键词
+    #     画爱莉的婚纱的话     → 「的婚纱」后面是「的」（虚词）→ 注入 wedding dress
+    # 这三句都**不含穿着意图**（1.0.30 的硬边界不会命中），抓错会把衣服画错，
+    # 与「宁少勿多」相悖 —— 而文档只承诺放行**句末语气词**。1.0.32 起边界只用
+    # `outfit._OUTFIT_TAIL_PARTICLES`（吧吗呢啊呀哦嘛呗啦咯喔）。
+    #
+    # 两跑（合成**一条**用例，与 C112/C113 一样只占一个 check）：
+    #   A. **单元级**：模式在"虚词尾巴"上**不匹配**，在 C113 的语气词尾巴、
+    #      C107 的标点/串尾上照旧匹配（防收窄过头）；顺带钉住那张语气词表是
+    #      `_OUTFIT_STOP_CHARS` 的**真子集**（1.0.32 的收窄就是这一步）。
+    #   B. **端到端**：三段不含穿着意图的话 → 判定角色照旧注入（证明不是空转），
+    #      但**不注入**任何穿着关键词（无 `（穿着：`、无 `已追加穿着`、
+    #      无 `穿着类型解析`、无 `穿着解析(LLM)`）、0 次模型调用；
+    #      再补一条 `画爱莉的婚纱吧～` 的**正例**（C113 的形状）证明没有收窄过头。
+    #
+    # 注：审计第三条 `婚纱的话` 是"假设句"形状 —— `的` 在穿着词**后面**，
+    # 所以连 1.0.31 也不会命中（它守的是"别把边界放宽成任意后缀"）；
+    # 审计说的那个形状的**完整句子**（`画的婚纱的话`）另列一条 `画爱莉的婚纱的话`，
+    # 那一条 1.0.31 **会**注入、1.0.32 不注入。
+    try:
+        from .. import outfit as outfit_module
+
+        pattern = outfit_module._OUTFIT_POSSESSIVE_WEAR_PATTERN
+        unit_cases: list[tuple[str, str | None]] = [
+            # 语气词尾巴 / 标点尾巴 / 串尾 → 照旧命中（C113 / C107 的形状）
+            ("画爱莉的婚纱吧～", "婚纱"),
+            ("画爱莉的婚纱呢", "婚纱"),
+            ("画爱莉的婚纱～", "婚纱"),
+            ("画爱莉的婚纱", "婚纱"),
+            ("画爱莉的居家服，然后出门", "居家服"),
+            # 虚词尾巴 → 1.0.32 起**不再**命中（1.0.31 会）
+            ("爱莉的婚纱是我挑的", None),  # 是（判断词）
+            ("流萤的校服被雨淋了", None),  # 被（介词）
+            ("画爱莉的婚纱的话", None),  # 的（结构助词）
+            ("爱莉的婚纱我买过一件", None),  # 我（代词）
+            ("婚纱的话", None),  # 穿着词在 `的` **前面**：任何版本都不命中
+            # C91 的形状：后面是「会」（汉字，且不在任何放行表里）
+            ("我想看你的学生会长制服", None),
+        ]
+        unit_runs: list[tuple[str, bool, str]] = []
+        for unit_text, expected in unit_cases:
+            match = pattern.search(unit_text)
+            got = match.group(1) if match else None
+            unit_runs.append((unit_text, got == expected, f"期望={expected!r} 实际={got!r}"))
+        tail_is_subset = set(outfit_module._OUTFIT_TAIL_PARTICLES) < set(
+            outfit_module._OUTFIT_STOP_CHARS
+        )
+
+        # B. 端到端：（触发消息, 期望判定角色, 上一条用户消息）
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        negative_samples: list[tuple[str, str, str]] = [
+            ("爱莉的婚纱是我挑的", "爱莉希雅", ""),
+            ("流萤的校服被雨淋了", "流萤", ""),
+            ("婚纱的话", "爱莉希雅", "画爱莉希雅吧"),
+            ("画爱莉的婚纱的话", "爱莉希雅", ""),
+        ]
+        for index, (trigger, who, previous) in enumerate(negative_samples):
+            history = [history_message(previous, 1.0)] if previous else []
+            params = natural_params(PINK_SCENE, text=trigger)
+            params["stream_id"] = f"s-c114-{index}"
+            with FakeOutfit() as stub, FakeHistory(history), LogCapture() as logs:
+                out = await fire(cfg, params)
+            c = out["args"]["content"]
+            records = logs.records_text()
+            runs.append(
+                (
+                    trigger,
+                    who in c  # ★ 角色照旧注入（证明这条用例不是空转）
+                    and "（穿着：" not in c  # ★ 没有穿着说明
+                    and "已追加穿着" not in records  # ★ 没有穿着注入日志
+                    and "穿着类型解析" not in records  # ★ ② 内置表没有命中
+                    and "穿着解析" not in records  # ★ ③/④ 也没走模型那条路
+                    and stub.calls == []
+                    and stub.wear_calls == [],
+                    (f"content={c!r} 调用=皮肤{stub.calls!r}/穿着{stub.wear_calls!r}"
+                    f" 日志={records!r}"),
+                )
+            )
+
+        # 正例（防收窄过头）：C113 的第一跑原样再来一次
+        params = natural_params(PINK_SCENE, text="画爱莉的婚纱吧～")
+        params["stream_id"] = "s-c114-positive"
+        with FakeOutfit() as stub, FakeHistory([]), LogCapture() as logs:
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "正例：画爱莉的婚纱吧～",
+                "爱莉希雅" in c
+                and all(keyword in c for keyword in WEDDING_KEYWORDS)
+                and "（穿着：“婚纱”：wedding dress, bridal veil, white dress）" in c
+                and "穿着跳过" not in records
+                and stub.calls == []
+                and stub.wear_calls == [],
+                (f"content={c!r} 调用=皮肤{stub.calls!r}/穿着{stub.wear_calls!r}"
+                f" 日志={records!r}"),
+            )
+        )
+
+        check(
+            "C114 归属句式边界只放行句末语气词（婚纱是… / 校服被… / 婚纱的话 → 不注入穿着）",
+            tail_is_subset
+            and all(hit for _, hit, _ in unit_runs)
+            and all(hit for _, hit, _ in runs),
+            (
+                f"语气词表是真子集={tail_is_subset}\n        "
+                + "\n        ".join(f"单元[{t}] {d}" for t, _, d in unit_runs)
+                + "\n        "
+                + "\n        ".join(f"端到端[{t}] {d}" for t, _, d in runs)
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C114 归属句式边界只放行句末语气词（婚纱是… / 校服被… / 婚纱的话 → 不注入穿着）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C115（1.0.32 收窄 🟠2）触发消息是追加指令时，不再"只看前一条的单名" ─────
+    # 审计给的可达场景：
+    #     你：画爱莉和流萤一起
+    #     你：流萤这张不错
+    #     你：一起画吧                  ← 触发这次生图
+    # 主题跟踪的结论是**流萤**、状态是「换人还是追加不确定」（与上一条点名相差 1 分钟
+    # < `multi.multi_window_minutes` = 5）。1.0.31：触发消息没点名就跳过它的闸门①②
+    # → 落到 `流萤这张不错`（恰好 1 个角色、无追加/疑问）→ 直接
+    # `判定依据=用户点名(最新消息):流萤` 并 return，**压过**主题跟踪的"不确定"与
+    # LLM 仲裁 → 只画流萤（该画两人只画一人）。1.0.32：触发消息含追加语义词（一起）、
+    # 且"原来会生效的结论"没定死一个人（主题跟踪 = 流萤 + 换人还是追加不确定）→
+    # **不让位**（`handler._additive_trigger_needs_tracking`）→ 走主题跟踪 +
+    # LLM 仲裁（假模型给出两人）→ 两人同框。
+    #
+    # 反例（同一段上文、触发换成 `都试试？`）：兜底**只**管"追加指令"，含「？」
+    # 的疑问句照旧让位给 `流萤这张不错` 的点名（`判定依据=用户点名(最新消息):流萤`，
+    # 这就是 1.0.31 的 C112 口径），并且一次模型都不问 —— 反例通过才说明这次没有
+    # "让位过头"。（注：`都试试？` 里的「都」本身也在 `ADDITIVE_WORDS` 里，
+    # 所以真正的判别点是**问号**，不是"非追加词"。）
+    try:
+        from .. import handler as handler_module
+        from ..character import CharacterEntry, CharacterExtraction
+
+        cfg = make_config(roster=RS3, use_llm=True)
+        cfg.general.history_cache_ttl = 0.0
+        history = [
+            history_message("画爱莉和流萤一起", 2.0),
+            history_message("流萤这张不错", 1.0),
+        ]
+        calls: list[str] = []
+
+        async def fake_extract(**kwargs):
+            # 模拟"LLM 读了画面描述与上文后给出的仲裁结论"：这次要画的是**两人**
+            calls.append(str(kwargs.get("description", "")))
+            return CharacterExtraction(
+                characters=[
+                    CharacterEntry(name="爱莉希雅", game="崩坏三 (Honkai Impact 3rd)"),
+                    CharacterEntry(
+                        name="流萤", game="崩坏：星穹铁道 (Honkai: Star Rail)"
+                    ),
+                ],
+                multi=True,
+            )
+
+        runs: list[tuple[str, bool, str]] = []
+        original = handler_module.extract_characters_via_llm
+        handler_module.extract_characters_via_llm = fake_extract
+        try:
+            # A. 追加指令（一起画吧）→ 不让位：交回主题跟踪 + LLM 仲裁
+            calls.clear()
+            params = natural_params("舞台上的双人合影", text="一起画吧")
+            params["stream_id"] = "s-c115-a"
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(cfg, params)
+            c = out["args"]["content"]
+            records = logs.records_text()
+            runs.append(
+                (
+                    "A 追加指令（一起画吧）不让位",
+                    "爱莉希雅" in c
+                    and "流萤" in c
+                    and c.count("画面角色") == 2  # ★ 两人同框（1.0.31 只会画流萤）
+                    and "判定依据=LLM 仲裁" in records  # ★ 走的是跟踪 + LLM 仲裁那条路
+                    and "换人还是追加不确定" in records  # ★ 原来会生效的正是"不确定"
+                    and "用户最新点名不采用（1.0.32）" in records  # ★ 1.0.32 的兜底生效
+                    # ★ 没有按前一条的单名拍板（这正是 1.0.31 的行为）
+                    and "判定依据=用户点名(最新消息)" not in records
+                    and bool(calls),  # ★ 确实问了模型（仲裁）
+                    f"content={c!r} 调用={calls!r} 日志={records!r}",
+                )
+            )
+
+            # B. 反例：疑问句（都试试？）照旧让位给"最新点名"（1.0.31 的 C112 不变）
+            calls.clear()
+            params = natural_params("舞台上的双人合影", text="都试试？")
+            params["stream_id"] = "s-c115-b"
+            with FakeHistory(history), LogCapture() as logs:
+                out = await fire(cfg, params)
+            c = out["args"]["content"]
+            records = logs.records_text()
+            runs.append(
+                (
+                    "B 反例：疑问句（都试试？）照旧让位",
+                    "流萤" in c
+                    and "爱莉希雅" not in c
+                    # ★ 判定 = 触发前最近 1 条用户消息里点名的流萤（让位生效）
+                    and "判定依据=用户点名(最新消息):流萤" in records
+                    # ★ 1.0.32 的兜底没有误伤疑问句
+                    and "用户最新点名不采用（1.0.32）" not in records
+                    and "判定依据=LLM 仲裁" not in records
+                    and not calls,  # ★ 让位了就不问模型
+                    f"content={c!r} 调用={calls!r} 日志={records!r}",
+                )
+            )
+        finally:
+            handler_module.extract_characters_via_llm = original
+
+        check(
+            "C115 触发消息是追加指令（一起画吧）→ 不让位，交回主题跟踪 + LLM 仲裁",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C115 触发消息是追加指令（一起画吧）→ 不让位，交回主题跟踪 + LLM 仲裁",
             False,
             f"{type(e).__name__}: {e}",
         )
