@@ -181,6 +181,33 @@ off/warn/fix，与期望集合那套互不影响）：
   ``皮肤注入: …（无角色，仅注入皮肤关键词）``。放在最后一步是有意的：
   皮肤不是角色，不参与角色对账，也不会被角色修正逻辑（fix 替换 / 删除）碰到 ——
   「角色在前、皮肤在后」的次序自然成立。
+
+**1.0.23 的三件事**（判定链仍然是「描述点名 > 主题跟踪 > 记忆库 > LLM 仲裁 > 不补」，
+一行未改）：
+
+- **皮肤名不再被当成表外角色名**（修一个真实风险）：用户说「画粉色妖精小姐这套」时，
+  1.0.20 的 ``画X`` 句式可能把「粉色妖精小姐」当成**角色表外**的角色名，于是 1.0.21 的
+  角色解析会多问一次模型；``consistency_check="fix"`` 时更会用解析结果去**替换 / 删除**
+  画面里那个「用户这批消息没提过」的表内角色标签。现在皮肤识别**先跑**
+  （:meth:`CharacterGuardHandler._scan_outfit_names`，1.0.22 起它本来就每次都跑），
+  它认出来的皮肤 / 时装名（**句式 / 引号抓到的候选 + 命中皮肤表的正式名**，
+  见 :class:`OutfitScope.names`）通过 ``exclude`` 传给
+  :meth:`CharacterGuardHandler._scan_user_naming` →
+  ``character.extract_outside_names(exclude=…)`` **豁免**；被豁免的候选会留一条
+  DEBUG ``皮肤名豁免: …``。**注入位置与语义一个字没变**（皮肤仍追加在最后一步、
+  角色在前皮肤在后），变的只有识别顺序 —— 表外点名扫描因此不再复用皮肤扫描备好的
+  文本，两处各读一次上文（同一份进程内缓存，见 ``general.history_cache_ttl``）；
+- **作品名去重**：``character._normalize_game_field`` 不再拼出
+  ``… (Honkai: Star Rail) (Honkai: Star Rail)``（只影响展示 / 日志 / 注入文本，
+  原始字段不动）；
+- **``outfits.infer_unnamed``**（新增，**默认关**）：用户只说「流萤的那一套皮肤」而
+  没点名具体皮肤时，开了就由模型推断这个角色最知名的一套并注入 ——
+  :meth:`CharacterGuardHandler._infer_unnamed_outfit`（识别用
+  :func:`outfit.find_unnamed_outfit_owner`，解析用 :func:`outfit.infer_outfit_via_llm`，
+  缓存键 ``<角色名>|__infer__``），日志标注
+  ``皮肤推断(模型): 流萤 → <皮肤名> → <关键词>（来源=模型推断，confidence=…）``；
+  **默认关**时一次模型都不问、一条相关日志都不打，行为与 1.0.22 逐字一致；
+  推断结果**不写回记忆库**（它是模型猜的，不该当成"用户确认过的事实"记住）。
 """
 
 from __future__ import annotations
@@ -241,8 +268,12 @@ from .outfit import (
     ResolvedOutfit,
     extract_outfit_names,
     find_outfit_entry,
+    find_unnamed_outfit_owner,
+    infer_outfit_via_llm,
     outfit_cache_get,
+    outfit_cache_key,
     outfit_cache_put,
+    outfit_infer_cache_key,
     parse_outfits,
     resolve_outfit_via_llm,
     write_outfit_to_memory,
@@ -740,6 +771,20 @@ def _cached_parse(key_text: str, cache: dict[str, Any], factory: Any) -> Any:
         cache.clear()
     cache[key] = result
     return result
+
+
+def _outfit_entries(config: CharPromptGuardConfig) -> list[OutfitEntry]:
+    """解析 ``outfits.entries`` 皮肤表（带配置文本缓存；1.0.23 起两处共用）。
+
+    ``_scan_outfit_names``（识别，``execute`` 里先跑）与 ``_resolve_outfit``
+    （解析）都要这张表：前者用它把「命中皮肤表的候选」升级成表里的**正式名**
+    （表外点名豁免要用），后者用它查关键词。两处都走这里 → 同一份缓存，
+    配置文本没变就不会重复解析。
+    """
+    section = getattr(config, "outfits", None)
+    return _cached_parse(
+        str(getattr(section, "entries", "") or ""), _outfits_cache, parse_outfits
+    )
 
 
 # ── 「本尊身份」解析（1.0.13）─────────────────────────────────────
@@ -1302,11 +1347,16 @@ class OutfitScope:
             角色线索（给模型当提示、也是缓存键的一半）就是从这一份里取的
         name: 选中的皮肤名（空串表示这次没有皮肤意图）
         source: 这个皮肤名**来自哪条消息**（给模型当上下文线索，也让日志可核对）
+        names: **本次识别到的全部**皮肤 / 时装名（1.0.23）—— 句式 / 引号抓到的候选
+            加上它们命中皮肤表时的**正式名**，去重保序。它不进日志、不参与解析，
+            只用来把「这些是皮肤，不是角色表外的角色名」告诉表外点名那条链路
+            （见 :meth:`CharacterGuardHandler._scan_user_naming` 的 ``exclude``）
     """
 
     texts: list[str] = field(default_factory=list)
     name: str = ""
     source: str = ""
+    names: list[str] = field(default_factory=list)
 
     def label(self) -> str:
         """一行式诊断文案（DEBUG 日志用）。"""
@@ -1414,20 +1464,34 @@ class CharacterGuardHandler(BaseEventHandler):
             if config.roster.enabled
             else []
         )
+        # 1.0.22：皮肤/时装（「我想看你的粉色妖精小姐」）—— **与角色那一侧完全解耦**：
+        # 只解析出「这次要穿哪一套」并带着走，注入统一放在 _finalize 的最后一步
+        # （两条一致性检查之后），角色判定链一个字都不改。
+        # [outfits] enabled=false 时本调用**立刻返回**（不读上文、不调模型、不打日志）。
+        #
+        # 1.0.23：**识别提前到「表外点名」扫描之前** —— 皮肤名要从表外点名链路里
+        # 豁免（见 _scan_user_naming 的 exclude），所以「这次识别到了哪些皮肤名」
+        # 必须先有结论。改的只是识别顺序：注入位置（_finalize 最后一步）与
+        # 「角色在前、皮肤在后」的语义一个字都没变。
+        outfit_scope = await self._scan_outfit_names(
+            params=params, config=config, roster=roster
+        )
+        outfit = await self._resolve_outfit(
+            params=params, config=config, roster=roster, scope=outfit_scope
+        )
         # 1.0.20：「用户点名了角色表外角色」这条判断要看**用户最近说过什么**，
         # 所以先把焦点范围内的用户消息扫一遍（触发消息 + 触发前最近 N 条用户消息，
         # 只取用户消息）。consistency_check="off" 时**一次都不扫**（连上文都不读），
         # 与「off=完全不检查」的语义一致。结果只用于 _finalize 里那条冲突检测，
         # 不参与判定链 —— 扫描本身失败也只记 DEBUG、返回空结果。
+        # 1.0.23：本次识别出的皮肤/时装名（outfit_scope.names）一并传进去**豁免** ——
+        # 它们是皮肤，不是角色表外的角色名（用户说「画粉色妖精小姐这套」时，
+        # 不该为「粉色妖精小姐」多问一次模型，更不该让 fix 去动画面里的角色标签）。
         user_naming = await self._scan_user_naming(
-            params=params, config=config, roster=roster
-        )
-        # 1.0.22：皮肤/时装（「我想看你的粉色妖精小姐」）—— **与角色那一侧完全解耦**：
-        # 只解析出「这次要穿哪一套」并带着走，注入统一放在 _finalize 的最后一步
-        # （两条一致性检查之后），角色判定链一个字都不改。
-        # [outfits] enabled=false 时本调用**立刻返回**（不读上文、不调模型）。
-        outfit = await self._resolve_outfit(
-            params=params, config=config, roster=roster, naming_scope=user_naming
+            params=params,
+            config=config,
+            roster=roster,
+            exclude=outfit_scope.names,
         )
         texts = self._detection_texts(content, spec, args)
         # 1.0.21：把用户点名的表外角色**解析**一次（复用 llm_api，结果带缓存），
@@ -2601,6 +2665,7 @@ class CharacterGuardHandler(BaseEventHandler):
         params: dict[str, Any],
         config: CharPromptGuardConfig,
         roster: list[CharacterEntry],
+        exclude: list[str] | None = None,
     ) -> UserNamingScope:
         """扫描「最近若干条用户消息」里用户点名的**表外**角色名（1.0.20）。
 
@@ -2617,6 +2682,15 @@ class CharacterGuardHandler(BaseEventHandler):
         提取规则（引号 / 句式）与过滤（长度 / 纯标点 / 常见词黑名单 / 角色表内）
         全部在 :func:`character.extract_outside_names`，本方法只负责"扫哪些消息"。
 
+        **1.0.23 的豁免**：``exclude`` 是**本次皮肤识别认定的皮肤 / 时装名**
+        （:meth:`_scan_outfit_names` 的 :attr:`OutfitScope.names`）。它们不该再被
+        当成「角色表外的角色名」—— 用户说「画粉色妖精小姐这套」时，「粉色妖精小姐」
+        是**一套皮肤**，不是角色；被误当成角色时不仅会多问一次模型（1.0.21 的角色
+        解析），``fix`` 还会去替换 / 删除画面里正确角色的标签。豁免口径与「表内」判定
+        一致（完全相同或互为子串，忽略大小写 / 空白），被豁免的候选会记一条 DEBUG
+        ``皮肤名豁免: …``，方便核对"是不是把真的表外角色名也豁免掉了"。
+        没有皮肤名（``exclude`` 为空）时行为与 1.0.22 逐字一致。
+
         ``consistency_check = "off"``、角色表为空时**直接返回空结果**（连上文都不读）；
         任何异常同样只记 DEBUG 并返回空结果 —— 这条判断是「多一条检查」，
         绝不允许影响判定链或拦住生图。
@@ -2628,6 +2702,8 @@ class CharacterGuardHandler(BaseEventHandler):
            ``_memory_lookup`` / ``_collect_candidates`` 直接命中 —— 也就是说
            **同一次生图事件最多只多一次库读**，且只在 ``history_cache_ttl = 0``
            （用户显式关掉缓存）时才会真的多读一次。
+           1.0.23 起皮肤识别（:meth:`_scan_outfit_names`）也自己读一次上文，
+           它跑在本方法**之前**、用的是同一份缓存，因此总量不变。
         """
         mode = (
             str(getattr(config.general, "consistency_check", "") or "").strip().lower()
@@ -2659,12 +2735,27 @@ class CharacterGuardHandler(BaseEventHandler):
 
             names: list[str] = []
             sources: dict[str, str] = {}
+            exempted: list[str] = []
             for text in texts:
-                for name in extract_outside_names(text, roster):
+                found = extract_outside_names(
+                    text,
+                    roster,
+                    exclude=exclude or (),
+                    dropped=exempted,
+                )
+                for name in found:
                     if name not in names:
                         names.append(name)
                         # 记住它来自哪句话（1.0.21：解析成功后写回记忆库时的触发语）
                         sources[name] = text
+            if exempted:
+                # 去重保序：同一套皮肤可能在好几条消息里被抓到
+                unique = list(dict.fromkeys(exempted))
+                logger.debug(
+                    "皮肤名豁免: "
+                    + "、".join(unique)
+                    + "（已由皮肤识别认定为皮肤/时装名，不算表外角色名）"
+                )
             scope = UserNamingScope(
                 texts=texts, scanned=scanned, names=names, sources=sources
             )
@@ -2683,7 +2774,7 @@ class CharacterGuardHandler(BaseEventHandler):
         params: dict[str, Any],
         config: CharPromptGuardConfig,
         roster: list[CharacterEntry],
-        entries: list[OutfitEntry],
+        entries: list[OutfitEntry] | None = None,
         texts: list[str] | None = None,
     ) -> OutfitScope:
         """扫描「最近若干条**用户消息**」里用户点名的皮肤/时装名（1.0.22）。
@@ -2692,12 +2783,18 @@ class CharacterGuardHandler(BaseEventHandler):
         N 条用户消息**（``N = min(multi.recent_messages, 4)``；bot 自己的消息跳过、
         不占名额），且**不扫画面描述** —— 画面描述是被改写的那一侧。
 
-        ``texts`` 已经由调用方（``_scan_user_naming``）备好时直接复用，**不重复读上文**；
-        没备好（``consistency_check="off"`` 或角色表为空时那条扫描会提前返回空）
+        ``texts`` 已经由调用方备好时直接复用，**不重复读上文**；没备好
+        （1.0.23 起 ``execute`` 就是直接调本方法，不再拿表外点名那份结果）
         才自己读一次 —— 走的是同一份进程内缓存（``general.history_cache_ttl``）。
 
         多个候选时取**最新一条消息里的、最长的**一个（``texts`` 是「触发消息在前、
         其后由新到旧」，所以第一个有候选的消息就是最新的那条）。
+
+        1.0.23：**返回的 :class:`OutfitScope` 里同时带上本次识别到的全部皮肤名**
+        （``names``，含命中皮肤表时的**正式名**）—— 表外点名那条链路要用它做豁免
+        （见 :meth:`_scan_user_naming`）。因此这里会**扫完**焦点范围内的每一条消息，
+        而不是像 1.0.22 那样找到第一个候选就返回（选中的 ``name`` 与 ``source``
+        仍是「最新一条消息里最长的那个」，语义没变）。
 
         ``[outfits] enabled = false`` 或任何异常 → 返回空结果：这条链路是「多一层
         外观」，绝不允许影响角色判定或拦住生图。
@@ -2705,6 +2802,8 @@ class CharacterGuardHandler(BaseEventHandler):
         if not bool(getattr(getattr(config, "outfits", None), "enabled", False)):
             # 整条链路零开销：不读上文、不调模型、不打日志
             return OutfitScope()
+        if entries is None:
+            entries = _outfit_entries(config)
         try:
             focus = [text for text in (texts or []) if text]
             if not focus:
@@ -2726,15 +2825,31 @@ class CharacterGuardHandler(BaseEventHandler):
                         continue
                     scanned += 1
                     focus.append(message_text(message))
+            name = ""
+            source = ""
+            names: list[str] = []
             for text in focus:
-                names = extract_outfit_names(text, entries, roster)
-                if not names:
+                hits = extract_outfit_names(text, entries, roster)
+                if not hits:
                     continue
-                scope = OutfitScope(texts=focus, name=max(names, key=len), source=text)
-                logger.debug(f"皮肤/时装扫描: {scope.label()}")
-                return scope
-            logger.debug("皮肤/时装=跳过（用户最近的几条消息里没有皮肤/时装的说法）")
-            return OutfitScope(texts=focus)
+                if not name:
+                    # 多个候选时取**最新一条消息里的、最长**的一个
+                    name = max(hits, key=len)
+                    source = text
+                for hit in hits:
+                    if hit not in names:
+                        names.append(hit)
+                    # 命中皮肤表的候选：把表里的**正式名**也记进来（1.0.23 的表外点名
+                    # 豁免要用它 —— 用户写「画粉色妖精」时抓到的候选与表里的名字并不相等）
+                    matched = find_outfit_entry(hit, entries)
+                    if matched is not None and matched.name not in names:
+                        names.append(matched.name)
+            if not name:
+                logger.debug("皮肤/时装=跳过（用户最近的几条消息里没有皮肤/时装的说法）")
+                return OutfitScope(texts=focus, names=names)
+            scope = OutfitScope(texts=focus, name=name, source=source, names=names)
+            logger.debug(f"皮肤/时装扫描: {scope.label()}")
+            return scope
         except Exception as e:  # noqa: BLE001 —— 多一层外观，失败即静默退回
             logger.debug(f"皮肤/时装扫描失败，本次跳过（{type(e).__name__}: {e}）")
             return OutfitScope()
@@ -2745,37 +2860,41 @@ class CharacterGuardHandler(BaseEventHandler):
         params: dict[str, Any],
         config: CharPromptGuardConfig,
         roster: list[CharacterEntry],
-        naming_scope: UserNamingScope | None = None,
+        scope: OutfitScope | None = None,
     ) -> ResolvedOutfit | None:
         """识别并解析本次的皮肤/时装（1.0.22）；没有或失败时返回 ``None``。
 
         流程（**表优先 → 模型兜底**）：
 
         1. ``outfits.enabled = false`` → **立刻返回**（不解析皮肤表、不读上文、不调模型）；
-        2. 解析皮肤表（``outfits.entries``，带配置文本缓存）并扫描焦点范围内的用户消息；
+        2. 解析皮肤表（``outfits.entries``，带配置文本缓存）；``scope`` 由调用方
+           （``execute``）先跑 :meth:`_scan_outfit_names` 备好时直接复用，
+           没给（本方法被单独调用）才自己扫一次；
         3. 命中皮肤表 → 直接用表里的关键词 / 中文描述，**零模型调用**；表里的那一行
            没写关键词时按「表未命中」处理（继续走第 4 步，用户少填一列也能用）；
         4. 表未命中且 ``outfits.auto_resolve`` → 问一次模型（:meth:`_resolve_outfit_with_cache`，
            与角色解析同一套缓存策略）；``auto_resolve = false`` → 只留一条 DEBUG
-           ``皮肤解析=跳过（…不在皮肤表里…）``。
+           ``皮肤解析=跳过（…不在皮肤表里…）``；
+        5. **1.0.23**：这次**一个皮肤名都没有**（``scope.name`` 为空）时，若
+           ``outfits.infer_unnamed`` 为真 → 交给 :meth:`_infer_unnamed_outfit`
+           去认「<角色>的那一套皮肤」并让模型推断（默认关，关掉时那一步立刻返回）。
 
         **本函数不抛异常**：任何失败都只记日志并返回 ``None``，由调用方什么都不注入。
         """
         section = getattr(config, "outfits", None)
         if not bool(getattr(section, "enabled", False)):
             return None
-        entries = _cached_parse(
-            str(getattr(section, "entries", "") or ""), _outfits_cache, parse_outfits
-        )
-        scope = await self._scan_outfit_names(
-            params=params,
-            config=config,
-            roster=roster,
-            entries=entries,
-            texts=(naming_scope.texts if naming_scope is not None else None),
-        )
+        entries = _outfit_entries(config)
+        if scope is None:
+            scope = await self._scan_outfit_names(
+                params=params, config=config, roster=roster, entries=entries
+            )
         if not scope.name:
-            return None
+            # 用户没点名具体的皮肤名 —— 1.0.23：只有显式开了 infer_unnamed 才继续，
+            # 默认关时这里与 1.0.22 完全一致（返回 None，什么都不注入）
+            return await self._infer_unnamed_outfit(
+                config=config, roster=roster, texts=scope.texts
+            )
         character = self._outfit_character_hint(scope, entries, roster)
         entry = find_outfit_entry(scope.name, entries)
         if entry is not None and entry.keywords:
@@ -2803,6 +2922,67 @@ class CharacterGuardHandler(BaseEventHandler):
             name=scope.name,
             character=character,
             context_text=scope.source,
+        )
+
+    async def _infer_unnamed_outfit(
+        self,
+        *,
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        texts: list[str],
+    ) -> ResolvedOutfit | None:
+        """用户只说「<角色>的那一套皮肤」时让模型推断一套（1.0.23，**默认关**）。
+
+        开关是 ``outfits.infer_unnamed``（默认 ``false``）：**关掉时本方法立刻返回**
+        —— 不扫消息、不调模型、不打任何日志，行为与 1.0.22 逐字一致（0 次模型调用）。
+
+        开启时：
+
+        1. 先确定是哪个角色 —— 用 :func:`outfit.find_unnamed_outfit_owner` 在焦点范围内
+           的用户消息里找「<角色名>的那一套皮肤 / 时装」（角色名必须是**角色表内**角色），
+           ``texts`` 是「触发消息在前、其后由新到旧」，所以取到的是**最近一条**消息里
+           提到的那个；找不到就什么都不做（只留一条 DEBUG）；
+        2. 交给 :meth:`_resolve_outfit_with_cache` 的 ``inferred=True`` 分支：
+           :func:`outfit.infer_outfit_via_llm`（与皮肤解析**同一套** ``llm_api`` /
+           ``translate_model`` / ``llm_timeout``）给出该角色最知名的一套，
+           校验口径与 1.0.22 完全相同（只收小写 ASCII 关键词；``unknown`` / JSON 坏 /
+           ``confidence < 0.5`` / 无有效关键词 → **什么都不注入**）；
+        3. 缓存与皮肤解析**同一套**，键为 ``<角色名>|__infer__``
+           （:func:`outfit.outfit_infer_cache_key`）；
+        4. 成功打 INFO ``皮肤推断(模型): 流萤 → <皮肤名> → <关键词>（来源=模型推断，confidence=…）``
+           与 ``建议加入皮肤表：…``；**推断结果不写回记忆库**（模型猜的东西不该被当成
+           "用户确认过的事实"记住）。
+
+        **本函数不抛异常**：任何失败都只记日志并返回 ``None``，调用方据此什么都不注入。
+        """
+        if not bool(getattr(getattr(config, "outfits", None), "infer_unnamed", False)):
+            # 默认关：一次模型都不问、一条日志都不打（与 1.0.22 逐字一致）
+            return None
+        if not roster:
+            return None
+        owner = ""
+        source = ""
+        for text in texts:
+            owner = find_unnamed_outfit_owner(text, roster)
+            if owner:
+                source = text
+                break
+        if not owner:
+            logger.debug(
+                "皮肤推断=跳过（用户最近的几条消息里没有"
+                "「<角色名>的那一套皮肤/时装」这种说法）"
+            )
+            return None
+        logger.debug(
+            f"皮肤推断: 候选角色={owner}（用户没点名具体是哪一套，"
+            f"来源={source[:30]!r}）"
+        )
+        return await self._resolve_outfit_with_cache(
+            config=config,
+            name=owner,
+            character=owner,
+            context_text=source,
+            inferred=True,
         )
 
     @staticmethod
@@ -2833,6 +3013,7 @@ class CharacterGuardHandler(BaseEventHandler):
         name: str,
         character: str = "",
         context_text: str = "",
+        inferred: bool = False,
     ) -> ResolvedOutfit | None:
         """解析一个皮肤名；**命中缓存就不再问模型**（1.0.22 的调用方缓存）。
 
@@ -2849,10 +3030,25 @@ class CharacterGuardHandler(BaseEventHandler):
           并按 ``outfits.write_back`` 写回记忆库；失败打 DEBUG
           ``皮肤解析(LLM)失败：<原因>``（异常则 WARNING）。
 
+        **1.0.23 的 ``inferred=True``**（用户只说「<角色>的那一套皮肤」、没点名具体皮肤）：
+        此时 ``name`` 是**角色名**，缓存键换成 ``<角色名>|__infer__``
+        （:func:`outfit.outfit_infer_cache_key`），解析函数换成
+        :func:`outfit.infer_outfit_via_llm`，日志前缀变成 ``皮肤推断(模型/缓存): …``；
+        其余（TTL、``建议加入皮肤表``、失败即什么都不注入）完全一致。
+        **推断结果不写回记忆库** —— 它是模型猜的，不该被当成"用户确认过的事实"记住
+        （1.0.22 那条写回只服务于「用户点名 → 解析出结果」这条可信路径）。
+
         **本函数不抛异常**（异常一律转成失败结果并写负缓存）；调用方拿到 ``None``
         或 ``ok`` 为假的结果时**什么都不注入**。
         """
-        cached = outfit_cache_get(name, character)
+        owner = (character or name).strip()
+        cache_key = (
+            outfit_infer_cache_key(owner)
+            if inferred
+            else outfit_cache_key(name, character)
+        )
+        label = "角色" if inferred else "皮肤"
+        cached = outfit_cache_get(name, character, key=cache_key)
         if cached is not None:
             logger.info(cached.log_line())
             if cached.ok:
@@ -2861,16 +3057,25 @@ class CharacterGuardHandler(BaseEventHandler):
             return None
 
         try:
-            result = await resolve_outfit_via_llm(
-                name,
-                character=character,
-                translate_model=str(config.general.translate_model or ""),
-                timeout=float(config.general.llm_timeout or 0.0),
-                context_text=context_text,
-            )
+            if inferred:
+                result = await infer_outfit_via_llm(
+                    owner,
+                    translate_model=str(config.general.translate_model or ""),
+                    timeout=float(config.general.llm_timeout or 0.0),
+                    context_text=context_text,
+                )
+            else:
+                result = await resolve_outfit_via_llm(
+                    name,
+                    character=character,
+                    translate_model=str(config.general.translate_model or ""),
+                    timeout=float(config.general.llm_timeout or 0.0),
+                    context_text=context_text,
+                )
         except Exception as e:  # noqa: BLE001 —— 解析是「多一层外观」，不许拦住生图
             logger.warning(
-                f"皮肤解析(LLM)失败：{type(e).__name__}: {e}（皮肤={name!r}）"
+                f"{'皮肤推断' if inferred else '皮肤解析'}(LLM)失败："
+                f"{type(e).__name__}: {e}（{label}={name!r}）"
             )
             # 异常也要进负缓存：同一套皮肤不必为每一张图都再等一次超时
             outfit_cache_put(
@@ -2880,17 +3085,24 @@ class CharacterGuardHandler(BaseEventHandler):
                     character=character,
                     reason=f"调用失败({type(e).__name__}: {e})",
                     raw_name=name,
+                    inferred=inferred,
                 ),
                 character=character,
+                key=cache_key,
             )
             return None
 
-        outfit_cache_put(name, result, character=character)
+        outfit_cache_put(name, result, character=character, key=cache_key)
         if not result.ok:
-            logger.debug(f"{result.log_line()}（皮肤={name!r}）")
+            logger.debug(f"{result.log_line()}（{label}={name!r}）")
             return None
         logger.info(result.log_line())
         self._log_outfit_suggestion(result)
+        if inferred:
+            logger.debug(
+                f"皮肤推断结果不写回记忆库（模型推断、用户没点名）：{result.name}"
+            )
+            return result
         if bool(getattr(getattr(config, "outfits", None), "write_back", True)):
             await write_outfit_to_memory(config, result)
         return result
@@ -3460,6 +3672,11 @@ class CharacterGuardHandler(BaseEventHandler):
         这样安排有两个理由：① 皮肤关键词不是角色，不该参与角色对账（那两条检查
         只认角色表内的字符串）；② 任何角色修正（fix 替换 / 删除）都不会碰到它 ——
         「角色在前、皮肤在后」的次序也就自然成立。
+
+        **1.0.23**：``outfit`` 也可能是「模型推断」出来的那一套
+        （``outfits.infer_unnamed`` 开启、用户只说「<角色>的那一套皮肤」时，
+        见 :meth:`_infer_unnamed_outfit`）—— 注入路径与 1.0.22 **完全相同**，
+        这里一个字都不需要改。
 
         .. note::
            1.0.21 修正（实测回归）：解析结果**不再并进第 1 条的判定集合**。

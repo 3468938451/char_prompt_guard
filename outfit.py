@@ -27,6 +27,21 @@
   「第二次还要不要问模型」永远绕过缓存 —— 与 C75 守的是同一条。
 
 本模块**不 import handler**（避免循环依赖）；只有写回记忆库时才用 :mod:`memory`。
+
+**1.0.23 的三件事**（判定链一行未改，皮肤这一维只多一条可选的路）：
+
+- **皮肤名不再被当成表外角色名**：:func:`extract_outfit_names` 给出的候选就是
+  「本次识别到的皮肤 / 时装名」，由调用方（``handler._scan_outfit_names`` →
+  ``CharacterGuardHandler._scan_user_naming``）传给
+  ``character.extract_outside_names(exclude=…)`` **豁免** —— 用户说
+  「画粉色妖精小姐这套」时，「粉色妖精小姐」是**皮肤**，不是角色表外的角色名；
+- **「没说名字的那一套」**（``outfits.infer_unnamed``，**默认关**）：
+  :func:`find_unnamed_outfit_owner` 认出「<角色名>的那一套皮肤 / 时装」里的角色，
+  :func:`infer_outfit_via_llm` 让模型给出这个角色最知名的一套（严格 JSON，
+  比 1.0.22 多一个 ``inferred: true`` 字段），校验口径与 1.0.22 **完全相同**；
+  关掉时一次模型都不问、一条日志都不打，行为与 1.0.22 逐字一致；
+- **作品名去重**（同一次日志里的 ``… (Honkai: Star Rail) (Honkai: Star Rail)``）
+  落在 :mod:`character`（``_normalize_game_field``），与本模块无关。
 """
 
 from __future__ import annotations
@@ -49,6 +64,7 @@ from .character import (
     _prepare_model_set,
     _resolve_response_text,
     _strip_json_object,
+    find_roster_identity,
     iter_config_entries,
     normalize_prompt_text,
 )
@@ -59,10 +75,16 @@ logger = get_logger("char_prompt_guard")
 OUTFIT_NAME_MIN_LEN = 2
 OUTFIT_NAME_MAX_LEN = 16
 
-#: 解析来源标记（进日志与缓存）；``表`` = 皮肤表命中、``模型`` = 模型给出、``缓存`` = 命中缓存
+#: 解析来源标记（进日志与缓存）；``表`` = 皮肤表命中、``模型`` = 模型给出、``缓存`` = 命中缓存。
+#: 1.0.23 起另有 :data:`OUTFIT_SOURCE_INFER`（用户没说皮肤名、由模型推断出一套）。
 OUTFIT_SOURCE_TABLE = "表"
 OUTFIT_SOURCE_MODEL = "模型"
 OUTFIT_SOURCE_CACHE = "缓存"
+
+#: 1.0.23：「没说名字的那一套」的来源标记。**不进** ``source`` 字段（那一列仍然写
+#: ``模型`` / ``缓存``，日志前缀才是区分点），只作为 :class:`ResolvedOutfit.inferred`
+#: 为真时日志里的「来源=…」文案与语义标识。
+OUTFIT_SOURCE_INFER = "模型推断"
 
 #: 皮肤表条目里「角色名」这一列缺失时，写回记忆库用的兜底归属名（不好看但保证三元组非空）
 OUTFIT_UNKNOWN_CHARACTER = "未知角色"
@@ -404,6 +426,77 @@ def extract_outfit_names(
     return [name for name in raw if _outfit_like(name, roster or [])]
 
 
+# ── 「没说名字的那一套」（1.0.23，默认关）─────────────────────────────
+#
+# 用户需求原话：「『流萤的那一套皮肤』这种没点名字的说法不会注入……做一个（开关），
+# 默认关就行，开了可以让模型去查（皮肤名字）然后注入提示词」。
+#
+# 识别部分**只认角色表内的角色名**（用现有角色表匹配）：`<角色名>的?(那)?一套(皮肤|时装|…)`
+# 与 `<角色名>的(皮肤|时装)`。这里刻意**不做**任何"猜角色"的事 —— 猜错角色比不注入更糟。
+# 是否真的问模型由调用方按 `outfits.infer_unnamed`（默认 false）决定。
+
+#: 「没说名字的那一套」的句式尾巴：``的?(那)?一套(皮肤|时装|衣服|裙子|装扮|造型)``
+#: 与 ``的(皮肤|时装)``。角色名由 :func:`_unnamed_outfit_pattern` 按角色表现拼。
+_UNNAMED_OUTFIT_TAIL = (
+    r"的?(?:那)?一套(?:皮肤|时装|衣服|裙子|装扮|造型)|的(?:皮肤|时装)"
+)
+
+
+def _unnamed_outfit_pattern(roster: list[CharacterEntry]) -> re.Pattern[str] | None:
+    """拼出「<角色名>的那一套皮肤 / 时装」的正则（1.0.23）；角色表为空时返回 ``None``。
+
+    角色名取角色表里的**名字与别名**（标准标签 / 作品名不参与 —— 用户不会用
+    ``elysia \\(honkai impact 3rd\\)`` 这种写法指代一个角色）；名字长的排在前面，
+    免得「爱莉」先把「爱莉希雅」吃掉。
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in roster:
+        for raw in (entry.name, *entry.aliases):
+            text = (raw or "").strip()
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                names.append(text)
+    if not names:
+        return None
+    names.sort(key=len, reverse=True)
+    escaped = "|".join(re.escape(name) for name in names)
+    return re.compile(rf"({escaped})(?:{_UNNAMED_OUTFIT_TAIL})")
+
+
+def find_unnamed_outfit_owner(text: str, roster: list[CharacterEntry]) -> str:
+    """从一条**用户消息**里找出「<角色名>的那一套皮肤 / 时装」说的是谁（1.0.23）。
+
+    只认两种句式，且角色名必须是**角色表内**的角色（名字或别名）：
+
+    - ``<角色名>的?(那)?一套(皮肤|时装|衣服|裙子|装扮|造型)``（「流萤的那一套皮肤」）；
+    - ``<角色名>的(皮肤|时装)``（「流萤的皮肤」）。
+
+    这正是 1.0.22 **刻意不做**的那种说法（用户没点名具体是哪一套，1.0.22 直接跳过）：
+    1.0.23 起由 ``outfits.infer_unnamed``（**默认关**）决定要不要交给模型推断。
+    本函数**只做识别**：返回角色表里的**正式名**（一条消息里多处命中时取最靠前的那个），
+    没有这种说法时返回空串 —— 不猜角色、不调模型、不打日志。
+
+    Args:
+        text: 一条用户消息的正文（调用方应先用 :func:`character.message_text`）
+        roster: 角色表（角色名必须是表内角色）
+
+    Returns:
+        角色表里的正式名；没有则空串
+    """
+    if not text or not roster:
+        return ""
+    pattern = _unnamed_outfit_pattern(roster)
+    if pattern is None:
+        return ""
+    for match in pattern.finditer(text):
+        # finditer 由左到右，第一个能对回角色表条目的就是最靠前的那个说法
+        entry = find_roster_identity(match.group(1), roster)
+        if entry is not None:
+            return entry.name
+    return ""
+
+
 # ── 关键词 / 标签的规范（模型给的东西一律先过这一关）──────────────────
 
 #: 皮肤关键词允许的字符：**小写**字母 / 数字 / 空格 / ``_`` / ``-`` / ``:`` / ``'``
@@ -491,7 +584,10 @@ class ResolvedOutfit:
         source: ``表`` / ``模型`` / ``缓存``（失败时为空串）
         confidence: 模型自评的把握（0~1；表命中按 1.0）
         reason: 失败原因（成功时为空串）
-        raw_name: 用户消息里的原始写法
+        raw_name: 用户消息里的原始写法（推断路径下是**角色名**）
+        inferred: 1.0.23 —— 这一套是**模型推断**出来的（用户没说皮肤名，
+            只说了「<角色>的那一套皮肤」）。日志前缀与「来源=」都据此变化，
+            调用方也用它决定「不写回记忆库」（见 ``handler._resolve_outfit_with_cache``）
     """
 
     name: str = ""
@@ -502,6 +598,7 @@ class ResolvedOutfit:
     confidence: float = 0.0
     reason: str = ""
     raw_name: str = ""
+    inferred: bool = False
 
     @property
     def ok(self) -> bool:
@@ -515,11 +612,25 @@ class ResolvedOutfit:
     def log_line(self) -> str:
         """可读日志行（成功与失败两种形状）。
 
-        成功：``皮肤解析(模型): 粉色妖精小姐 → pink elf dress, fairy wings（角色=爱莉希雅，confidence=0.9）``
-        失败：``皮肤解析(LLM)失败：<原因>``
+        成功（用户点名了具体皮肤）：
+        ``皮肤解析(模型): 粉色妖精小姐 → pink elf dress, fairy wings（角色=爱莉希雅，confidence=0.9）``
+        成功（1.0.23 模型推断，用户没点名）：
+        ``皮肤推断(模型): 流萤 → 白色花嫁 → white dress（来源=模型推断，confidence=0.8）``
+        失败：``皮肤解析(LLM)失败：<原因>``（推断路径是 ``皮肤推断(LLM)失败：<原因>``）
+
+        「模型推断」必须一眼可见：这条结果是**猜**出来的（用户没说具体是哪一套），
+        与「表命中」「用户点名后解析」是两种可信度，用户据此决定要不要写进皮肤表。
         """
         if not self.ok:
-            return f"皮肤解析(LLM)失败：{self.reason or '未知原因'}"
+            kind = "皮肤推断" if self.inferred else "皮肤解析"
+            return f"{kind}(LLM)失败：{self.reason or '未知原因'}"
+        if self.inferred:
+            return (
+                f"皮肤推断({self.source or OUTFIT_SOURCE_MODEL}): "
+                f"{self.character or '未指定'} → {self.name or '未命名'} → "
+                f"{self.keywords_text()}"
+                f"（来源={OUTFIT_SOURCE_INFER}，confidence={self.confidence:g}）"
+            )
         character = self.character or "未指定"
         return (
             f"皮肤解析({self.source}): {self.raw_name or self.name} → "
@@ -556,6 +667,10 @@ def parse_outfit_resolution_payload(
         {"unknown": false, "outfit_cn": "粉色妖精小姐", "outfit_en": "Pink Elf Lady",
          "tag": "pink elf dress, fairy wings",
          "keywords": ["pink elf dress", "fairy wings"], "confidence": 0.9}
+
+    1.0.23 起结构上多一个**可选**字段 ``"inferred": true``（用户没说皮肤名、由模型
+    推断出一套时）：读取它只为让日志能标注「来源=模型推断」，校验规则一个字没变
+    （缺字段 / 非布尔时按 ``false`` 处理，与 1.0.22 完全一致）。
 
     校验规则（任何一条不满足都返回**失败原因**，由调用方"什么都不注入"）：
 
@@ -624,6 +739,7 @@ def parse_outfit_resolution_payload(
             keywords=keywords,
             source=OUTFIT_SOURCE_MODEL,
             confidence=confidence,
+            inferred=_as_bool(payload.get("inferred")),
         ),
         "",
         confidence,
@@ -664,6 +780,44 @@ NovelAI（Danbooru）提示词的**英文外观关键词**。
 _OUTFIT_USER_TEMPLATE = """皮肤 / 时装名称：{name}
 {character}{context}
 请按要求输出 JSON。"""
+
+
+#: 「没说名字的那一套」用的系统提示（1.0.23）：任务从「解析一个皮肤名」变成
+#: 「给出这个角色最知名的一套」。与 1.0.22 的提示词**同源**（同一套字段与同一条
+#: 「不确定就 unknown=true」的硬规则），只多一个 ``inferred: true`` 与更严的把握要求。
+_OUTFIT_INFER_SYSTEM_PROMPT = """你是角色装扮（皮肤 / 时装 / 装扮）资料助手，服务于 NovelAI 生图提示词补全。
+
+任务：用户**没有点名**具体是哪一套皮肤 / 时装，只说「<角色>的那一套皮肤 / 时装」。
+请给出这个角色**最知名 / 最常被画**的那一套，并给出可以直接写进 NovelAI（Danbooru）
+提示词的**英文外观关键词**。
+
+输出格式（**只输出一个 JSON 对象**，不要 markdown 代码块，不要任何解释文字）：
+{"unknown": false, "inferred": true, "outfit_cn": "皮肤中文名", "outfit_en": "皮肤英文名",
+ "tag": "关键词1, 关键词2", "keywords": ["关键词1", "关键词2"], "confidence": 0.8}
+
+字段说明：
+- inferred：本次是**推断**（用户没点名），固定填 true。
+- unknown：布尔值。**你没有把握说出这个角色最出名的那一套时填 true**，其余字段留空
+  即可 —— 宁可不答，也不要猜；猜错会让下游把衣服画成另一套，比不答更糟。
+- outfit_cn / outfit_en：这套皮肤的中文名与英文名（没有通用英文名时留空）。
+- tag：把关键词写成**一段逗号分隔的字符串**（与 keywords 等价，写一种即可）。
+- keywords：描述这套装扮**外观**的英文关键词列表，例如服装款式 / 材质 / 颜色 /
+  配饰 / 风格。硬性要求：**全部小写 ASCII**，只用小写字母、数字、空格、下划线、
+  连字符、冒号与单引号，括号必须转义写成 `\\(` 与 `\\)`；
+  不要写角色标签，也不要写画质词（masterpiece / best quality 之类）。
+  正确示例：["white wedding dress", "veil"]、["pink elf dress", "fairy wings"]。
+  错误示例（一律不要）：["白色长裙"]（非 ASCII）、["White Dress"]（大写）、
+  ["white dress (wedding)"]（括号未转义）。
+- confidence：你对这次判断的把握，0 到 1 之间的小数；**没有把握就给低分**。
+
+硬性规则：
+- 只输出 JSON，不要 markdown 代码块，不要前后缀说明；
+- 不要把角色名当关键词，不要输出角色标签（角色那一侧由别的逻辑负责）；
+- 只描述**外观**，不要编造出处作品、不要输出中文关键词。"""
+
+_OUTFIT_INFER_USER_TEMPLATE = """角色名：{character}
+{context}用户**没有点名**具体是哪一套皮肤 / 时装，只说「{character} 的那一套皮肤 / 时装」。
+请给出这个角色最知名 / 最常被画的那一套，并按要求输出 JSON。"""
 
 
 async def resolve_outfit_via_llm(
@@ -781,6 +935,106 @@ async def resolve_outfit_via_llm(
     )
 
 
+async def infer_outfit_via_llm(
+    character: str,
+    *,
+    translate_model: str = "",
+    timeout: float = 0.0,
+    context_text: str = "",
+) -> ResolvedOutfit:
+    """用户没说皮肤名时，让模型推断该角色最知名的一套（1.0.23，``infer_unnamed``）。
+
+    与 :func:`resolve_outfit_via_llm` **完全同一套**管道：同一个 ``llm_api``、
+    同一个模型（``general.translate_model``，留空回退 ``UTILS_SMALL``）、同一个超时
+    （``general.llm_timeout``）、同一套 JSON 提取与
+    :func:`parse_outfit_resolution_payload` 校验（只收小写 ASCII 关键词；
+    ``unknown=true`` / JSON 坏 / ``confidence`` 低于 :data:`OUTFIT_RESOLVE_MIN_CONFIDENCE` /
+    无有效关键词 → **解析失败**）。差别只有两处：
+
+    1. 提示词换成 :data:`_OUTFIT_INFER_SYSTEM_PROMPT`（要求模型给出该角色
+       **最知名 / 最常被画**的一套，并在 JSON 里带上 ``"inferred": true``）；
+    2. 返回结果的 ``inferred`` 一律为真 —— 这是**推断**，即使模型漏填那个字段，
+       调用方也必须能按「模型推断」记录日志并据此**不写回记忆库**。
+
+    与 :func:`resolve_outfit_via_llm` 一样：**本函数只做「纯解析」**（不读缓存、
+    不写缓存、不打成功日志），缓存与日志都在调用方
+    （``handler._resolve_outfit_with_cache`` 的 ``inferred=True`` 分支）。
+
+    Args:
+        character: 角色名（来自 :func:`find_unnamed_outfit_owner`，一定是角色表内角色）
+        translate_model: 解析用模型名；空字符串回退 ``UTILS_SMALL``
+        timeout: 超时秒数；``<=0`` 表示不限时
+        context_text: 可选的用户原话（提供线索）
+
+    Returns:
+        :class:`ResolvedOutfit`（``ok`` 为假表示解析失败，``reason`` 写明原因）
+    """
+    raw_character = (character or "").strip()
+    if not raw_character:
+        return ResolvedOutfit(reason="角色名为空", inferred=True)
+
+    def _failure(reason: str, confidence: float = 0.0) -> ResolvedOutfit:
+        return ResolvedOutfit(
+            character=raw_character,
+            reason=reason,
+            confidence=confidence,
+            raw_name=raw_character,
+            inferred=True,
+        )
+
+    async def _run() -> str:
+        request = llm_api.create_llm_request(
+            model_set=_prepare_model_set(translate_model),
+            request_name="char_prompt_guard_outfit_infer",
+        )
+        request.add_payload(
+            LLMPayload(ROLE.SYSTEM, Text(_OUTFIT_INFER_SYSTEM_PROMPT))
+        )
+        context = (context_text or "").strip()
+        request.add_payload(
+            LLMPayload(
+                ROLE.USER,
+                Text(
+                    _OUTFIT_INFER_USER_TEMPLATE.format(
+                        character=raw_character,
+                        context=(
+                            f"用户原话（线索）：{context[:200]}\n" if context else ""
+                        ),
+                    )
+                ),
+            )
+        )
+        response = await request.send(stream=False)
+        return await _resolve_response_text(response)
+
+    try:
+        if timeout and timeout > 0:
+            raw_text = await asyncio.wait_for(_run(), timeout=timeout)
+        else:
+            raw_text = await _run()
+    except TimeoutError:
+        return _failure(f"模型超时（{timeout:g}s）")
+    except Exception as e:  # noqa: BLE001 —— 推断只多一条路，失败只返回失败结果
+        return _failure(f"调用失败({type(e).__name__}: {e})")
+
+    try:
+        payload = json.loads(_strip_json_object(raw_text))
+    except Exception as e:  # noqa: BLE001 —— JSON 坏 = 解析失败
+        return _failure(f"JSON 解析失败({type(e).__name__}: {e})")
+
+    outfit, reason, confidence = parse_outfit_resolution_payload(payload)
+    if outfit is None:
+        return _failure(reason, confidence)
+    # 皮肤名缺失时回落「<角色>的那一套」；归属角色一律用调用方给的角色名
+    return replace(
+        outfit,
+        name=outfit.name or f"{raw_character}的那一套",
+        character=outfit.character or raw_character,
+        raw_name=raw_character,
+        inferred=True,
+    )
+
+
 # ── 解析结果的进程内缓存（存储与 TTL 在本模块，读写在调用方）──────────
 
 #: 成功结果的缓存有效期（秒）：24 小时。皮肤外观是**静态知识**，同一天里没必要
@@ -793,6 +1047,13 @@ OUTFIT_FAILURE_TTL_SECONDS = 10 * 60.0
 
 #: 缓存条数上限（超出即整表清空，避免无上限增长）
 OUTFIT_CACHE_LIMIT = 128
+
+#: 1.0.23：「没说名字的那一套」的缓存键后缀 —— ``<角色名>|__infer__``。
+#:
+#: 为什么与皮肤名共用一张表：TTL 语义完全一样（皮肤外观是静态知识），
+#: 分开存只会多一套要维护的过期逻辑；后缀保证它与「皮肤名|角色名」两类键
+#: **永远不会互相覆盖**（「流萤」这个角色名不会与任何一套皮肤名撞键）。
+OUTFIT_INFER_CACHE_SUFFIX = "__infer__"
 
 #: 缓存：``(皮肤名 + 角色名)`` 归一化键 → ``(写入时间, 结果)``
 _outfit_cache: dict[str, tuple[float, ResolvedOutfit]] = {}
@@ -809,23 +1070,43 @@ def outfit_cache_key(name: str, character: str = "") -> str:
     return f"{skin}|{owner}"
 
 
+def outfit_infer_cache_key(character: str) -> str:
+    """「没说名字的那一套」的缓存键：``<角色名>|__infer__``（1.0.23）。
+
+    这里**不用** :func:`outfit_cache_key` 拼（它会把下划线归一化成空格，
+    于是后缀变成 ``infer``）：键的形状是给用户看日志 / 排查用的，
+    固定成 ``<角色名>|__infer__`` 更好认；角色名那一半的归一化口径与
+    :func:`outfit_cache_key` 保持一致。
+    """
+    owner = normalize_prompt_text(character) or (character or "").strip().lower()
+    return f"{owner}|{OUTFIT_INFER_CACHE_SUFFIX}"
+
+
 def outfit_cache_get(
-    name: str, character: str = "", *, now: float | None = None
+    name: str,
+    character: str = "",
+    *,
+    now: float | None = None,
+    key: str = "",
 ) -> ResolvedOutfit | None:
     """按（皮肤名 + 角色名）读缓存；未命中或已过期返回 ``None``（1.0.22）。
 
     成功结果缓存 24 小时（:data:`OUTFIT_CACHE_TTL_SECONDS`）、失败负缓存 10 分钟
     （:data:`OUTFIT_FAILURE_TTL_SECONDS`）。**命中时把 ``source`` 改写成** ``缓存``
     再返回：调用方直接打 ``result.log_line()``，日志里就是 ``皮肤解析(缓存): …``。
+
+    ``key`` 不为空时**直接用它当缓存键**（1.0.23 的「皮肤推断」用
+    :func:`outfit_infer_cache_key` 拼出来的 ``<角色名>|__infer__``）——
+    只有调用方知道该用哪种键，TTL 与过期逻辑仍共用这一处。
     """
-    key = outfit_cache_key(name, character)
-    stamp_and_result = _outfit_cache.get(key)
+    cache_key = key or outfit_cache_key(name, character)
+    stamp_and_result = _outfit_cache.get(cache_key)
     if stamp_and_result is None:
         return None
     stamp, result = stamp_and_result
     ttl = OUTFIT_CACHE_TTL_SECONDS if result.ok else OUTFIT_FAILURE_TTL_SECONDS
     if ttl <= 0 or ((time.time() if now is None else float(now)) - stamp) >= ttl:
-        _outfit_cache.pop(key, None)
+        _outfit_cache.pop(cache_key, None)
         return None
     return replace(
         result,
@@ -841,12 +1122,18 @@ def outfit_cache_put(
     *,
     character: str = "",
     now: float | None = None,
+    key: str = "",
 ) -> None:
-    """按（皮肤名 + 角色名）写缓存（成功 / 失败都写；超上限时整表清空）。"""
+    """按（皮肤名 + 角色名）写缓存（成功 / 失败都写；超上限时整表清空）。
+
+    ``key`` 的语义与 :func:`outfit_cache_get` 完全一致（读写必须用同一个键，
+    否则会写出「读不回来」的缓存）。
+    """
     if len(_outfit_cache) >= OUTFIT_CACHE_LIMIT:
         _outfit_cache.clear()
     stamp = time.time() if now is None else float(now)
-    _outfit_cache[outfit_cache_key(name, character)] = (stamp, result)
+    cache_key = key or outfit_cache_key(name, character)
+    _outfit_cache[cache_key] = (stamp, result)
 
 
 def reset_outfit_cache() -> None:
@@ -920,12 +1207,14 @@ __all__ = [
     "OUTFIT_CORE_TAG",
     "OUTFIT_FAILURE_TTL_SECONDS",
     "OUTFIT_GENERIC_WORDS",
+    "OUTFIT_INFER_CACHE_SUFFIX",
     "OUTFIT_KEYWORD_ALLOWED_CHARS",
     "OUTFIT_KEYWORD_MAX_CHARS",
     "OUTFIT_NAME_MAX_LEN",
     "OUTFIT_NAME_MIN_LEN",
     "OUTFIT_RESOLVE_MIN_CONFIDENCE",
     "OUTFIT_SOURCE_CACHE",
+    "OUTFIT_SOURCE_INFER",
     "OUTFIT_SOURCE_MODEL",
     "OUTFIT_SOURCE_TABLE",
     "OUTFIT_UNKNOWN_CHARACTER",
@@ -933,9 +1222,12 @@ __all__ = [
     "ResolvedOutfit",
     "extract_outfit_names",
     "find_outfit_entry",
+    "find_unnamed_outfit_owner",
+    "infer_outfit_via_llm",
     "outfit_cache_get",
     "outfit_cache_key",
     "outfit_cache_put",
+    "outfit_infer_cache_key",
     "outfit_write_title",
     "parse_outfit_resolution_payload",
     "parse_outfits",

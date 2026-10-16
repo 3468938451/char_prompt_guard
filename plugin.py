@@ -73,6 +73,20 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
 - 注入放在 ``_finalize`` 的最后一步：``natural`` 追加
   ``（皮肤/时装：“粉色妖精小姐”：pink elf dress, fairy wings）``，``tags`` 把关键词
   追加进同一个参数串；``[outfits] enabled = false`` 时整条链路零开销。
+
+1.0.23 起修三件事（判定链仍然一行未改，见 :mod:`handler` / :mod:`outfit`）：
+
+- **皮肤名不再被当成表外角色名**：皮肤识别先跑，它认出来的皮肤 / 时装名通过
+  ``exclude`` 传给 :func:`character.extract_outside_names` **豁免** —— 用户说
+  「画粉色妖精小姐这套」时「粉色妖精小姐」是**一套皮肤**，不会为它多问一次模型、
+  ``fix`` 也不会再去动画面里的角色标签（注入位置与语义一个字没变）；
+- **作品名去重**（:func:`character._normalize_game_field`）：``game_cn`` 已含
+  ``game_en`` 时只保留一个，不再拼出 ``… (Honkai: Star Rail) (Honkai: Star Rail)``；
+- **``outfits.infer_unnamed``**（新增，**默认关**）：用户只说「流萤的那一套皮肤」
+  而没点名具体皮肤时，开了才由模型推断该角色最知名的一套并注入
+  （:func:`outfit.find_unnamed_outfit_owner` + :func:`outfit.infer_outfit_via_llm`，
+  校验口径与 1.0.22 完全相同，日志标注「来源=模型推断」，推断结果不写回记忆库）；
+  默认关时 0 次模型调用、无相关日志，行为与 1.0.22 逐字一致。
 """
 
 from __future__ import annotations
@@ -149,7 +163,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.22"
+    plugin_version: str = "1.0.23"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

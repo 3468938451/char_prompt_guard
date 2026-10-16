@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -855,7 +856,12 @@ def replace_character_reference(
 # 本模块只做**提取与过滤**（纯文本、零依赖、可单独回归）；「算不算冲突」以及
 # warn / fix 的处理都在 ``handler``。提取天然会有误判 —— 所以这里的口径一律
 # 取**宁少勿多**：宁可漏掉一个表外点名（退回 1.0.19 的行为，无害），也不要把
-# 一句普通描述当成角色名（``fix`` 会因此删掉画面里正确的角色，有害）。
+# 一句普通描述当成角色名（``fix`` 会因此删掉画面里正确的角色）。
+#
+# 1.0.23 起多一道**豁免**（:func:`_excluded_name`）：本次皮肤识别认定的皮肤 /
+# 时装名（``outfit.extract_outfit_names`` 的候选 = 用户说的那套衣服）不再算
+# 表外角色名 —— 用户说「画粉色妖精小姐这套」时「粉色妖精小姐」是**一套皮肤**，
+# 既不该触发一次角色解析，更不该让 ``fix`` 去替换 / 删除画面里的角色标签。
 
 #: 表外点名的最小 / 最大长度（对应需求里的「X 取 2~12 个非标点字符」）。
 OUTSIDE_NAME_MIN_LEN = 2
@@ -1127,12 +1133,40 @@ def _in_roster(candidate: str, roster: list[CharacterEntry]) -> bool:
     return False
 
 
+def _excluded_name(candidate: str, exclude: Iterable[str]) -> bool:
+    """候选是不是「本次已经认定为皮肤 / 时装」的名字（1.0.23 的豁免）。
+
+    用户说「画粉色妖精小姐这套」时，句式抓到的候选可能是「粉色妖精小姐这套」，
+    而皮肤表里的正式名是「粉色妖精小姐」—— 两者互为子串。所以比较口径与
+    :func:`_in_roster` 完全一致：**完全相同或互为子串**，忽略大小写 / 空白 /
+    反斜杠下划线（走 :func:`normalize_prompt_text`）。
+
+    ``exclude`` 由调用方（``handler._scan_user_naming``）传入**本次皮肤识别认定的
+    皮肤 / 时装名**（``outfit.extract_outfit_names`` 的候选 + 命中的表内正式名）。
+    空集合时本函数恒为假 —— 没开 `[outfits]` / 这次没有皮肤意图时行为与 1.0.22 一致。
+    """
+    target = normalize_prompt_text(candidate)
+    if not target:
+        return False
+    for raw in exclude or ():
+        known = normalize_prompt_text(str(raw or ""))
+        if known and (known in target or target in known):
+            return True
+    return False
+
+
 def _scene_word_hit(candidate: str) -> bool:
     """候选里是否含"美术需求"常用词（只用于句式模式，见 :data:`OUTSIDE_NAME_SCENE_WORDS`）。"""
     return any(word in candidate for word in OUTSIDE_NAME_SCENE_WORDS)
 
 
-def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
+def extract_outside_names(
+    text: str,
+    roster: list[CharacterEntry],
+    exclude: Iterable[str] = (),
+    *,
+    dropped: list[str] | None = None,
+) -> list[str]:
     """从一段**用户消息**里提取「用户点名的角色表外角色名」（1.0.20）。
 
     规则（对应需求里的两条提取模式 + 三条过滤）：
@@ -1142,7 +1176,12 @@ def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
     2. **句式模式**：``披上X这层壳`` / ``扮演X`` / ``画X`` / ``要X`` / ``看看X`` /
        ``换成X`` / ``来张X``（X = 2~12 个非标点字符；过滤用
        :data:`_SENTENCE_NAME_STOP_CHARS` + :data:`OUTSIDE_NAME_SCENE_WORDS`）；
-    3. **过滤**：长度 / 纯标点 / 黑名单 / 角色表内的名字与别名（见 :func:`_name_like`）。
+    3. **过滤**：长度 / 纯标点 / 黑名单 / 角色表内的名字与别名（见 :func:`_name_like`）；
+    4. **豁免**（1.0.23）：``exclude`` 里的名字是**皮肤 / 时装名**
+       （``outfit.extract_outfit_names`` 认出来的），它们**不算表外角色名** ——
+       用户说「画粉色妖精小姐这套」时「粉色妖精小姐」是一套皮肤，不是角色。
+       这一步排在其它过滤**之后**：只有"确实像一个名字、只差豁免这一道"的候选
+       才会被记进 ``dropped``（诊断用，见下）。
 
     调用方（``handler``）负责只喂**用户消息**（bot 的复述不算），并沿用自我指代
     扫描的焦点范围（触发消息 + 触发之前最近 N 条用户消息）。
@@ -1150,6 +1189,10 @@ def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
     Args:
         text: 一条消息的正文（调用方应先用 :func:`message_text` 剥掉引用块）
         roster: 角色表（用于剔除"表内"的名字与别名）；为空时全部视为表外
+        exclude: 本次已认定为皮肤 / 时装的名字（豁免；为空时等于 1.0.22 行为）
+        dropped: 可选**出参**：被 ``exclude`` 豁免掉的候选会追加到这里
+            （只记通过其它全部过滤的那些）。调用方据此打一条 DEBUG，
+            用户核对"是不是把真的表外角色名也豁免掉了"就靠它
 
     Returns:
         表外名字列表（去重、保序；没有则空列表）
@@ -1157,7 +1200,10 @@ def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
     .. note::
        这是**启发式**：宁可漏（漏了就当 1.0.20 这条不存在，行为退回 1.0.19），
        也不要把普通词当成角色名（``fix`` 会据此删掉画面里正确的角色）。
-       已知残余风险与边界写在 ``docs/multi-character-design.md`` 的 1.0.20 一节。
+       已知残余风险与边界写在 ``docs/multi-character-design.md`` 的 1.0.20 一节；
+       1.0.23 的豁免（``exclude``）另有一条残余风险：若某个**皮肤名恰好是**
+       某个真表外角色名的子串（或反之），那个角色名会被一起豁免 —— 取舍见
+       该文档 1.0.23 一节。
     """
     if not text:
         return []
@@ -1169,6 +1215,13 @@ def extract_outside_names(text: str, roster: list[CharacterEntry]) -> list[str]:
         if scene_filter and _scene_word_hit(candidate):
             return
         if not _name_like(candidate, stop_chars, roster):
+            return
+        if _excluded_name(candidate, exclude):
+            # 1.0.23：已由皮肤识别认定为皮肤 / 时装 → 不算「表外角色名」。
+            # 走到这里说明它已经通过了长度 / 字符 / 虚词 / 黑名单 / 角色表五道过滤，
+            # 确实"像一个名字"，只有豁免这一道能拦住它 —— 记下来方便核对。
+            if dropped is not None:
+                dropped.append(candidate)
             return
         key = candidate.lower()
         if key in seen:
@@ -1736,18 +1789,70 @@ def validate_tag(tag: str) -> tuple[bool, str]:
     return True, ""
 
 
+#: 括号块（中英文圆括号 / 方括号 / 书名号）：比较名字与作品名时先去掉它们（1.0.23）
+_BRACKET_BLOCK_PATTERN = re.compile(r"[（(\[【《][^）)\]】》]*[）)\]】》]")
+
+
+def _dedupe_key(text: str) -> str:
+    """比较用的键：忽略大小写与**所有空白**（1.0.23）。"""
+    return re.sub(r"\s+", "", (text or "").lower())
+
+
+def _name_key(text: str) -> str:
+    """比较「名字」用的键：:func:`_dedupe_key` 再去掉括号块（1.0.23）。"""
+    return _dedupe_key(_BRACKET_BLOCK_PATTERN.sub("", text or ""))
+
+
+def _duplicate_name(left: str, right: str) -> bool:
+    """两个名字是不是同一个（大小写 / 空白 / 括号不敏感，1.0.23）。
+
+    用于 ``name_cn`` / ``name_en`` / 标签里的英文名三者去重：模型偶尔会把同一
+    个名字写两遍（``name_cn="刻律德拉 (Kleidra)"``、``name_en="Kleidra"``），
+    别名表里就不该再多出一条同义项。**只判相等，不做子串猜测** ——
+    「爱莉」与「爱莉希雅」是两个名字，必须都留着。
+    """
+    left_key = _name_key(left)
+    return bool(left_key) and left_key == _name_key(right)
+
+
+def _work_name_duplicate(name_cn: str, name_en: str) -> bool:
+    """``name_en`` 是不是已经在 ``name_cn`` 里出现过（1.0.23）。
+
+    实测（用例 C72 的日志）：模型把英文作品名**也**塞进了 ``game_cn``
+    （``game_cn="崩坏：星穹铁道 (Honkai: Star Rail)"``、``game_en="Honkai: Star Rail"``），
+    代码照旧拼一次就得到 ``… (Honkai: Star Rail) (Honkai: Star Rail)``。
+    两种重复都算：**去空白 / 大小写后互为子串**（含句子里的那份），
+    以及**去掉括号块后还相同 / 包含**（``game_en="(Honkai: Star Rail)"`` 这种写法）。
+    """
+    cn_key, en_key = _dedupe_key(name_cn), _dedupe_key(name_en)
+    if not en_key:
+        return False
+    if cn_key == en_key or en_key in cn_key:
+        return True
+    bare_cn = _dedupe_key(_BRACKET_BLOCK_PATTERN.sub("", name_cn))
+    bare_en = _dedupe_key(_BRACKET_BLOCK_PATTERN.sub("", name_en))
+    return bool(bare_en) and bare_en in bare_cn
+
+
 def _normalize_game_field(name_cn: str, name_en: str) -> str:
     """把 ``game_cn`` / ``game_en`` 合成一个作品名字段：``崩坏：星穹铁道 (Honkai: Star Rail)``。
 
     与角色表第 2 列的既有写法一致（中文作品名 + 括号里的英文作品名）：
     ``natural`` 模式的追加模板与 ``_drop_work_name_groups`` 的「作品名括号」清理
     都按这个形状工作。只有一项时就用那一项。
+
+    **1.0.23 起去重**（见 :func:`_work_name_duplicate`）：``game_en`` 已经在
+    ``game_cn`` 里时**只保留一个**，不再拼出 ``… (Honkai: Star Rail) (Honkai: Star Rail)``。
+    改的只是这一处**展示 / 日志 / 注入文本的拼接** —— ``game_cn`` / ``game_en``
+    两个原始字段一个字都不动（它们进不了任何地方，只在这里被读一次）。
     """
     cn = (name_cn or "").strip()
     en = (name_en or "").strip()
-    if cn and en and cn != en:
-        return f"{cn} ({en})"
-    return cn or en
+    if not cn or not en:
+        return cn or en
+    if _work_name_duplicate(cn, en):
+        return cn
+    return f"{cn} ({en})"
 
 
 def _tag_latin_part(tag: str) -> str:
@@ -1821,12 +1926,15 @@ def parse_resolution_payload(
         text = (candidate or "").strip()
         # 中文名 / 英文名 / 标签里的英文名三者互为别名：去掉与正式名重复的
         # （忽略大小写），以及已经收过的（同样忽略大小写 —— 实现按**原文**保留
-        # 第一次出现的写法，例如 ``Kleidra``，不会为了对齐大小写而改写）
+        # 第一次出现的写法，例如 ``Kleidra``，不会为了对齐大小写而改写）。
+        # 1.0.23 起「重复」的判定再算上**空白与括号块**（:func:`_duplicate_name`）：
+        # 模型写 ``name_cn="刻律德拉 (Kleidra)"``、``name_en="Kleidra"`` 这类
+        # 带括号的同一名字时，别名表里不会再多出一条同义项
+        # （``刻律德拉`` 与 ``Kleidra`` 不同名，照旧都保留）。
         if (
             text
-            and text != name
-            and text.lower() != name.lower()
-            and not any(text.lower() == known.lower() for known in aliases)
+            and not _duplicate_name(text, name)
+            and not any(_duplicate_name(text, known) for known in aliases)
         ):
             aliases.append(text)
     return (

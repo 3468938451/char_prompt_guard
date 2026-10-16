@@ -148,6 +148,44 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
 记忆库同一个理由：旧用例是更早版本的行为回归，不该因为本机恰好配了皮肤表 /
 模型而变红；插件配置类里的默认值仍是 `true`，见 tests/check_import.py 的断言）。
 
+1.0.23 起修三件事（C83~C88），判定链仍然一行未改：
+
+1. **皮肤名不再被当成表外角色名**：用户说「画粉色妖精小姐这套」时，「粉色妖精小姐」
+   是**一套皮肤**（皮肤表里有），可 1.0.20 的「表外点名」提取链可能把同一句话里的
+   名字当成**角色表外的角色名** → 1.0.21 会为此多问一次模型，`consistency_check="fix"`
+   时还会用解析结果去替换 / 删除画面里**用户这批消息没提过**的表内角色标签。
+   现在皮肤识别（`handler._scan_outfit_names`）**先跑**，它认出来的皮肤 / 时装名
+   （句式 / 引号抓到的候选 + 命中皮肤表的正式名）通过 `exclude` 传给
+   `character.extract_outside_names` **豁免**；注入位置与语义一个字没变。
+   - C86：用户消息「画粉色妖精小姐这套」+ 皮肤表命中 + 角色表里**没有**它 +
+   `consistency_check="fix"` + 画面里有用户这次没提过的 `elysia` 标签 →
+   皮肤**照旧注入**（表命中、0 次皮肤模型调用），角色侧**一次解析都不问**，
+   日志里没有 `用户点名「粉色妖精小姐」`，画面里的 `elysia` 标签原样保留；
+   - C88（豁免真的生效）：换一个 1.0.20 **确实会抓到**的写法「画「粉色妖精小姐」这套」
+     —— 单元级断言「不传 exclude 抓得到、传了就抓不到」，端到端断言角色侧 0 次解析、
+     日志里有 `皮肤名豁免`。为什么必须单独一条：C86 的写法会被
+     `_SENTENCE_NAME_STOP_CHARS` 的「这」提前拦掉，光靠它证明不了豁免在起作用；
+2. **作品名去重**（`character._normalize_game_field`）：模型把英文作品名也塞进
+   `game_cn` 时（`game_cn="崩坏：星穹铁道 (Honkai: Star Rail)"`、
+   `game_en="Honkai: Star Rail"`），1.0.22 会拼出
+   「… (Honkai: Star Rail) (Honkai: Star Rail)」—— C87 断言生成的中文说明与日志里
+   `Honkai: Star Rail` **只出现一次**（原始字段一个字没动）；
+3. **`outfits.infer_unnamed`**（新增，**默认关**）：用户只说「流萤的那一套皮肤」而
+   没点名具体皮肤时，开了才由模型推断该角色最知名的一套并注入（角色名必须是角色表内
+   角色，取最近一条消息里提到的；解析走 `outfit.infer_outfit_via_llm`，校验口径与
+   1.0.22 完全相同；缓存键 `<角色名>|__infer__`；日志标注「来源=模型推断」）。
+   - C83：`infer_unnamed=false`（默认）+「我想看流萤的那一套皮肤～」→ **0 次模型调用**
+     （解析与推断两条路都是 0）、无皮肤注入、日志无 `皮肤推断`、内容与关掉 `[outfits]`
+     时逐字一致；
+   - C84：`infer_unnamed=true` + 同一句话 + 假推断返回合法 payload（`inferred=true`、
+     关键词 `firefly's outfit` / `white dress`，**全是小写 ASCII**）→ 关键词注入成功、
+     **角色在前皮肤在后**，日志含 `皮肤推断(模型)`、`来源=模型推断`、`建议加入皮肤表`；
+   - C85：`infer_unnamed=true` + 假推断 `unknown=true` → **什么都不注入**、
+     日志含 `皮肤推断(LLM)失败` 与失败原因，内容与不开这一维时逐字一致。
+
+**C77~C88 的 ``make_config`` 需要皮肤功能时显式传 ``outfits_enabled=True`` 与
+``outfits=...``**（1.0.23 的 ``outfits_infer_unnamed`` 默认 false，与插件默认值一致）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -214,6 +252,7 @@ RS3 = (
 TAG_ELYSIA = r"elysia \(honkai impact 3rd\)"
 TAG_EDEN = r"eden \(honkai impact 3rd\)"
 TAG_HANABI = r"hanabi \(honkai: star rail\)"
+TAG_FIREFLY = r"firefly \(honkai: star rail\)"
 
 _results: list[tuple[str, bool, str]] = []
 RUN_LLM = "--llm" in sys.argv
@@ -249,6 +288,7 @@ def make_config(
     outfits: str = "",
     outfits_enabled: bool = False,
     outfits_auto_resolve: bool = True,
+    outfits_infer_unnamed: bool = False,
 ) -> CharPromptGuardConfig:
     """按用例参数构造配置。
 
@@ -258,7 +298,9 @@ def make_config(
     1.0.19 的 C64~C67 同理（也都是 ``memory=True`` + :class:`FakeMemory`）。
     1.0.22 起 ``[outfits]``（皮肤/时装）**同样默认关掉**：C1~C76 是 1.0.21 及以前的
     行为回归，不该因为本机恰好配了皮肤表或可用模型而变红；需要皮肤功能的用例
-    （C77~C82）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
+    （C77~C88）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
+    1.0.23 的 ``outfits_infer_unnamed``（「没说名字的那一套」）**默认 false**，
+    与插件配置类的默认值一致（见 tests/check_import.py 的断言）。
     （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
     """
     cfg = CharPromptGuardConfig()
@@ -273,6 +315,7 @@ def make_config(
     cfg.outfits.enabled = outfits_enabled
     cfg.outfits.entries = outfits
     cfg.outfits.auto_resolve = outfits_auto_resolve
+    cfg.outfits.infer_unnamed = outfits_infer_unnamed
     return cfg
 
 
@@ -597,6 +640,12 @@ class FakeOutfit:
     - ``calls`` 记录每一次调用（皮肤名），用例据此断言调用次数
       （C77 表命中、C80 无皮肤意图、C82 开关关掉时都必须是 **0 次**）。
 
+    1.0.23 起同一个替身还负责「没说名字的那一套」那条路：
+    ``outfit.infer_outfit_via_llm``（同样两个位置）也换成 :meth:`infer`，
+    它用 ``infer_payload`` / ``infer_error`` 决定返回什么 —— **与解析那条路
+    完全独立**（各自的 payload 与计数器），因此 C83~C85 能分别断言
+    「推断问了几次模型」「解析问了几次模型」。
+
     退出 with 块时恢复原函数，并清掉解析缓存 —— 免得上一条用例的缓存把下一条
     用例的「该不该问模型」判断带偏。
     """
@@ -606,12 +655,22 @@ class FakeOutfit:
         payload: dict | None = None,
         *,
         error: BaseException | None = None,
+        infer_payload: dict | None = None,
+        infer_error: BaseException | None = None,
     ) -> None:
         self.payload = payload if payload is not None else {"unknown": True}
         self.error = error
         self.calls: list[str] = []
+        #: 1.0.23「皮肤推断」那条路的假结果与调用记录
+        self.infer_payload = (
+            infer_payload if infer_payload is not None else {"unknown": True}
+        )
+        self.infer_error = infer_error
+        self.infer_calls: list[str] = []
         self._original_outfit = None
         self._original_handler = None
+        self._original_infer_outfit = None
+        self._original_infer_handler = None
 
     async def __call__(self, name: str, *, character: str = "", **kwargs):
         """假解析函数：记录调用，再按 payload / error 返回。"""
@@ -639,6 +698,38 @@ class FakeOutfit:
             raw_name=name,
         )
 
+    async def infer(self, character: str, **kwargs):
+        """假「皮肤推断」函数（1.0.23）：记录调用，再按 infer_payload 返回。
+
+        校验链与解析那条路**完全相同**（同一个 ``parse_outfit_resolution_payload``），
+        只是结果一定带 ``inferred=True`` —— 与 ``outfit.infer_outfit_via_llm``
+        的真实行为一致（哪怕模型漏填 ``inferred`` 字段）。
+        """
+        from ..outfit import ResolvedOutfit, parse_outfit_resolution_payload
+
+        self.infer_calls.append(character)
+        if self.infer_error is not None:
+            raise self.infer_error
+        outfit, reason, confidence = parse_outfit_resolution_payload(self.infer_payload)
+        if outfit is None:
+            return ResolvedOutfit(
+                character=character,
+                reason=reason,
+                confidence=confidence,
+                raw_name=character,
+                inferred=True,
+            )
+        return ResolvedOutfit(
+            name=outfit.name or f"{character}的那一套",
+            character=character,
+            keywords=outfit.keywords,
+            description=outfit.description,
+            source="模型",
+            confidence=confidence,
+            raw_name=character,
+            inferred=True,
+        )
+
     def __enter__(self) -> Self:
         from .. import handler as handler_module
         from .. import outfit as outfit_module
@@ -647,6 +738,11 @@ class FakeOutfit:
         self._original_handler = handler_module.resolve_outfit_via_llm
         outfit_module.resolve_outfit_via_llm = self  # type: ignore[assignment]
         handler_module.resolve_outfit_via_llm = self  # type: ignore[assignment]
+        # 1.0.23：推断那条路也一起替换（否则 C84/C85 会真的去问模型）
+        self._original_infer_outfit = outfit_module.infer_outfit_via_llm
+        self._original_infer_handler = handler_module.infer_outfit_via_llm
+        outfit_module.infer_outfit_via_llm = self.infer  # type: ignore[assignment]
+        handler_module.infer_outfit_via_llm = self.infer  # type: ignore[assignment]
         # 清缓存放在**替换之后**：这里清的是上一条用例留下的结果
         outfit_module.reset_outfit_cache()
         return self
@@ -659,6 +755,10 @@ class FakeOutfit:
             outfit_module.resolve_outfit_via_llm = self._original_outfit
         if self._original_handler is not None:
             handler_module.resolve_outfit_via_llm = self._original_handler
+        if self._original_infer_outfit is not None:
+            outfit_module.infer_outfit_via_llm = self._original_infer_outfit
+        if self._original_infer_handler is not None:
+            handler_module.infer_outfit_via_llm = self._original_infer_handler
         outfit_module.reset_outfit_cache()
         return False
 
@@ -682,6 +782,21 @@ PINK_KEYWORDS = ("pink elf dress", "fairy wings")
 PINK_REQUEST = "我想看你的粉色妖精小姐"
 #: 皮肤用例共用的画面描述（不含任何角色，角色由上文决定）
 PINK_SCENE = "帮我画一张她战斗的样子"
+#: 「没说名字的那一套」的说法（1.0.23；用户需求里的第二种说法，1.0.22 刻意不做）
+UNNAMED_REQUEST = "我想看流萤的那一套皮肤～"
+#: 「皮肤推断」的假结果（1.0.23）：结构与 1.0.22 的皮肤解析一致，只多一个
+#: ``inferred: true``；关键词必须是小写 ASCII（校验链与 1.0.22 完全相同）
+INFER_PAYLOAD = {
+    "unknown": False,
+    "inferred": True,
+    "outfit_cn": "流萤·花嫁",
+    "outfit_en": "Firefly Wedding Dress",
+    "tag": "firefly's outfit, white dress",
+    "keywords": ["firefly's outfit", "white dress"],
+    "confidence": 0.8,
+}
+#: 期望出现在提示词里的「推断出来的」关键词
+INFER_KEYWORDS = ("firefly's outfit", "white dress")
 
 
 def natural_params(
@@ -4012,6 +4127,332 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C82 [outfits] enabled=false → 0 次调用、无皮肤日志、内容一致",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C83 infer_unnamed=false（默认）→「流萤的那一套皮肤」什么都不做（1.0.23）──
+    # 需求原话：「『流萤的那一套皮肤』这种没点名字的说法不会注入……做一个（开关），
+    # 默认关就行，开了可以让模型去查（皮肤名字）然后注入提示词」。
+    # 默认关时必须与 1.0.22 **逐字一致**：皮肤解析与皮肤推断两条路都是 0 次模型调用、
+    # 没有皮肤关键词注入、日志里没有 `皮肤推断`，内容与「[outfits] 全关」时一字不差。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg_off = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=False)
+        cfg_off.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=UNNAMED_REQUEST)
+        params["stream_id"] = "s-c83"
+        history = [history_message("我们来聊流萤吧", 1.0)]
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, infer_payload=INFER_PAYLOAD) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        with FakeHistory(history):
+            out_off = await fire(cfg_off, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            stub.calls == []  # ★ 解析那条路 0 次
+            and stub.infer_calls == []  # ★ 推断那条路也 0 次
+            and all(keyword not in c for keyword in (*PINK_KEYWORDS, *INFER_KEYWORDS))
+            and "皮肤/时装" not in c
+            and "皮肤推断" not in records  # ★ 没有任何推断相关日志
+            and "皮肤解析" not in records
+            and "建议加入皮肤表" not in records
+            and c == out_off["args"]["content"]  # ★ 与 [outfits] 全关时逐字一致
+            and "流萤" in c
+            and TAG_FIREFLY in c  # 角色注入照旧
+        )
+        check(
+            "C83 infer_unnamed=false → 0 次调用、无皮肤注入、无推断日志、内容一致",
+            ok,
+            f"content = {c!r}\n        关掉 [outfits] 的 content = "
+            f"{out_off['args']['content']!r}\n        解析调用 = {stub.calls!r} / "
+            f"推断调用 = {stub.infer_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C83 infer_unnamed=false → 0 次调用、无皮肤注入、无推断日志、内容一致",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C84 infer_unnamed=true → 模型推断出「流萤的那一套」并注入（1.0.23）─────
+    # 开了开关才做这件事：先从用户消息里认出「流萤的那一套皮肤」里的角色（**角色表内**），
+    # 再让模型给出该角色最知名的一套（假推断返回 inferred=true 的合法 payload，
+    # 关键词是小写 ASCII），注入方式与 1.0.22 **完全相同**（角色在前、皮肤在后）；
+    # 日志必须标注来源「模型推断」，并照旧给一条「建议加入皮肤表」供用户核对。
+    try:
+        cfg = make_config(
+            roster=RS3,
+            outfits=RS_OUTFIT,
+            outfits_enabled=True,
+            outfits_infer_unnamed=True,
+        )
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=UNNAMED_REQUEST)
+        params["stream_id"] = "s-c84"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, infer_payload=INFER_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊流萤吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in INFER_KEYWORDS)  # ★ 推断出的关键词进来了
+            and "流萤·花嫁" in c  # 推断出的皮肤名也在（可核对）
+            and "皮肤/时装" in c
+            and "流萤" in c
+            and TAG_FIREFLY in c  # 角色照旧
+            and c.index("流萤") < c.index("流萤·花嫁")  # ★ 角色在前、皮肤在后
+            and stub.infer_calls == ["流萤"]  # ★ 只问一次「推断」
+            and stub.calls == []  # 用户没说皮肤名 → 解析那条路一次都没问
+            and "皮肤推断(模型): 流萤 → 流萤·花嫁 → firefly's outfit, white dress"
+            "（来源=模型推断，confidence=0.8）" in records  # ★ 来源标注
+            and "建议加入皮肤表" in records  # ★ 只打日志的建议行
+            and "皮肤解析(模型)" not in records
+        )
+        check(
+            "C84 infer_unnamed=true → 模型推断并注入（日志标注来源=模型推断）",
+            ok,
+            f"content = {c!r}\n        推断调用 = {stub.infer_calls!r} / "
+            f"解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C84 infer_unnamed=true → 模型推断并注入（日志标注来源=模型推断）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C85 infer_unnamed=true + 假推断 unknown=true → 什么都不注入（1.0.23）────
+    # 校验口径与 1.0.22 完全一致：模型说不知道（或 JSON 坏 / confidence 低于 0.5 /
+    # 没有可用关键词）时**什么都不注入** —— 绝不瞎编一套衣服。
+    try:
+        cfg = make_config(
+            roster=RS3,
+            outfits=RS_OUTFIT,
+            outfits_enabled=True,
+            outfits_infer_unnamed=True,
+        )
+        cfg.general.history_cache_ttl = 0.0
+        cfg_off = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg_off.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=UNNAMED_REQUEST)
+        params["stream_id"] = "s-c85"
+        history = [history_message("我们来聊流萤吧", 1.0)]
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD, infer_payload={"unknown": True}) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        with FakeHistory(history):
+            out_off = await fire(cfg_off, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword not in c for keyword in INFER_KEYWORDS)  # ★ 没有推断出的关键词
+            and "流萤·花嫁" not in c
+            and "皮肤/时装" not in c
+            and stub.infer_calls == ["流萤"]  # 问过一次（模型说不知道）
+            and stub.calls == []
+            and "皮肤推断(LLM)失败" in records  # ★ 失败也标明是「推断」那条路
+            and "unknown" in records  # ★ 失败原因写清楚
+            and "建议加入皮肤表" not in records
+            and c == out_off["args"]["content"]  # 与不开这一维时逐字一致
+            and "流萤" in c
+            and TAG_FIREFLY in c
+        )
+        check(
+            "C85 假推断 unknown=true → 不注入、日志写明失败原因",
+            ok,
+            f"content = {c!r}\n        不开这一维的 content = "
+            f"{out_off['args']['content']!r}\n        推断调用 = {stub.infer_calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C85 假推断 unknown=true → 不注入、日志写明失败原因",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C86（①的验证）皮肤名不再被当成表外角色名（1.0.23）────────────────────
+    # 用户说「画粉色妖精小姐这套」时，「粉色妖精小姐」是**一套皮肤**（皮肤表里有），
+    # 不是角色表外的角色名：皮肤照旧注入（表命中、0 次皮肤模型调用），
+    # 而角色那一侧**不该**因此做任何解析 —— 1.0.21 会给表外名字多问一次模型，
+    # `fix` 模式下还可能把画面里**用户这批消息没提过**的表内角色标签替换 / 删掉
+    # （这正是 1.0.23 要修的坑，所以这条用例用 fix 模式 + 0.9 把握的假解析结果）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"  # 最能暴露风险的模式
+        raw = f"{TAG_ELYSIA}, 粉色长发的少女站在花海中"  # 画面里的表内角色（用户这次没提过）
+        params = natural_params(raw, text="画粉色妖精小姐这套")
+        params["stream_id"] = "s-c86"
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as resolve_stub,
+            FakeOutfit(OUTFIT_PAYLOAD, infer_payload=INFER_PAYLOAD) as outfit_stub,
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "pink elf dress" in c  # ★ 皮肤照旧注入（表命中）
+            and "fairy wings" in c
+            and "粉色妖精小姐" in c
+            and "皮肤/时装" in c
+            and "皮肤解析(表)" in records
+            and outfit_stub.calls == []  # ★ 表命中：0 次皮肤模型调用
+            and outfit_stub.infer_calls == []  # 也没走「没说名字」那条推断路
+            and resolve_stub.calls == []  # ★ 角色侧一次解析都没问
+            and "角色解析(模型)" not in records
+            and "角色解析(LLM)" not in records
+            and "用户点名「粉色妖精小姐」" not in records  # ★ 没被当成表外角色名
+            and TAG_ELYSIA in c  # 画面里的角色标签原样保留（fix 没动它）
+            and c.startswith(raw)
+        )
+        check(
+            "C86 皮肤名不被当成表外角色名（表命中、0 调用、角色侧不解析）",
+            ok,
+            f"content = {c!r}\n        角色解析调用 = {resolve_stub.calls!r} / "
+            f"皮肤解析调用 = {outfit_stub.calls!r} / "
+            f"推断调用 = {outfit_stub.infer_calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C86 皮肤名不被当成表外角色名（表命中、0 调用、角色侧不解析）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C87（②的验证）作品名去重：game_cn 里已有英文名时不再拼第二遍（1.0.23）──
+    # 实测（C72 的日志）：模型把英文作品名也塞进了 `game_cn`：
+    #   game_cn="崩坏：星穹铁道 (Honkai: Star Rail)"、game_en="Honkai: Star Rail"
+    # 1.0.22 照旧拼一次 → 「… (Honkai: Star Rail) (Honkai: Star Rail)」。
+    # 1.0.23 起**生成的中文说明与日志**里 `Honkai: Star Rail` 只出现一次；
+    # 原始字段（name_cn / name_en / game_cn / game_en）一个字都没动。
+    try:
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as stub,
+            FakeHistory([history_message("这身是「刻律德拉」？", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(
+                cfg,
+                {
+                    "signature": "nai_artist:action:share_photo",
+                    "action_name": "share_photo",
+                    "args": {"content": KLEIDRA_SCENE},
+                    "message": FakeMessage("嗯"),
+                    "stream_id": "s-c87",
+                },
+            )
+        c = out["args"]["content"]
+        records = logs.records_text()
+        # 「生成的中文说明」= natural 模式那条追加句；画面描述原文里本来就有一个
+        # `(Honkai: Star Rail)`（那是调用方的旧标签残渣，不是这次拼出来的），
+        # 所以只对**生成的那一段**与日志行计数
+        clause = c[c.index("（画面角色") :] if "（画面角色" in c else ""
+        game_lines = [line for line in records.splitlines() if "作品《" in line]
+        ok = (
+            "崩坏：星穹铁道 (Honkai: Star Rail)" in c  # 去重后的作品名
+            and "(Honkai: Star Rail) (Honkai: Star Rail)" not in c  # ★ 不再拼第二遍
+            and clause.count("Honkai: Star Rail") == 1  # ★ 中文说明里只出现一次
+            and "出自游戏《崩坏：星穹铁道 (Honkai: Star Rail)》" in c
+            and len(game_lines) >= 1  # 日志里那条依据行确实在
+            and all(line.count("Honkai: Star Rail") == 1 for line in game_lines)  # ★ 同样只一次
+            and TAG_KLEIDRA in c
+            and stub.calls == ["刻律德拉"]
+        )
+        check(
+            "C87 作品名去重 → 中文说明与日志里 Honkai: Star Rail 只出现一次",
+            ok,
+            f"content = {c!r}\n        中文说明 = {clause!r}\n"
+            f"        含作品名的日志行 = {game_lines!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C87 作品名去重 → 中文说明与日志里 Honkai: Star Rail 只出现一次",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C88（豁免真的生效）「画「粉色妖精小姐」这套」→ 皮肤注入、角色侧不解析 ──
+    # 为什么单独一条：C86 的写法「画粉色妖精小姐这套」在 1.0.22 里其实会被
+    # `_SENTENCE_NAME_STOP_CHARS` 的「这」拦掉（抓到的候选是「粉色妖精小姐这套」），
+    # 所以那条用例**证明不了**豁免真的在起作用。这里换一个 1.0.20 确实会抓到的写法
+    # （引号模式），它同时命中皮肤表（皮肤照旧注入，0 次调用）—— 于是「要不要为这个
+    # 表外名字解析一次」这条路上只有豁免能拦住它：不豁免就会多问一次模型，
+    # fix 模式下还会把画面里的 elysia 标签换成解析出来的 kleidra。
+    # 单元级顺带钉住：同一个函数**不传** exclude 时确实抓得到（否则整条用例是空转）。
+    try:
+        from ..character import extract_outside_names, parse_roster
+
+        request = "画「粉色妖精小姐」这套"
+        raw = f"{TAG_ELYSIA}, 粉色长发的少女站在花海中"
+        extracted = extract_outside_names(request, parse_roster(RS3))
+        exempted = extract_outside_names(
+            request, parse_roster(RS3), exclude=["粉色妖精小姐"]
+        )
+        # 豁免**不该**把真的表外角色名一起吃掉：同一条消息里另有一个真表外名字时，
+        # 它必须照旧被抓到（C68~C71 那类场景依赖它）
+        mixed = extract_outside_names(
+            "画「粉色妖精小姐」这套，顺便画「刻律德拉」",
+            parse_roster(RS3),
+            exclude=["粉色妖精小姐"],
+        )
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(raw, text=request)
+        params["stream_id"] = "s-c88"
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as resolve_stub,
+            FakeOutfit(OUTFIT_PAYLOAD) as outfit_stub,
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            extracted == ["粉色妖精小姐"]  # ★ 提取链真的会抓到它（不是空转）
+            and exempted == []  # ★ 传了 exclude 就抓不到
+            and mixed == ["刻律德拉"]  # ★ 真表外角色名不会被一起豁免
+            and "pink elf dress" in c  # 皮肤照旧注入
+            and "粉色妖精小姐" in c
+            and outfit_stub.calls == []
+            and outfit_stub.infer_calls == []
+            and resolve_stub.calls == []  # ★ 没有把它当角色去解析
+            and "角色解析(模型)" not in records
+            and "角色解析(LLM)" not in records
+            and "用户点名「粉色妖精小姐」" not in records
+            and "皮肤名豁免" in records  # ★ 日志里能看到"确实豁免了"
+            and TAG_ELYSIA in c  # 画面里的角色标签没被动过
+        )
+        check(
+            "C88 引号写法的皮肤名同样被豁免（豁免真的生效，皮肤照常注入）",
+            ok,
+            f"提取(不豁免) = {extracted!r} / 提取(豁免) = {exempted!r} / "
+            f"混合消息(豁免后) = {mixed!r}\n"
+            f"        content = {c!r}\n        角色解析调用 = {resolve_stub.calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C88 引号写法的皮肤名同样被豁免（豁免真的生效，皮肤照常注入）",
             False,
             f"{type(e).__name__}: {e}",
         )

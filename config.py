@@ -461,7 +461,7 @@ class CharPromptGuardConfig(BaseConfig):
 
     @config_section("outfits")
     class OutfitsSection(SectionBase):
-        """皮肤/时装（装扮）识别与注入配置（1.0.22 起）。"""
+        """皮肤/时装（装扮）识别与注入配置（1.0.22 起；1.0.23 起多一个推断开关）。"""
 
         enabled: bool = Field(
             default=True,
@@ -504,7 +504,27 @@ class CharPromptGuardConfig(BaseConfig):
                 "core_tags / diffusion_tags / opposing_tags 三元组同时非空），"
                 "标题形如「皮肤指向：粉色妖精小姐 → 爱莉希雅」。"
                 "需要 [memory] enabled 为真、memory.write_back 为真、"
-                "且 base_url 合法；写入失败只记日志，绝不影响生图"
+                "且 base_url 合法；写入失败只记日志，绝不影响生图。"
+                "1.0.23 起只对「用户点名了具体皮肤」的那条路生效："
+                "模型推断出来的那一套（见 infer_unnamed）不写回"
+            ),
+        )
+        infer_unnamed: bool = Field(
+            default=False,
+            description=(
+                "当用户只说「<角色>的那一套皮肤/时装」而**没有点名**具体皮肤时，"
+                "是否允许模型自行推断该角色已知的皮肤/时装名称与关键词（默认关）。"
+                "开启后：先从用户消息里认出「<角色名>的那一套(皮肤|时装|衣服|裙子|装扮|造型)」"
+                "这类说法里的角色（角色名必须是角色表内角色，取最近一条消息里提到的），"
+                "再让已配置的模型（沿用 translate_model / llm_timeout）给出该角色"
+                "最知名/最常被画的一套，注入方式与 1.0.22 完全相同"
+                "（角色在前、皮肤在后）。**有编造风险**：推断结果同样要过 1.0.22 的"
+                "关键词校验（只收小写 ASCII；unknown=true / JSON 坏 / confidence 低于 0.5 / "
+                "没有可用关键词 → 什么都不注入），日志会标注来源"
+                "（皮肤推断(模型): 流萤 → <皮肤名> → <关键词>（来源=模型推断，confidence=…），"
+                "并照旧打一条「建议加入皮肤表：…」供核对）；推断结果不会写回记忆库。"
+                "关闭（默认）时**完全不做这件事**：0 次模型调用、无相关日志，"
+                "行为与 1.0.22 逐字一致"
             ),
         )
 

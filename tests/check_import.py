@@ -324,6 +324,13 @@ def main() -> int:
             cfg.outfits.write_back is True,
             f"outfits.write_back={cfg.outfits.write_back!r}",
         )
+        # 1.0.23 新增：没说名字的那一套（模型推断）**默认关** —— 有编造风险，
+        # 必须用户显式打开；关掉时 0 次模型调用、无相关日志（见 check_logic.py 的 C83）。
+        check(
+            "1.0.23 默认不让模型推断「没说名字的那一套」（outfits.infer_unnamed=false）",
+            cfg.outfits.infer_unnamed is False,
+            f"outfits.infer_unnamed={cfg.outfits.infer_unnamed!r}",
+        )
         # 1.0.22：皮肤表也只留一行示例「粉色妖精小姐」（方便照抄改掉），
         # 四列写法、分隔符与注释规则仍然写在说明里（与角色表那一条同一口径）。
         outfits_field = type(cfg.outfits).__dict__.get("entries")
@@ -642,6 +649,24 @@ def main() -> int:
             f"表外={quoted!r} 表内={inside!r}",
         )
 
+        # 1.0.23：皮肤名豁免 —— 本次皮肤识别认定的名字不再算「表外角色名」，
+        # 被豁免的候选会记进 dropped（只记那些"本来会被报出来"的候选）。
+        exempted_dropped: list[str] = []
+        exempted = extract_outside_names(
+            "画「粉色妖精小姐」这套",
+            roster_one,
+            exclude=["粉色妖精小姐"],
+            dropped=exempted_dropped,
+        )
+        check(
+            "1.0.23 皮肤名豁免：exclude 里的名字不再算表外角色名（并记录被豁免的候选）",
+            exempted == []
+            and exempted_dropped == ["粉色妖精小姐"]
+            and extract_outside_names("画「粉色妖精小姐」这套", roster_one)
+            == ["粉色妖精小姐"],  # 不传 exclude 时照旧抓得到（否则这条是空转）
+            f"豁免后={exempted!r} 被豁免的候选={exempted_dropped!r}",
+        )
+
         hanabi = roster_one[0]
         cleaned, hits = delete_character_reference(
             "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前", hanabi
@@ -760,6 +785,37 @@ def main() -> int:
             f"unknown={unknown_reason!r} low={low_reason!r} bad={bad_reason!r}",
         )
 
+        # 1.0.23：作品名去重 —— 模型把英文作品名也塞进 game_cn 时不再拼第二遍
+        # （实测日志：`… (Honkai: Star Rail) (Honkai: Star Rail)`）
+        dup_game, dup_game_reason, _ = parse_resolution_payload(
+            {
+                **ok_payload,
+                "game_cn": "崩坏：星穹铁道 (Honkai: Star Rail)",
+                "game_en": "Honkai: Star Rail",
+            }
+        )
+        check(
+            "1.0.23 作品名去重：game_cn 已含 game_en 时只保留一个",
+            dup_game is not None
+            and dup_game.game == "崩坏：星穹铁道 (Honkai: Star Rail)"
+            and "(Honkai: Star Rail) (Honkai: Star Rail)" not in dup_game.game
+            and dup_game_reason == "",
+            f"game={getattr(dup_game, 'game', '')!r}",
+        )
+
+        # 1.0.23：名字去重 —— name_cn / name_en 同名（忽略大小写 / 空白 / 括号）时
+        # 别名表里不再多出一条同义项；不同名则都保留（上面那条已断言 Kleidra 在别名里）
+        same_name, _, _ = parse_resolution_payload(
+            {**ok_payload, "name_cn": "Kleidra", "name_en": "Kleidra"}
+        )
+        check(
+            "1.0.23 名字去重：name_cn 与 name_en 同名时只留一个",
+            same_name is not None
+            and same_name.name == "Kleidra"
+            and same_name.aliases == [],
+            f"entry={same_name!r}",
+        )
+
         check(
             "1.0.21 解析入口 / 缓存函数存在，缓存 TTL 为 24 小时",
             callable(_resolve_fn)
@@ -831,19 +887,25 @@ def main() -> int:
 
     # ── 5.22 皮肤/时装（1.0.22）：皮肤表、关键词规范、严格校验与入口 ────────
     # 与 §5.21 同一口径：这里只做「装得上、调得动」的冒烟（完整的识别 / 注入行为
-    # 在 check_logic.py 的 C77~C82）。重点钉三件事：
+    # 在 check_logic.py 的 C77~C88）。重点钉三件事：
     # ① 皮肤表的四列能解析、"只写一部分"能命中；
     # ② 模型给的关键词真的会过规范（大写 / 中文 / 未转义括号一律不要）；
     # ③ unknown / confidence 太低 / 没有可用关键词一律判失败（什么都不注入）。
+    # 1.0.23 再补：解析结构多一个可选字段 `inferred`、「<角色>的那一套皮肤」的识别、
+    # 推断入口与缓存键都在（默认关见上面的配置默认值断言）。
     try:
         from .. import handler as outfit_handler
+        from ..character import parse_roster
         from ..outfit import (
             OUTFIT_CACHE_TTL_SECONDS,
             OUTFIT_FAILURE_TTL_SECONDS,
             OUTFIT_RESOLVE_MIN_CONFIDENCE,
             find_outfit_entry,
+            find_unnamed_outfit_owner,
+            infer_outfit_via_llm,
             outfit_cache_get,
             outfit_cache_put,
+            outfit_infer_cache_key,
             parse_outfit_resolution_payload,
             parse_outfits,
             reset_outfit_cache,
@@ -965,6 +1027,50 @@ def main() -> int:
             and hasattr(outfit_handler.CharacterGuardHandler, "_apply_outfit")
             # 解析函数在 handler 里是模块级导入（用例打桩要同时替换两处）
             and callable(outfit_handler.resolve_outfit_via_llm),
+        )
+
+        # 1.0.23：解析结构多一个**可选**字段 `inferred`（用户没说皮肤名、模型推断时）
+        inferred_outfit, inferred_reason, _ = parse_outfit_resolution_payload(
+            {**good_payload, "inferred": True}
+        )
+        legacy_outfit, legacy_reason, _ = parse_outfit_resolution_payload(
+            dict(good_payload)
+        )
+        check(
+            "1.0.23 解析结构多一个可选字段 inferred（缺省 false，1.0.22 的结构照旧）",
+            inferred_outfit is not None
+            and inferred_outfit.inferred is True
+            and inferred_reason == ""
+            and legacy_outfit is not None
+            and legacy_outfit.inferred is False
+            and legacy_reason == "",
+            f"inferred={getattr(inferred_outfit, 'inferred', None)!r} / "
+            f"缺省={getattr(legacy_outfit, 'inferred', None)!r}",
+        )
+
+        # 1.0.23：「<角色名>的那一套皮肤/时装」里的角色 —— 只认**角色表内**的角色
+        unnamed_roster = parse_roster(
+            r"流萤 | 崩坏：星穹铁道 (Honkai: Star Rail) | firefly,流萤 | "
+            r"firefly \(honkai: star rail\)"
+        )
+        check(
+            "1.0.23「<角色>的那一套皮肤」识别：表内角色认得出、表外的认不出",
+            find_unnamed_outfit_owner("我想看流萤的那一套皮肤～", unnamed_roster)
+            == "流萤"
+            and find_unnamed_outfit_owner("流萤的皮肤", unnamed_roster) == "流萤"
+            and find_unnamed_outfit_owner("我想看刻律德拉的那一套皮肤", unnamed_roster)
+            == ""
+            and find_unnamed_outfit_owner("画花火吧", unnamed_roster) == "",
+        )
+        check(
+            "1.0.23 推断入口 / 缓存键都在（handler 与 outfit 两处都要能打桩）",
+            callable(infer_outfit_via_llm)
+            and callable(outfit_handler.infer_outfit_via_llm)
+            and outfit_infer_cache_key("流萤") == "流萤|__infer__"
+            and hasattr(
+                outfit_handler.CharacterGuardHandler, "_infer_unnamed_outfit"
+            ),
+            f"缓存键={outfit_infer_cache_key('流萤')!r}",
         )
     except Exception as e:  # noqa: BLE001
         check("皮肤/时装模块可调用", False, f"{type(e).__name__}: {e}")
