@@ -871,9 +871,7 @@ _NAME_LIKE_PATTERN = re.compile(
 )
 
 #: 候选里**不允许**出现的标点（同时也是句式模式里 X 的边界）。
-_PUNCT_CHARS = (
-    "，。！？；：、,.!?;:…～~·「」『』《》‘’“”\"'（）()[]【】{}<>—－-/|\\"
-)
+_PUNCT_CHARS = "，。！？；：、,.!?;:…～~·「」『』《》‘’“”\"'（）()[]【】{}<>—－-/|\\"
 #: 句式模式里的「X」：2~12 个非标点、非空白字符。
 _NAME_CHAR_CLASS = "[^" + re.escape(_PUNCT_CHARS) + r"\s]"
 
@@ -916,15 +914,61 @@ _OUTSIDE_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
 #: 需求里点名要求收录的：``你 / 我 / 他 / 她 / 这 / 那 / 壳 / 本尊 / 图 / 照片 / 样子``。
 OUTSIDE_NAME_BLACKLIST: tuple[str, ...] = (
     # 人称代词 / 指示代词（含「本尊」这条最容易被抓出来的自我指代）
-    "你", "你们", "您", "我", "我们", "他", "他们", "她", "她们", "它",
-    "这", "那", "哪", "谁", "自己", "本人", "本尊", "真身", "本体", "本我",
+    "你",
+    "你们",
+    "您",
+    "我",
+    "我们",
+    "他",
+    "他们",
+    "她",
+    "她们",
+    "它",
+    "这",
+    "那",
+    "哪",
+    "谁",
+    "自己",
+    "本人",
+    "本尊",
+    "真身",
+    "本体",
+    "本我",
     # 「壳」这一族的说法（拆单场景里用户常说的就是"壳"）
-    "壳", "壳子", "外壳", "这层壳", "那层壳",
+    "壳",
+    "壳子",
+    "外壳",
+    "这层壳",
+    "那层壳",
     # 画面元素本身（不是角色名）
-    "图", "图片", "照片", "样子", "模样", "长相", "外观", "画面", "镜头", "镜头里",
-    "东西", "家伙", "人物", "角色", "那个谁", "什么", "怎么", "为什么",
+    "图",
+    "图片",
+    "照片",
+    "样子",
+    "模样",
+    "长相",
+    "外观",
+    "画面",
+    "镜头",
+    "镜头里",
+    "东西",
+    "家伙",
+    "人物",
+    "角色",
+    "那个谁",
+    "什么",
+    "怎么",
+    "为什么",
     # 时间 / 泛指
-    "今天", "现在", "刚才", "最后", "别的", "其它", "其他", "每个", "所有",
+    "今天",
+    "现在",
+    "刚才",
+    "最后",
+    "别的",
+    "其它",
+    "其他",
+    "每个",
+    "所有",
 )
 
 #: 引号候选的「不像名字」字符：虚词 / 语气词 / 代词 / 量词 / 常见动词。
@@ -955,15 +999,79 @@ _SENTENCE_NAME_STOP_CHARS = _QUOTED_NAME_STOP_CHARS + (
 #: 拦不住。它们进了 warn 只是多一条噪音日志，但 ``fix`` 会据此删掉画面里正确的
 #: 角色标签 —— 所以这里按"美术需求常用词"再拦一道（宁少勿多）。
 OUTSIDE_NAME_SCENE_WORDS: tuple[str, ...] = (
-    "场景", "风景", "背景", "全景", "特写", "半身", "全身", "立绘", "头像",
-    "壁纸", "海报", "封面", "插画", "草稿", "线稿", "素描", "写实", "油画",
-    "水彩", "漫画", "动画", "表情包", "肖像", "合照", "合影", "自拍", "照片",
-    "画面", "镜头", "构图", "光影", "光线", "色调", "气氛", "姿势", "动作",
-    "表情", "服装", "衣服", "裙子", "长裙", "短裙", "星空", "夜空", "日落",
-    "日出", "海边", "天空", "云彩", "街道", "城市", "森林", "教室", "房间",
+    "场景",
+    "风景",
+    "背景",
+    "全景",
+    "特写",
+    "半身",
+    "全身",
+    "立绘",
+    "头像",
+    "壁纸",
+    "海报",
+    "封面",
+    "插画",
+    "草稿",
+    "线稿",
+    "素描",
+    "写实",
+    "油画",
+    "水彩",
+    "漫画",
+    "动画",
+    "表情包",
+    "肖像",
+    "合照",
+    "合影",
+    "自拍",
+    "照片",
+    "画面",
+    "镜头",
+    "构图",
+    "光影",
+    "光线",
+    "色调",
+    "气氛",
+    "姿势",
+    "动作",
+    "表情",
+    "服装",
+    "衣服",
+    "裙子",
+    "长裙",
+    "短裙",
+    "星空",
+    "夜空",
+    "日落",
+    "日出",
+    "海边",
+    "天空",
+    "云彩",
+    "街道",
+    "城市",
+    "森林",
+    "教室",
+    "房间",
     # 「要X / 看看X」后面常见的同框 / 镜头说法（实测抓到过「要同框」这种词）
-    "同框", "单人", "双人", "多人", "两人", "三人", "互动", "拥抱", "接吻",
-    "背影", "侧脸", "正面", "俯视", "仰视", "近景", "远景", "中景", "氛围",
+    "同框",
+    "单人",
+    "双人",
+    "多人",
+    "两人",
+    "三人",
+    "互动",
+    "拥抱",
+    "接吻",
+    "背影",
+    "侧脸",
+    "正面",
+    "俯视",
+    "仰视",
+    "近景",
+    "远景",
+    "中景",
+    "氛围",
 )
 
 
@@ -1200,9 +1308,7 @@ def _tidy_prompt_after_removal(text: str) -> str:
     for left, right in _EMPTY_PAIRS:
         result = re.sub(re.escape(left) + r"[ \t]*" + re.escape(right), " ", result)
     separators = re.escape(_SEPARATOR_CHARS)
-    result = re.sub(
-        rf"([{separators}])[ \t]*(?:[{separators}][ \t]*)+", r"\1", result
-    )
+    result = re.sub(rf"([{separators}])[ \t]*(?:[{separators}][ \t]*)+", r"\1", result)
     result = re.sub(rf"^[ \t{separators}]+", "", result, flags=re.MULTILINE)
     result = re.sub(rf"[ \t{separators}]+$", "", result, flags=re.MULTILINE)
     result = re.sub(r"[ \t]{2,}", " ", result)
@@ -1592,9 +1698,7 @@ CHARACTER_RESOLVE_MIN_CONFIDENCE = 0.5
 #: 允许的字符只有 小写字母 / 数字 / 空格 / ``_`` / ``-`` / ``:`` / ``'`` /
 #: **转义括号** ``\\(`` ``\\)``；括号**必须转义**（未转义的 ``(`` ``)``、
 #: 全角 ``（）``、以及 ``\\`` 之外的任何反斜杠写法一律判为非法）。
-TAG_ALLOWED_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyz0123456789 _-:'\\()"
-)
+TAG_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789 _-:'\\()")
 #: 标签里的「作品名」括号（转义写法）
 _TAG_GROUP_PATTERN = re.compile(r"\\\(([^()\\]*)\\\)")
 
@@ -1832,7 +1936,9 @@ def resolve_cache_key(name: str) -> str:
     return normalize_prompt_text(name) or (name or "").strip().lower()
 
 
-def resolve_cache_get(name: str, *, now: float | None = None) -> ResolvedCharacter | None:
+def resolve_cache_get(
+    name: str, *, now: float | None = None
+) -> ResolvedCharacter | None:
     """按角色名读缓存；未命中或已过期返回 ``None``（1.0.21）。
 
     成功结果的缓存 24 小时（:data:`RESOLVE_CACHE_TTL_SECONDS`）、失败的负缓存
@@ -1959,7 +2065,9 @@ async def resolve_character_via_llm(
                 Text(
                     _RESOLVE_USER_TEMPLATE.format(
                         name=raw_name,
-                        context=f"（对话线索，仅供参考）：{context[:200]}\n" if context else "",
+                        context=f"（对话线索，仅供参考）：{context[:200]}\n"
+                        if context
+                        else "",
                     )
                 ),
             )
@@ -1990,7 +2098,9 @@ async def resolve_character_via_llm(
 
     entry, reason, confidence = parse_resolution_payload(payload)
     if entry is None:
-        return ResolvedCharacter(reason=reason, confidence=confidence, raw_name=raw_name)
+        return ResolvedCharacter(
+            reason=reason, confidence=confidence, raw_name=raw_name
+        )
 
     return ResolvedCharacter(
         entry=entry,

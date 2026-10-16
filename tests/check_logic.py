@@ -119,6 +119,35 @@ C66（防回归）记忆库里只有「顺带提到爱莉希雅、但没有触�
   预判不满足只留一条 DEBUG `角色解析=跳过（<原因>）`（没有 `角色解析(LLM)` 成败行、
   也没有 `角色解析(缓存)`）。
 
+1.0.22 起补上**「皮肤 / 时装」这一维**（C77~C82，配置在 `[outfits]` 节），起因是
+用户需求：「当说『我想看看你的 xxxx（皮肤）』，可以搜索并加进去。例如
+『我想看粉色妖精小姐 / 春婵丽娟』→ 就会出现**爱莉穿着这一套**的衣服；也包括
+**流萤的那一套皮肤时装**。」**角色那一侧一个字都没改**（描述点名 > 主题跟踪 >
+本尊身份 > 记忆库 > LLM 仲裁 > 不补），新增的只是「这次要穿哪一套」：皮肤名只从
+**用户消息**里找（触发消息 + 触发前最近 4 条用户消息，bot 消息跳过，**不扫画面
+描述**），句式 + 引号两种模式提取后过五道过滤，命中 `outfits.entries` 的候选优先；
+解析走「**表优先 → 模型兜底**」，失败（`unknown` / JSON 坏 / `confidence < 0.5` /
+没有可用关键词）时**什么都不注入**。这几条用例用假解析函数（monkeypatch
+`outfit.resolve_outfit_via_llm`，见 :class:`FakeOutfit`）跑，不需要真调模型：
+
+- C77：皮肤在 `[outfits]` 表里 + 用户消息「我想看你的粉色妖精小姐」+ 角色判定
+  （上文主题跟踪）= 爱莉希雅 → content 同时含 `pink elf dress`、`fairy wings`、
+  皮肤名「粉色妖精小姐」与「爱莉希雅」，且**模型调用 0 次**（表命中）；
+- C78：表里没有 + `auto_resolve = true` + 假解析返回合法 keywords → 注入成功，
+  日志含 `皮肤解析(模型)` 与 `建议加入皮肤表`；
+- C79：假解析返回 `unknown=true` → **没有**注入任何皮肤关键词，角色注入照旧
+  （内容与关掉 `[outfits]` 时**逐字一致**），日志含 `皮肤解析(LLM)失败`；
+- C80（防误报）：用户消息里没有任何皮肤意图（「画花火吧」）→ 不触发皮肤逻辑
+  （模型 0 次调用、日志里没有 `皮肤解析`）；
+- C81：皮肤 + 角色同时命中 → 角色标签与皮肤关键词**同时存在**且顺序合理
+  （角色在前、皮肤在后）；
+- C82：`[outfits] enabled=false` → 0 次模型调用、日志无 `皮肤解析`、
+  内容与「开着但不触发」时逐字一致。
+
+**C1~C76 的 ``make_config`` 因此默认把 `[outfits]` 关掉**（与 1.0.18 起默认关掉
+记忆库同一个理由：旧用例是更早版本的行为回归，不该因为本机恰好配了皮肤表 /
+模型而变红；插件配置类里的默认值仍是 `true`，见 tests/check_import.py 的断言）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -217,6 +246,9 @@ def make_config(
     max_characters: int = 6,
     general_enabled: bool = True,
     memory: bool = False,
+    outfits: str = "",
+    outfits_enabled: bool = False,
+    outfits_auto_resolve: bool = True,
 ) -> CharPromptGuardConfig:
     """按用例参数构造配置。
 
@@ -224,6 +256,9 @@ def make_config(
     以前的行为回归，它们不该因为「本机恰好开着 Booku Memory」而变红；需要记忆库
     的用例（C60~C63）显式传 ``memory=True`` 并配 :class:`FakeMemory` 假传输层。
     1.0.19 的 C64~C67 同理（也都是 ``memory=True`` + :class:`FakeMemory`）。
+    1.0.22 起 ``[outfits]``（皮肤/时装）**同样默认关掉**：C1~C76 是 1.0.21 及以前的
+    行为回归，不该因为本机恰好配了皮肤表或可用模型而变红；需要皮肤功能的用例
+    （C77~C82）显式传 ``outfits_enabled=True`` 与 ``outfits=...``。
     （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
     """
     cfg = CharPromptGuardConfig()
@@ -235,6 +270,9 @@ def make_config(
     cfg.multi.enabled = multi_enabled
     cfg.multi.max_characters = max_characters
     cfg.memory.enabled = memory
+    cfg.outfits.enabled = outfits_enabled
+    cfg.outfits.entries = outfits
+    cfg.outfits.auto_resolve = outfits_auto_resolve
     return cfg
 
 
@@ -544,6 +582,108 @@ KLEIDRA_SCENE = (
 )
 
 
+class FakeOutfit:
+    """上下文管理器：替换皮肤解析函数，模拟（或统计）模型调用（1.0.22）。
+
+    与 :class:`FakeResolve` 同一套做法：插件里唯一需要替换的是
+    ``outfit.resolve_outfit_via_llm``（``handler`` 在模块级
+    ``from .outfit import resolve_outfit_via_llm``，所以两个位置都要替换），
+    因此用例不必起 LLM 运行时、也不会真的发请求：
+
+    - ``payload`` 是模型「返回」的 JSON 字典 —— 用
+      ``outfit.parse_outfit_resolution_payload`` 走**与插件完全同一条**校验链，
+      于是「unknown / confidence 太低 / 关键词非 ASCII」这些分支都被真实覆盖；
+    - ``error`` 非空时抛该异常（超时 / 网络故障的替身）；
+    - ``calls`` 记录每一次调用（皮肤名），用例据此断言调用次数
+      （C77 表命中、C80 无皮肤意图、C82 开关关掉时都必须是 **0 次**）。
+
+    退出 with 块时恢复原函数，并清掉解析缓存 —— 免得上一条用例的缓存把下一条
+    用例的「该不该问模型」判断带偏。
+    """
+
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.payload = payload if payload is not None else {"unknown": True}
+        self.error = error
+        self.calls: list[str] = []
+        self._original_outfit = None
+        self._original_handler = None
+
+    async def __call__(self, name: str, *, character: str = "", **kwargs):
+        """假解析函数：记录调用，再按 payload / error 返回。"""
+        from ..outfit import ResolvedOutfit, parse_outfit_resolution_payload
+
+        self.calls.append(name)
+        if self.error is not None:
+            raise self.error
+        outfit, reason, confidence = parse_outfit_resolution_payload(self.payload)
+        if outfit is None:
+            return ResolvedOutfit(
+                name=name,
+                character=character,
+                reason=reason,
+                confidence=confidence,
+                raw_name=name,
+            )
+        return ResolvedOutfit(
+            name=outfit.name or name,
+            character=outfit.character or character,
+            keywords=outfit.keywords,
+            description=outfit.description,
+            source="模型",
+            confidence=confidence,
+            raw_name=name,
+        )
+
+    def __enter__(self) -> Self:
+        from .. import handler as handler_module
+        from .. import outfit as outfit_module
+
+        self._original_outfit = outfit_module.resolve_outfit_via_llm
+        self._original_handler = handler_module.resolve_outfit_via_llm
+        outfit_module.resolve_outfit_via_llm = self  # type: ignore[assignment]
+        handler_module.resolve_outfit_via_llm = self  # type: ignore[assignment]
+        # 清缓存放在**替换之后**：这里清的是上一条用例留下的结果
+        outfit_module.reset_outfit_cache()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        from .. import handler as handler_module
+        from .. import outfit as outfit_module
+
+        if self._original_outfit is not None:
+            outfit_module.resolve_outfit_via_llm = self._original_outfit
+        if self._original_handler is not None:
+            handler_module.resolve_outfit_via_llm = self._original_handler
+        outfit_module.reset_outfit_cache()
+        return False
+
+
+#: 示例皮肤表（1.0.22）：`皮肤名 | 角色名 | 英文关键词 | 中文描述`
+RS_OUTFIT = (
+    "粉色妖精小姐 | 爱莉希雅 | pink elf dress, fairy wings | 爱莉希雅的粉色妖精装"
+)
+#: 表外皮肤的假解析结果（与需求里的字段一一对应）
+OUTFIT_PAYLOAD = {
+    "unknown": False,
+    "outfit_cn": "粉色妖精小姐",
+    "outfit_en": "Pink Elf Lady",
+    "tag": "pink elf dress, fairy wings",
+    "keywords": ["pink elf dress", "fairy wings"],
+    "confidence": 0.9,
+}
+#: 期望出现在提示词里的英文关键词
+PINK_KEYWORDS = ("pink elf dress", "fairy wings")
+#: 「我想看你这套皮肤」这句话（用户需求里的原话）
+PINK_REQUEST = "我想看你的粉色妖精小姐"
+#: 皮肤用例共用的画面描述（不含任何角色，角色由上文决定）
+PINK_SCENE = "帮我画一张她战斗的样子"
+
+
 def natural_params(
     content: str, mode: str = "drawing", text: str = "我们来聊爱莉希雅吧"
 ) -> dict:
@@ -659,9 +799,12 @@ async def run_cases() -> int:
     # 1.0.21：先清掉角色解析的进程内缓存 —— 否则同一次进程里重跑时，
     # C68/C69 这类**没配假解析函数**的用例会（按 10 分钟负缓存）跳过模型调用，
     # 缓存状态就会影响「该不该问模型」的断言。
+    # 1.0.22：皮肤解析缓存同理（C77~C82 断言的都是"问了几次模型"）。
     from ..character import reset_resolve_cache
+    from ..outfit import reset_outfit_cache
 
     reset_resolve_cache()
+    reset_outfit_cache()
     print(f"框架根   : {NEO_ROOT}")
     print(f"插件目录 : {PLUGIN_DIR}")
     print(f"LLM 用例 : {'开' if RUN_LLM else '关（加 --llm 打开）'}")
@@ -3251,8 +3394,7 @@ async def run_cases() -> int:
         check(
             "C69 同场景 fix：删除画面里的花火标签、保留外观描述原文",
             ok,
-            f"content = {c!r}\n        WARNING = {warns!r}\n"
-            f"        日志 = {records!r}",
+            f"content = {c!r}\n        WARNING = {warns!r}\n        日志 = {records!r}",
         )
     except Exception as e:  # noqa: BLE001
         check(
@@ -3270,10 +3412,7 @@ async def run_cases() -> int:
         cfg = make_config(roster=RS3)
         cfg.general.history_cache_ttl = 0.0
         cfg.general.consistency_check = "warn"
-        raw = (
-            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
-            "头上戴着蓝白饰冠"
-        )
+        raw = "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，头上戴着蓝白饰冠"
         history = [
             history_message("说起来，「刻律德拉」那身也不错", 1.5),
             history_message("画花火吧，顺便看看这身", 1.0),
@@ -3316,10 +3455,7 @@ async def run_cases() -> int:
     # （跳过），既有对账该跳过还是跳过 —— 内容与 `consistency_check="off"`
     # （完全不检查）时逐字一致。
     try:
-        raw = (
-            "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，"
-            "头上戴着蓝白饰冠"
-        )
+        raw = "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前，头上戴着蓝白饰冠"
         history = [history_message("行～", 1.0)]
         params = {
             "signature": "nai_artist:action:share_photo",
@@ -3372,9 +3508,11 @@ async def run_cases() -> int:
         cfg = make_config(roster=RS3)
         cfg.general.history_cache_ttl = 0.0
         cfg.general.consistency_check = "fix"
-        with FakeResolve(KLEIDRA_PAYLOAD) as stub, FakeHistory(
-            [history_message("这身是「刻律德拉」？", 1.0)]
-        ), LogCapture() as logs:
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as stub,
+            FakeHistory([history_message("这身是「刻律德拉」？", 1.0)]),
+            LogCapture() as logs,
+        ):
             out = await fire(
                 cfg,
                 {
@@ -3399,7 +3537,8 @@ async def run_cases() -> int:
             and "蓝白饰冠" in c
             and "长杖" in c
             and "角色解析" in records  # 解析日志
-            and "替换" in records  # 「一致性检查=冲突已修正（fix）：把画面里的…替换为…」
+            and "替换"
+            in records  # 「一致性检查=冲突已修正（fix）：把画面里的…替换为…」
             and "依据=角色解析(LLM)" in records
             and stub.calls == ["刻律德拉"]  # 只问一次模型
             and "建议加入角色表" in records  # 只打日志的「建议加入角色表」也在
@@ -3424,9 +3563,11 @@ async def run_cases() -> int:
         cfg = make_config(roster=RS3)
         cfg.general.history_cache_ttl = 0.0
         cfg.general.consistency_check = "fix"
-        with FakeResolve({"unknown": True}) as stub, FakeHistory(
-            [history_message("这身是「刻律德拉」？", 1.0)]
-        ), LogCapture() as logs:
+        with (
+            FakeResolve({"unknown": True}) as stub,
+            FakeHistory([history_message("这身是「刻律德拉」？", 1.0)]),
+            LogCapture() as logs,
+        ):
             out = await fire(
                 cfg,
                 {
@@ -3474,9 +3615,11 @@ async def run_cases() -> int:
         cfg = make_config(roster=RS3)
         cfg.general.history_cache_ttl = 0.0
         cfg.general.consistency_check = "fix"
-        with FakeResolve(error=TimeoutError("timed out")) as stub, FakeHistory(
-            [history_message("这身是「刻律德拉」？", 1.0)]
-        ), LogCapture() as logs:
+        with (
+            FakeResolve(error=TimeoutError("timed out")) as stub,
+            FakeHistory([history_message("这身是「刻律德拉」？", 1.0)]),
+            LogCapture() as logs,
+        ):
             out = await fire(
                 cfg,
                 {
@@ -3582,9 +3725,11 @@ async def run_cases() -> int:
             "message": FakeMessage("画花火吧"),
             "stream_id": "s-c76",
         }
-        with FakeResolve(KLEIDRA_PAYLOAD) as stub, FakeHistory(
-            [history_message("画花火吧，顺便看看这身", 1.0)]
-        ), LogCapture() as logs:
+        with (
+            FakeResolve(KLEIDRA_PAYLOAD) as stub,
+            FakeHistory([history_message("画花火吧，顺便看看这身", 1.0)]),
+            LogCapture() as logs,
+        ):
             out = await fire(cfg, params)
         c = out["args"]["content"]
         records = logs.records_text()
@@ -3606,6 +3751,267 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C76 角色在角色表内 → 完全不做解析（调用次数 0）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C77 皮肤表命中 → 零模型调用，皮肤关键词追加进提示词（1.0.22）────────
+    # 用户需求原话：「我想看粉色妖精小姐」→ 出现**爱莉穿着这一套**的衣服。
+    # 角色那一侧照旧（这里由上文「我们来聊爱莉希雅吧」的主题跟踪给出爱莉希雅），
+    # 皮肤走 `[outfits] entries` 精确命中 → **一次模型都不问**。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params["stream_id"] = "s-c77"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "pink elf dress" in c  # ★ 表里的英文关键词进来了
+            and "fairy wings" in c
+            and "粉色妖精小姐" in c  # ★ 皮肤名也写进了说明（可核对）
+            and "皮肤/时装" in c
+            and "爱莉希雅的粉色妖精装" in c  # 表第 4 列的中文描述
+            and "爱莉希雅" in c  # ★ 角色照旧补进来了
+            and TAG_ELYSIA in c  # 角色标准标签也在（tag_completion）
+            and stub.calls == []  # ★ 表命中：一次模型都没问
+            and "皮肤解析(表)" in records
+            and "皮肤解析(模型)" not in records
+            and "皮肤解析(LLM)失败" not in records
+        )
+        check(
+            "C77 皮肤表命中 → 零模型调用，皮肤关键词进提示词",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C77 皮肤表命中 → 零模型调用，皮肤关键词进提示词",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C78 表里没有 + auto_resolve → 模型解析成功并注入（1.0.22）──────────
+    # 皮肤表是"零成本快路径"，表里没有时才问一次模型；成功后不仅要注入，
+    # 还要打一条「建议加入皮肤表：…」（只打日志、绝不改配置文件），
+    # 让用户能把这次的结果粘进配置，下次就零成本了。
+    try:
+        cfg = make_config(roster=RS3, outfits="", outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params["stream_id"] = "s-c78"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword in c for keyword in PINK_KEYWORDS)  # ★ 模型给的关键词进来了
+            and "粉色妖精小姐" in c
+            and "爱莉希雅" in c  # 角色照旧
+            and stub.calls == ["粉色妖精小姐"]  # ★ 只问一次模型
+            and "皮肤解析(模型)" in records
+            and "角色=爱莉希雅" in records  # 归属角色线索（来自上文）
+            and "建议加入皮肤表" in records  # ★ 只打日志的建议行
+            and "pink elf dress, fairy wings" in records
+        )
+        check(
+            "C78 表未命中 + auto_resolve → 模型解析成功并注入",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C78 表未命中 + auto_resolve → 模型解析成功并注入",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C79 解析返回 unknown=true → 什么都不注入，角色注入照旧（1.0.22）──────
+    # 模型不认识这套皮肤（或没把握）时必须**什么都不加**：绝不瞎编关键词。
+    # 内容与「关掉 [outfits]」时**逐字一致** —— 这条链路对角色那一侧零影响。
+    try:
+        cfg_on = make_config(roster=RS3, outfits="", outfits_enabled=True)
+        cfg_on.general.history_cache_ttl = 0.0
+        cfg_off = make_config(roster=RS3, outfits="", outfits_enabled=False)
+        cfg_off.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params["stream_id"] = "s-c79"
+        history = [history_message("我们来聊爱莉希雅吧", 1.0)]
+        with (
+            FakeOutfit({"unknown": True}) as stub,
+            FakeHistory(history),
+            LogCapture() as logs,
+        ):
+            out_on = await fire(cfg_on, params)
+        with FakeHistory(history):
+            out_off = await fire(cfg_off, params)
+        c = out_on["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            all(keyword not in c for keyword in PINK_KEYWORDS)  # ★ 没有皮肤关键词
+            and "粉色妖精小姐" not in c
+            and "皮肤/时装" not in c
+            and "爱莉希雅" in c  # ★ 角色注入照旧
+            and TAG_ELYSIA in c
+            and c == out_off["args"]["content"]  # ★ 与关掉 [outfits] 时逐字一致
+            and stub.calls == ["粉色妖精小姐"]  # 问过一次（模型给了 unknown）
+            and "皮肤解析(LLM)失败" in records
+            and "unknown" in records  # 失败原因写清楚
+            and "建议加入皮肤表" not in records  # 失败就没有建议行
+        )
+        check(
+            "C79 解析 unknown=true → 不注入皮肤关键词、角色注入照旧",
+            ok,
+            f"content = {c!r}\n        关掉 [outfits] 的 content = "
+            f"{out_off['args']['content']!r}\n        解析调用 = {stub.calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C79 解析 unknown=true → 不注入皮肤关键词、角色注入照旧",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C80（防误报）用户消息里没有皮肤意图 → 不触发皮肤逻辑（1.0.22）────────
+    # 「画花火吧」里没有任何皮肤/时装的说法：不该去问模型，也不该留下
+    # `皮肤解析` 这类日志（否则用户会以为插件"在乱猜皮肤"）；画面里已经有角色，
+    # 内容照旧一字不改地放行。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        raw = "hanabi \\(honkai: star rail\\), 银白色长发的少女"
+        params = {
+            "signature": "nai_artist:action:share_photo",
+            "action_name": "share_photo",
+            "args": {"content": raw},
+            "message": FakeMessage("画花火吧"),
+            "stream_id": "s-c80",
+        }
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD) as stub,
+            FakeHistory([history_message("画花火吧，顺便看看这身", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            stub.calls == []  # ★ 一次模型都不问
+            and "皮肤解析" not in records  # ★ 日志里没有皮肤解析
+            and "皮肤/时装" not in c
+            and all(keyword not in c for keyword in PINK_KEYWORDS)
+            and c == raw  # 画面里已经有角色 → 内容一字不改
+        )
+        check(
+            "C80 用户消息里没有皮肤意图 → 不触发皮肤逻辑（0 次调用）",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C80 用户消息里没有皮肤意图 → 不触发皮肤逻辑（0 次调用）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C81 皮肤 + 角色同时命中 → 角色在前、皮肤在后（1.0.22）──────────────
+    # 注入顺序是这条需求的关键：皮肤说明必须追加在**角色**之后，
+    # 这样下游翻译模型先看到角色标签、再看到装扮关键词（衣服归属不会串人）。
+    try:
+        cfg = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params["stream_id"] = "s-c81"
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD) as stub,
+            FakeHistory([history_message("我们来聊爱莉希雅吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        # 三个位置都要能找到，且顺序为 角色中文名 < 角色标签 < 皮肤说明（皮肤名 → 关键词）
+        ok = (
+            "爱莉希雅" in c
+            and TAG_ELYSIA in c
+            and "pink elf dress" in c
+            and c.index("爱莉希雅") < c.index(TAG_ELYSIA)
+            and c.index(TAG_ELYSIA) < c.index("粉色妖精小姐")
+            and c.index("粉色妖精小姐") < c.index("pink elf dress")
+            and stub.calls == []
+            and "皮肤注入" in records  # 「皮肤注入: …（搭配角色=爱莉希雅）」
+            and "搭配角色=爱莉希雅" in records
+            and "已追加皮肤/时装" in records
+        )
+        check(
+            "C81 皮肤 + 角色同时命中 → 角色在前、皮肤在后",
+            ok,
+            f"content = {c!r}\n        解析调用 = {stub.calls!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C81 皮肤 + 角色同时命中 → 角色在前、皮肤在后",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C82 [outfits] enabled=false → 零开销、零调用、内容一致（1.0.22）──────
+    # 关掉时必须真的"什么都不做"：不解析皮肤表、不读上文、不问模型，日志里连
+    # `皮肤解析` 都没有（连"跳过"都不打）；内容与「开着这一维但不注入任何东西」
+    # 时**逐字一致**（对照组 = 皮肤表为空 + auto_resolve=false：识别照跑、解析关掉）。
+    try:
+        cfg_off = make_config(roster=RS3, outfits=RS_OUTFIT, outfits_enabled=False)
+        cfg_off.general.history_cache_ttl = 0.0
+        # 对照组：开着但不注入（皮肤表为空 + auto_resolve=false）
+        cfg_idle = make_config(
+            roster=RS3,
+            outfits="",
+            outfits_enabled=True,
+            outfits_auto_resolve=False,
+        )
+        cfg_idle.general.history_cache_ttl = 0.0
+        params = natural_params(PINK_SCENE, text=PINK_REQUEST)
+        params["stream_id"] = "s-c82"
+        history = [history_message("我们来聊爱莉希雅吧", 1.0)]
+        with (
+            FakeOutfit(OUTFIT_PAYLOAD) as stub,
+            FakeHistory(history),
+            LogCapture() as logs_off,
+        ):
+            out_off = await fire(cfg_off, params)
+        with FakeHistory(history):
+            out_idle = await fire(cfg_idle, params)
+        c = out_off["args"]["content"]
+        records = logs_off.records_text()
+        ok = (
+            stub.calls == []  # ★ 0 次模型调用
+            and "皮肤解析" not in records  # ★ 日志里没有皮肤解析
+            and "皮肤/时装" not in c
+            and all(keyword not in c for keyword in PINK_KEYWORDS)
+            and c == out_idle["args"]["content"]  # ★ 内容与对照组逐字一致
+            and "爱莉希雅" in c  # 角色注入不受影响
+        )
+        check(
+            "C82 [outfits] enabled=false → 0 次调用、无皮肤日志、内容一致",
+            ok,
+            f"content = {c!r}\n        对照组的 content = "
+            f"{out_idle['args']['content']!r}\n        解析调用 = {stub.calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C82 [outfits] enabled=false → 0 次调用、无皮肤日志、内容一致",
             False,
             f"{type(e).__name__}: {e}",
         )

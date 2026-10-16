@@ -46,6 +46,7 @@ MODULES = [
     f"{PLUGIN_NAME}.handler",
     f"{PLUGIN_NAME}.memory",
     f"{PLUGIN_NAME}.monitor",
+    f"{PLUGIN_NAME}.outfit",
     f"{PLUGIN_NAME}.plugin",
     f"{PLUGIN_NAME}.tag_hint",
 ]
@@ -296,10 +297,49 @@ def main() -> int:
         check(
             "1.0.21 角色表示例只留一行爱莉希雅（照抄改掉即可）",
             "爱莉希雅 | 崩坏三 (Honkai Impact 3rd) | elysia,爱莉 | "
-            r"elysia \(honkai impact 3rd\)" in roster_desc
+            r"elysia \(honkai impact 3rd\)"
+            in roster_desc
             and "伊甸" not in roster_desc
             and "留空则只用 LLM 从上文识别" in roster_desc,
             f"characters.description={roster_desc!r}",
+        )
+        # 1.0.22 新增：皮肤/时装（[outfits] 节）
+        check(
+            "1.0.22 默认启用皮肤/时装识别（outfits.enabled）",
+            cfg.outfits.enabled is True,
+            f"outfits.enabled={cfg.outfits.enabled!r}",
+        )
+        check(
+            "1.0.22 皮肤表默认留空（表外的皮肤交给模型解析）",
+            cfg.outfits.entries == "",
+            f"outfits.entries={cfg.outfits.entries!r}",
+        )
+        check(
+            "1.0.22 默认允许把表外皮肤交给模型解析（auto_resolve）",
+            cfg.outfits.auto_resolve is True,
+            f"outfits.auto_resolve={cfg.outfits.auto_resolve!r}",
+        )
+        check(
+            "1.0.22 默认把解析成功的皮肤写回记忆库（write_back）",
+            cfg.outfits.write_back is True,
+            f"outfits.write_back={cfg.outfits.write_back!r}",
+        )
+        # 1.0.22：皮肤表也只留一行示例「粉色妖精小姐」（方便照抄改掉），
+        # 四列写法、分隔符与注释规则仍然写在说明里（与角色表那一条同一口径）。
+        outfits_field = type(cfg.outfits).__dict__.get("entries")
+        if outfits_field is None:
+            outfits_field = type(cfg.outfits).model_fields.get("entries")
+        outfits_desc = str(getattr(outfits_field, "description", "") or "")
+        check(
+            "1.0.22 皮肤表示例只留一行粉色妖精小姐（照抄改掉即可）",
+            "粉色妖精小姐 | 爱莉希雅 | pink elf dress, fairy wings | "
+            "爱莉希雅的粉色妖精装"
+            in outfits_desc
+            and "\n" not in outfits_desc
+            and "照抄改掉即可" in outfits_desc
+            and "流萤" not in outfits_desc
+            and "春婵丽娟" not in outfits_desc,
+            f"entries.description={outfits_desc!r}",
         )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
@@ -606,7 +646,9 @@ def main() -> int:
         cleaned, hits = delete_character_reference(
             "Hanabi (Honkai: Star Rail) 银白色长发的少女站在镜头前", hanabi
         )
-        no_hit, no_hits = delete_character_reference("银白色长发的少女站在镜头前", hanabi)
+        no_hit, no_hits = delete_character_reference(
+            "银白色长发的少女站在镜头前", hanabi
+        )
         check(
             "1.0.20 「删除角色引用」删掉标签与作品名括号、保留外观描述",
             hits >= 1
@@ -786,6 +828,146 @@ def main() -> int:
         asyncio.run(_check_resolve_off())
     except Exception as e:  # noqa: BLE001
         check("角色解析模块可调用", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.22 皮肤/时装（1.0.22）：皮肤表、关键词规范、严格校验与入口 ────────
+    # 与 §5.21 同一口径：这里只做「装得上、调得动」的冒烟（完整的识别 / 注入行为
+    # 在 check_logic.py 的 C77~C82）。重点钉三件事：
+    # ① 皮肤表的四列能解析、"只写一部分"能命中；
+    # ② 模型给的关键词真的会过规范（大写 / 中文 / 未转义括号一律不要）；
+    # ③ unknown / confidence 太低 / 没有可用关键词一律判失败（什么都不注入）。
+    try:
+        from .. import handler as outfit_handler
+        from ..outfit import (
+            OUTFIT_CACHE_TTL_SECONDS,
+            OUTFIT_FAILURE_TTL_SECONDS,
+            OUTFIT_RESOLVE_MIN_CONFIDENCE,
+            find_outfit_entry,
+            outfit_cache_get,
+            outfit_cache_put,
+            parse_outfit_resolution_payload,
+            parse_outfits,
+            reset_outfit_cache,
+            validate_outfit_keyword,
+            validate_outfit_tag,
+        )
+
+        table = parse_outfits(
+            "粉色妖精小姐 | 爱莉希雅 | pink elf dress, fairy wings | 爱莉希雅的粉色妖精装"
+        )
+        check(
+            "1.0.22 皮肤表：四列解析（关键词按逗号切开）",
+            len(table) == 1
+            and table[0].name == "粉色妖精小姐"
+            and table[0].character == "爱莉希雅"
+            and table[0].keywords == ["pink elf dress", "fairy wings"]
+            and table[0].description == "爱莉希雅的粉色妖精装",
+            f"table={table!r}",
+        )
+        check(
+            "1.0.22 皮肤表：允许只写一部分（粉色妖精 → 粉色妖精小姐）",
+            find_outfit_entry("粉色妖精", table) is table[0]
+            and find_outfit_entry("粉色妖精小姐", table) is table[0]
+            and find_outfit_entry("不存在的皮肤", table) is None,
+        )
+        rejected = {
+            label: validate_outfit_keyword(word)[0] is False
+            for label, word in {
+                "大写": "Pink Elf Dress",
+                "中文": "粉色长裙",
+                "未转义括号": "pink dress (fairy)",
+                "全角括号": "pink dress（fairy）",
+                "空": "",
+                "含逗号（不是一个关键词）": "pink elf dress, fairy wings",
+            }.items()
+        }
+        check(
+            "1.0.22 关键词规范：大写 / 中文 / 未转义与全角括号 / 空 / 含逗号全部拦下，"
+            "合法关键词通过",
+            all(rejected.values())
+            and validate_outfit_keyword("pink elf dress")[0] is True
+            and validate_outfit_keyword(r"ribbon \(hair\)")[0] is True,
+            f"逐项 = {rejected!r}",
+        )
+        check(
+            "1.0.22 皮肤标签规范：逗号分隔的安全词串合法，大写 / 中文串非法",
+            validate_outfit_tag("pink elf dress, fairy wings")[0] is True
+            and validate_outfit_tag("Pink Elf Dress")[0] is False
+            and validate_outfit_tag("粉色长裙")[0] is False
+            and validate_outfit_tag("")[0] is False,
+        )
+
+        good_payload = {
+            "unknown": False,
+            "outfit_cn": "粉色妖精小姐",
+            "outfit_en": "Pink Elf Lady",
+            "tag": "pink elf dress, fairy wings",
+            "keywords": ["pink elf dress", "fairy wings"],
+            "confidence": 0.9,
+        }
+        outfit, reason, confidence = parse_outfit_resolution_payload(good_payload)
+        check(
+            "1.0.22 解析结果：合法 JSON → 皮肤名 / 关键词 / confidence",
+            outfit is not None
+            and outfit.name == "粉色妖精小姐"
+            and outfit.keywords == ["pink elf dress", "fairy wings"]
+            and outfit.ok
+            and confidence == 0.9
+            and reason == "",
+            f"outfit={outfit!r} reason={reason!r}",
+        )
+        # 非 ASCII / 大写关键词是**逐条丢弃**（不是整条判失败）：剩下能用的照样用
+        mixed, mixed_reason, _ = parse_outfit_resolution_payload(
+            {
+                **good_payload,
+                "tag": "",
+                "keywords": ["pink elf dress", "粉色长裙", "Bad Tag"],
+            }
+        )
+        check(
+            "1.0.22 解析结果：非 ASCII / 大写关键词被逐条丢弃，剩下的照常用",
+            mixed is not None
+            and mixed.keywords == ["pink elf dress"]
+            and mixed_reason == "",
+            f"mixed={mixed!r} reason={mixed_reason!r}",
+        )
+        unknown_outfit, unknown_reason, _ = parse_outfit_resolution_payload(
+            {"unknown": True}
+        )
+        low_outfit, low_reason, low_conf = parse_outfit_resolution_payload(
+            {**good_payload, "confidence": 0.2}
+        )
+        empty_outfit, empty_reason, _ = parse_outfit_resolution_payload(
+            {**good_payload, "tag": "", "keywords": ["粉色长裙"]}
+        )
+        check(
+            "1.0.22 解析结果：unknown / 低 confidence / 没有可用关键词都判失败",
+            unknown_outfit is None
+            and "unknown" in unknown_reason
+            and low_outfit is None
+            and low_conf == 0.2
+            and str(OUTFIT_RESOLVE_MIN_CONFIDENCE) in low_reason
+            and empty_outfit is None
+            and "关键词" in empty_reason,
+            f"unknown={unknown_reason!r} low={low_reason!r} empty={empty_reason!r}",
+        )
+        check(
+            "1.0.22 入口 / 缓存函数存在，成功 TTL 24 小时、失败负缓存 10 分钟",
+            callable(reset_outfit_cache)
+            and callable(outfit_cache_get)
+            and callable(outfit_cache_put)
+            and OUTFIT_CACHE_TTL_SECONDS == 24 * 60 * 60.0
+            and OUTFIT_FAILURE_TTL_SECONDS == 10 * 60.0
+            and hasattr(outfit_handler.CharacterGuardHandler, "_scan_outfit_names")
+            and hasattr(outfit_handler.CharacterGuardHandler, "_resolve_outfit")
+            and hasattr(
+                outfit_handler.CharacterGuardHandler, "_resolve_outfit_with_cache"
+            )
+            and hasattr(outfit_handler.CharacterGuardHandler, "_apply_outfit")
+            # 解析函数在 handler 里是模块级导入（用例打桩要同时替换两处）
+            and callable(outfit_handler.resolve_outfit_via_llm),
+        )
+    except Exception as e:  # noqa: BLE001
+        check("皮肤/时装模块可调用", False, f"{type(e).__name__}: {e}")
 
     print("-" * 72)
     if _failures:

@@ -459,9 +459,59 @@ class CharPromptGuardConfig(BaseConfig):
             description="写入记忆时使用的记忆类型 memory_type",
         )
 
+    @config_section("outfits")
+    class OutfitsSection(SectionBase):
+        """皮肤/时装（装扮）识别与注入配置（1.0.22 起）。"""
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用「皮肤/时装」识别与注入：用户说「我想看你的 XXXX」这类"
+                "点了一套皮肤/时装时，把它解析成英文关键词**追加**进提示词"
+                "（角色照旧由原来的判定链决定，这一维只做「多追加一层」，"
+                "失败时一个字都不改）。关闭后整条链路零开销："
+                "不读上文、不调模型、不碰提示词"
+            ),
+        )
+        entries: str = Field(
+            default="",
+            description=(
+                "皮肤表：每段「皮肤名 | 角色名(可空) | 英文关键词或 NAI 标签 | "
+                "中文描述(可空)」，后三项可省略。多行或分号(;)分隔均可；"
+                "整行以 # 开头为注释。命中表里的皮肤名时**零模型调用**，"
+                "直接用表里的关键词与中文描述；留空则每次都由模型解析（见 auto_resolve）。"
+                "示例（只有一行，按同样格式逐行添加你自己的皮肤，照抄改掉即可）："
+                "粉色妖精小姐 | 爱莉希雅 | pink elf dress, fairy wings | 爱莉希雅的粉色妖精装"
+            ),
+        )
+        auto_resolve: bool = Field(
+            default=True,
+            description=(
+                "皮肤表里没有的皮肤名，是否调用已配置的模型解析（与角色解析同一套 "
+                "llm_api：模型沿用 translate_model、超时沿用 llm_timeout，"
+                "不引入新依赖，结果带进程内缓存）。解析结果必须是小写 ASCII 的英文"
+                "关键词：unknown=true / JSON 解析失败 / confidence 低于 0.5 / "
+                "既没有 tag 又没有 keywords 一律视为失败，**什么都不注入**"
+                "（绝不瞎编），日志 皮肤解析(LLM)失败：<原因>。解析成功会额外打一条"
+                "「建议加入皮肤表：…」（只打日志，绝不自动改配置文件）。"
+                "关闭后只有皮肤表里写得出的皮肤会被注入"
+            ),
+        )
+        write_back: bool = Field(
+            default=True,
+            description=(
+                "解析成功后是否把这次结果写回记忆库（沿用 memory.py 现有写回通道，"
+                "core_tags / diffusion_tags / opposing_tags 三元组同时非空），"
+                "标题形如「皮肤指向：粉色妖精小姐 → 爱莉希雅」。"
+                "需要 [memory] enabled 为真、memory.write_back 为真、"
+                "且 base_url 合法；写入失败只记日志，绝不影响生图"
+            ),
+        )
+
     general: GeneralSection = Field(default_factory=GeneralSection)
     roster: RosterSection = Field(default_factory=RosterSection)
     targets: TargetsSection = Field(default_factory=TargetsSection)
     multi: MultiSection = Field(default_factory=MultiSection)
     monitor: MonitorSection = Field(default_factory=MonitorSection)
     memory: MemorySection = Field(default_factory=MemorySection)
+    outfits: OutfitsSection = Field(default_factory=OutfitsSection)

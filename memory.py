@@ -155,6 +155,9 @@ _CONTENT_KEYS = ("content_snippet", "snippet", "content", "text", "body")
 
 #: 写入记忆时的固定标签（供检索与人工核对）
 CORE_TAG = "角色指向"
+#: 1.0.22：写入「皮肤/时装」解析结果时用的固定标签（与 :data:`CORE_TAG` 并列，
+#: 方便在记忆库里把两类结论分开检索）
+OUTFIT_CORE_TAG = "皮肤指向"
 #: 写入记忆时 ``status`` 的取值
 WRITE_STATUS = "active"
 #: 写入记忆内容里的来源标注
@@ -473,16 +476,27 @@ class MemoryClient:
         game: str = "",
         tag: str = "",
         scenario: str = "",
+        title: str = "",
+        core_tag: str = CORE_TAG,
     ) -> str:
         """把一次「确认」写回记忆库（记住）。
+
+        Args:
+            title: 覆盖默认标题（``角色指向：<触发词> → <角色名>``）。1.0.22 起
+                皮肤/时装解析写回时传 ``皮肤指向：<皮肤名> → <角色名>``
+            core_tag: ``core_tags`` 的第一项，默认 :data:`CORE_TAG`（1.0.22 起皮肤
+                写回传 :data:`OUTFIT_CORE_TAG`）。三元组仍**同时非空**
+                （``core_tags`` / ``diffusion_tags`` / ``opposing_tags``）
 
         Returns:
             成功时返回记忆 ``id``（响应里没有 ``id`` 时返回 ``"?"``）；
             失败返回空串，并打一条 INFO 日志说明原因（**绝不影响生图**）。
         """
-        title = write_title(trigger_word, character.label())
+        memory_title = (title or "").strip() or write_title(
+            trigger_word, character.label()
+        )
         payload: dict[str, Any] = {
-            "title": title,
+            "title": memory_title,
             "content": write_content(
                 trigger_word=trigger_word,
                 character=character,
@@ -493,7 +507,7 @@ class MemoryClient:
             "bucket": self.bucket,
             "memory_type": self.memory_type,
             "status": WRITE_STATUS,
-            "core_tags": [CORE_TAG, trigger_word, character.label()],
+            "core_tags": [core_tag, trigger_word, character.label()],
             "diffusion_tags": ["角色指向", "photo", "标签", "角色表"],
             "opposing_tags": ["标签误用", "角色混淆", "张冠李戴"],
         }
@@ -502,10 +516,10 @@ class MemoryClient:
             response = await _call(_http_post_json, url, payload, float(self.timeout))
         except Exception as e:  # noqa: BLE001 —— 写失败只记日志
             reason = _failure_reason(e)
-            logger.info(f"记忆库写入失败（{title}）：{reason}")
+            logger.info(f"记忆库写入失败（{memory_title}）：{reason}")
             return ""
         memory_id = _response_id(response)
-        logger.info(f"记忆库已记住：{title}（id={memory_id or '未知'}）")
+        logger.info(f"记忆库已记住：{memory_title}（id={memory_id or '未知'}）")
         return memory_id or "?"
 
 
@@ -1046,6 +1060,7 @@ __all__ = [
     "FAILURE_COOLDOWN_SECONDS",
     "KEYWORD_MAX_CHARS",
     "LIMIT_MAX",
+    "OUTFIT_CORE_TAG",
     "RECONCILE_UNCERTAINTY",
     "SNIPPET_MAX_CHARS",
     "SPEAKER_TRIGGER_WORDS",
