@@ -218,6 +218,25 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
 句末语气词（``吧吗呢啊呀哦嘛呗啦咯喔``）；实词汉字不放行**"：``画爱莉的婚纱吧～`` 命中，
 而 ``爱莉的婚纱是我挑的`` / ``流萤的校服被雨淋了`` / ``画爱莉的婚纱的话`` 不命中。
 正则、常量、判定链与用例（仍是 C1~C115 共 115 条）一个字都没动。
+
+1.0.34 起**不再要求用户手工打框架补丁**（静态补丁仍然可用，二者**自动二选一**，由
+:mod:`compat` 在插件加载时探测）：插件启动时检查 ``src/core/utils/llm_tool_call.py``
+是否已经在发「执行前事件」——
+
+- **已经在发**（打过 ``framework-patch/llm_tool_call-pre-events.patch``，或上游将来
+  原生支持）→ **一行代码都不执行**，日志 ``检测到框架已含执行前事件（静态补丁），
+  未重复包装``；
+- **没在发** → 在**内存里**给 ``run_tool_call`` 补一层包装（**不写任何文件**、不改
+  框架源码、不 import 补丁的内部符号），把订阅者写回的 ``args`` 交给原函数 ——
+  与静态补丁二版等价，日志 ``已启用框架运行时兼容（等价 llm_tool_call-pre-events
+  补丁 v2）``；
+- **认不出**（模块 / 函数不在、源码读不到）→ **不装**（宁可不生效也不重复发事件），
+  日志 ``框架版本不支持运行时兼容，已跳过…``。
+
+配置开关 ``general.runtime_framework_compat``（默认开）关掉后不再探测。任何异常都只记
+日志、**绝不拦住生图**，最坏等价"没装 shim"（行为与 1.0.33 逐字一致）。用例
+C116~C118 用离线桩覆盖「已打补丁不重复装」「没打补丁则补上并能改写 args」「开关关掉 /
+原函数抛异常 / 桩里没有 run_tool_call」三组行为。
 """
 
 from __future__ import annotations
@@ -227,11 +246,33 @@ from typing import Any, ClassVar
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
-from . import tag_hint
+from . import compat, tag_hint
 from .config import CharPromptGuardConfig
 from .handler import _BUILTIN_TARGETS, CharacterGuardHandler
 
 logger = get_logger("char_prompt_guard")
+
+#: 运行时框架兼容（1.0.34）各状态对应的日志文案（见 :func:`compat.install`）。
+#: 用户排查「为什么插件没生效」时看的就是这一行，所以每种状态都有确定的一句。
+_RUNTIME_COMPAT_LOG: dict[str, str] = {
+    compat.STATUS_APPLIED: (
+        "已启用框架运行时兼容（等价 llm_tool_call-pre-events 补丁 v2）"
+    ),
+    compat.STATUS_ALREADY_PATCHED: (
+        "检测到框架已含执行前事件（静态补丁），未重复包装"
+    ),
+    compat.STATUS_ALREADY_INSTALLED: "运行时兼容已安装，跳过",
+    compat.STATUS_UNSUPPORTED: (
+        "框架版本不支持运行时兼容，已跳过"
+        "（如需生效请应用 framework-patch/llm_tool_call-pre-events.patch）"
+    ),
+    compat.STATUS_DISABLED: (
+        "运行时框架兼容已关闭（general.runtime_framework_compat=false）"
+    ),
+}
+
+#: 五种状态里唯一按 WARNING 打的那一个（其余都按 INFO）
+_RUNTIME_COMPAT_WARNING = compat.STATUS_UNSUPPORTED
 
 _REMINDER_BUCKET = "actor"
 _REMINDER_NAME = "关于生图时的角色提示词补全"
@@ -294,7 +335,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.33"
+    plugin_version: str = "1.0.34"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。
@@ -332,6 +373,24 @@ class CharPromptGuardPlugin(BasePlugin):
                 "只订阅 before_action_call；agent 聊天器路径需要更新核心或打框架补丁"
             )
 
+    @staticmethod
+    def _install_runtime_compat(config: Any) -> None:
+        """1.0.34：探测框架是否已经在发「执行前事件」，没发就在内存里补一层。
+
+        判定与包装全在 :mod:`compat`（**只改内存，不写任何文件**）：框架已经在发
+        （打过静态补丁 / 上游将来原生支持）时**什么都不做**；没在发且结构认得出时
+        才原地包一层 ``run_tool_call``；认不出就不装。这里只负责把返回的状态翻成
+        一条 INFO / WARNING —— 用户排查「为什么没生效」看的就是这一行。
+        """
+        status = compat.install(logger, config)
+        message = _RUNTIME_COMPAT_LOG.get(status)
+        if message is None:
+            logger.debug(f"运行时兼容：未知状态 {status!r}，已跳过")
+        elif status == _RUNTIME_COMPAT_WARNING:
+            logger.warning(message)
+        else:
+            logger.info(message)
+
     async def on_plugin_loaded(self) -> None:
         """插件加载时告知主模型角色补全机制、可用标记与标签书写规则。"""
         config = self.config
@@ -339,6 +398,12 @@ class CharPromptGuardPlugin(BasePlugin):
             config = CharPromptGuardConfig()
 
         self._log_runtime_capability()
+
+        # 1.0.34：探测框架是否已经在发「执行前事件」，没发就在内存里补一层
+        # （让没打 framework-patch 的用户也开箱可用；已打补丁的机器一行代码都不执行）。
+        # 与下面的 reminder / 参数说明注入**互相独立**：那两条失败也不影响兼容层，
+        # 这里失败（极罕见）同样只记日志、不影响它们。
+        self._install_runtime_compat(config)
 
         # 1.0.17：把「标签写在最前面」直接追加进生图动作的**参数说明**（纯内存改动，
         # 不写文件）。这是比 reminder 强得多的通道，所以放在 reminder 之前、且不受

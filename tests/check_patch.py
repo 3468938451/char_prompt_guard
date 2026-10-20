@@ -7,7 +7,8 @@ neo_default_chatter）走的正是这条路径，于是依赖「执行前改写�
 
 本脚本只读框架源码，不改任何东西，三种结论：
 
-- ``未打补丁``：agent 聊天器下本插件不会生效 → 需要 apply 补丁；
+- ``未打补丁``：静态补丁没打上（**1.0.34 起插件会用「运行时兼容」在内存里补一层**，
+  启动日志出现 ``已启用框架运行时兼容（…）`` 就说明已接管；本脚本只看静态补丁这一种方案）；
 - ``原版补丁``：事件补上了，但动作名只读旧属性 ``action_name`` → 用新版
   ``name`` 声明的组件（image_generator_plugin-neo 的 draw_image）动作名为空，
   插件侧虽已做参数名兜底，仍建议换成修正版补丁；
@@ -67,13 +68,20 @@ def main() -> int:
         check("agent 聊天器路径补发执行前事件", False, "未检测到补丁代码")
         print()
         print(
-            "结论：**未打补丁** —— agent 聊天器（default_chatter / neo_default_chatter）下"
+            "结论：**未打静态补丁** —— agent 聊天器（default_chatter / neo_default_chatter）下"
         )
         print(
-            "      本插件收不到任何通知，表现是「装上毫无反应、日志里一条记录都没有」。"
+            "      上游本身不会发这个事件。**1.0.34 起插件会自己补上**：启动日志里出现"
         )
         print(
-            "      处理：git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch"
+            "      `已启用框架运行时兼容（等价 llm_tool_call-pre-events 补丁 v2）`"
+            " 就说明运行时兼容已接管，"
+        )
+        print(
+            "      不需要再打补丁；只有那条日志是 `框架版本不支持运行时兼容` 时才需要手工打："
+        )
+        print(
+            "      git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch"
         )
         return 1
 

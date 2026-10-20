@@ -2,29 +2,44 @@
 
 ## ⚠️ 插件没生效 / 加载成功但从不起作用？先看这里
 
-本插件监听框架的「**工具/动作执行前事件**」。但**agent 类聊天器**（`default_chatter`、`neo_default_chatter`、KFC 等）走的是另一条调用路径，**框架默认不会发这个事件** —— 于是插件会「加载成功、日志却一直静默」。
+本插件监听框架的「**工具/动作执行前事件**」。但**agent 类聊天器**（`default_chatter`、`neo_default_chatter`、KFC 等）走的是另一条调用路径（`run_tool_call` → `create_llm_usable_execution` → `_wrap_execute`），**框架默认不会发这个事件** —— 在 1.0.33 及以前，插件会「加载成功、日志却一直静默」，必须手工打框架补丁。
 
-**这种情况下需要给框架打补丁（一次性，改一个文件）：**
+**1.0.34 起不用再手工打补丁了**：插件**加载时自己探测**框架有没有在发这个事件 ——
+**已经在发**（你打过静态补丁，或上游将来原生支持）就**一行代码都不动**；**没在发**才在
+**内存里**给 `run_tool_call` 补一层包装（**不写任何文件**、不改框架源码）。细节见
+[框架兼容：静态补丁 或 运行时兼容](#框架兼容静态补丁-或-运行时兼容1034-起二选一自动检测)。
 
-1. 下载补丁：仓库 [`framework-patch/llm_tool_call-pre-events.patch`](./framework-patch/llm_tool_call-pre-events.patch)（同一文件也作为 GitHub Release 资产提供）；
-2. 打补丁（在**框架根目录**执行）：
-   ```bash
-   git apply <下载路径>/llm_tool_call-pre-events.patch
-   # 若报错可加 --3way；仍失败就照补丁内容手工修改 src/core/utils/llm_tool_call.py
-   ```
-3. **重启 bot**。日志里出现「已补入角色 / 已补标准标签」即生效；若始终没有，再看下一步自检；
-4. 自检补丁是否打对：
-   ```powershell
-   $env:NEO_ROOT = "<框架根>"
-   python <插件目录>\tests\check_patch.py     # 期望：[PASS] …修正版补丁
-   ```
-5. 另外两个前提：
+所以现在的排查顺序是：
+
+1. **先看日志**（1.0.34 起插件加载时会打一条，二选一）：
+   - `已启用框架运行时兼容（等价 llm_tool_call-pre-events 补丁 v2）` → **已经能用了**，不用再管补丁；
+   - `检测到框架已含执行前事件（静态补丁），未重复包装` → 你已经打过补丁，也**不用再管**；
+   - `框架版本不支持运行时兼容，已跳过（如需生效请应用 framework-patch/llm_tool_call-pre-events.patch）`
+     → 框架结构认不出（或源码读不到），这时才需要手工打补丁；
+   - `运行时框架兼容已关闭（general.runtime_framework_compat=false）` → 你自己关掉了探测。
+2. **`unsupported` 时才打静态补丁**（一次性，改一个文件）：
+   1. 下载补丁：仓库 [`framework-patch/llm_tool_call-pre-events.patch`](./framework-patch/llm_tool_call-pre-events.patch)（同一文件也作为 GitHub Release 资产提供）；
+   2. 打补丁（在**框架根目录**执行）：
+      ```bash
+      git apply <下载路径>/llm_tool_call-pre-events.patch
+      # 若报错可加 --3way；仍失败就照补丁内容手工修改 src/core/utils/llm_tool_call.py
+      ```
+   3. **重启 bot**。日志里出现「已补入角色 / 已补标准标签」即生效；若始终没有，再看下一步自检；
+   4. 自检补丁是否打对：
+      ```powershell
+      $env:NEO_ROOT = "<框架根>"
+      python <插件目录>\tests\check_patch.py     # 期望：[PASS] …修正版补丁
+      ```
+3. 另外两个前提（与补丁无关）：
    - 至少要装**一个生图插件**（`nai_artist` 或 `image_generator_plugin-neo`），否则本插件没有可接管的目标；
    - 建议在 `[roster] characters` 里填写常用角色（含第 4 列的**转义标准标签**，如 `firefly \(honkai: star rail\)`），标签可靠性由此决定。
 
 > 补丁做两件事：① 在 agent 聊天器的工具调用路径上**补发执行前事件**；② 事件里带上 `stream_id`、并按新版 `name` 解析动作名。框架升级（`git pull`）会覆盖它，需要**重新打一次**。
+> 运行时兼容做的是同一件事（等价补丁**二版**），但只在内存里、**升级框架后不用再管**；
+> 它只包 `run_tool_call` 这一条入口，`BaseAgent` 的本地组件执行
+> （`exec_llm_usable` → `create_llm_usable_execution`）不在其中 —— 需要全覆盖时仍然建议打静态补丁。
 
-> 文档版本：1.0.33 · 作者：思源（siyuan）· 许可：MIT
+> 文档版本：1.0.34 · 作者：思源（siyuan）· 许可：MIT
 > 同时适配 **nai_artist** 与 **image_generator_plugin-neo** 两个生图插件。
 > 本插件由 **AI 辅助编写**（作者审阅与整合）：缺陷、遗漏或无意残留的第三方内容请见
 > [AI_USAGE.md](./AI_USAGE.md)（无担保 / 责任限制 / 第三方内容通知即处理 / 反馈渠道）。
@@ -39,6 +54,8 @@
 **1.0.32 起只收窄两处**（独立只读审计的两条 🟠，都是"放宽越界"；判定链的规则、优先级次序与「用户最新点名」四条闸门的语义都没动；新增用例 C114/C115，原 C1~C113 的断言一条都没改）：① **归属句式的尾边界收窄为"不是名字字符即放行，另外只额外放行那 10 个句末语气词"** —— 1.0.31 图省事，直接放行了**整张** `outfit._OUTFIT_STOP_CHARS`（`的` / `是` / `我` / `你` / `都` / `还` … 全在里面），于是「爱莉的**婚纱是**我挑的」「流萤的**校服被**雨淋了」「画的**婚纱的**话」这类**不含穿着意图**的话也会被当成穿着候选（1.0.30 不会）—— 抓错会把衣服画错，与「宁少勿多」相悖，而文档的承诺只是**额外放行句末语气词**；1.0.32 起**额外放行的只有**专用词表 `outfit._OUTFIT_TAIL_PARTICLES`（`吧吗呢啊呀哦嘛呗啦咯喔`），**尾边界本身仍是"后面不是名字字符（标点 / 空白 / 串尾 / emoji）即放行"、实词汉字不放行**，「画爱莉的**婚纱吧**～」/「画爱莉的**婚纱呢**」照旧命中（C113 不变）、`会` 照旧不在任何放行表里（C91 不变），新增用例 C114；② **触发消息是追加指令时，1.0.31 的让位不再"只看前一条的单名"** —— 触发消息**自己没点名**、却含**追加语义词**（`一起` / `都` / `还有` …）且**不是疑问句**，而 `handler._overtaken_conclusion` 算出的"原来会生效的结论"**没定死一个人**（多人 ≥2 角色，或「换人还是追加不确定」＝会交 LLM 仲裁）时，本次**不让位**，交回主题跟踪 / LLM 仲裁（`handler._additive_trigger_needs_tracking`）。用户场景 `你：画爱莉和流萤一起` → `你：流萤这张不错` → 触发 `你：一起画吧`：1.0.30 会让位给 LLM 仲裁（可能两人），1.0.31 却直接按前一条的单名拍板并 return（`判定依据=用户点名(最新消息):流萤`），**压过**主题跟踪的「换人还是追加不确定」与 LLM 仲裁 → **该画两人只画一人**；1.0.32 起这次不让位（新增用例 C115）。疑问句照旧让位（C112 的 `都试试？` 一字不改：`？` 是"征询 / 选择"，不是"把上一位一起画"的指令）。详见下文[「判定优先级」](#判定优先级1010-起1030-起在最前面插了一条用户最新点名)与[「泛指的穿着类型」](#泛指的穿着类型outfits-wear_types1028-起)。
 
 **1.0.33 起只同步文档措辞，无行为改动**（正则、常量、判定链与用例一个字都没动，`tests/check_logic.py` 仍是 **115** 条 C1~C115）：把"归属句式尾边界只放行句末语气词"这类**过强**表述改成与实现一致的口径 —— **后面不是名字字符（标点 / 空白 / 串尾 / emoji）即放行，另外额外放行 10 个句末语气词**（`outfit._OUTFIT_TAIL_PARTICLES` = `吧吗呢啊呀哦嘛呗啦咯喔`）；**实词汉字不放行** —— 于是 `画爱莉的婚纱吧～` 命中（C113），而 `爱莉的婚纱是我挑的` / `流萤的校服被雨淋了` / `画爱莉的婚纱的话` 不命中（C114）。**注意语义**：`爱莉的居家服，然后出门` 里逗号后是新分句、用户确实在说那件衣服，所以**会**注入 `居家服` —— 这属于符合意图，不是 bug。详见下文[「泛指的穿着类型」](#泛指的穿着类型outfits-wear_types1028-起)。
+
+**1.0.34 起不再要求手工打框架补丁**（本版唯一的新功能；判定链 / 优先级 / 注入位置一个字都没改，新增用例 C116~C118，原 C1~C115 的断言一条都没改）：新增 `compat` 模块，插件**加载时**探测 `src/core/utils/llm_tool_call.py` 是否已经在发「执行前事件」—— **已经在发**（打过 `framework-patch/llm_tool_call-pre-events.patch`，或上游将来原生支持）就**一行代码都不执行**；**没在发**才在**内存里**给 `run_tool_call` 补一层包装（等价补丁**二版**：补发 `before_action_call` / `before_tool_call`，带上 `signature` / 动作名 / `args` / `message` / `stream_id`，并把订阅者写回的 `args` 交给原函数；**没有订阅者时一个事件都不发**）。**不写任何文件**、不改框架源码、不 import 补丁的内部符号；认不出框架结构（模块 / 函数不在、源码读不到）时**不装**（宁可不生效，也不重复发事件），任何异常都只记日志、**绝不拦住生图**。开关 `general.runtime_framework_compat`（默认开）。详见下文[「框架兼容：静态补丁 或 运行时兼容」](#框架兼容静态补丁-或-运行时兼容1034-起二选一自动检测)。
 
 ## 兼容的生图插件（下列两个都已适配）
 
@@ -1064,7 +1081,19 @@ memory_type = "knowledge"                         # 写入用的记忆类型
 `判定依据=用户点名(最新消息):流萤`、一次模型都不问）。
 C115 用假 `extract_characters_via_llm`（monkeypatch），不真调模型。
 
-`tests/check_logic.py` 目前共 **115** 条用例（C1~C115，离线跑法默认全跑，加 `--llm`
+**1.0.34 的三条**（框架运行时兼容，全部用**离线桩**：假宿主模块 + 假事件总线，
+不真导入 `src.core.utils.llm_tool_call`）：**C116**（假宿主 `run_tool_call` 的**源码**里
+带着补丁的三类标记 → `install()` 返回 `already_patched`，**函数对象未被替换**、也没打包装
+标记 —— "已打补丁的机器一行代码都不执行"）、**C117**（未打补丁的假宿主 → `applied`，
+`run_tool_call` 被 `functools.wraps` 包装；三跑：**A** 有订阅者 → 恰好发一次
+`before_action_call`（`signature` / `action_name` / `args` / `message` / `stream_id` 都对）、
+订阅者改写的 `args` **传给原函数**；**B** 清空订阅者 → **一个事件都不发**、原函数收到原样
+参数（零开销）；**C** `tool-*` 名字 → 发 `before_tool_call` 且 `tool_name` / 签名都对）、
+**C118**（三条兜底：**①** `runtime_framework_compat=false` → `disabled` 且不替换；
+**②** 包装后原函数抛异常 → 异常**照旧向上传播**（抛之前事件照发）、第二次调用照常工作；
+**③** 桩里没有 `run_tool_call`（以及"有但不是可调用"）→ `unsupported`、不崩）。
+
+`tests/check_logic.py` 目前共 **118** 条用例（C1~C118，离线跑法默认全跑，加 `--llm`
 再多两条真调小模型的用例）。C104 是**按最终真实可达行为重写**（改动前它断言的是
 「仍然注入校服」这个 bug 存在），不是放宽：单元样例表反而加严了
 （1.0.30 新补的 15 条同义写法全部要求命中）。C107/C108 里唯一被改过的断言是
@@ -1078,12 +1107,13 @@ C112 钉住新的前置判断，C113 钉住放宽后的归属句式边界（两�
 **1.0.32 同样只加两条用例**（C114/C115），C1~C113 的断言一条都没改、也没放宽：
 C114 把 1.0.31 那条边界收窄成"不是名字字符即放行 + 额外只放行 10 个句末语气词、实词汉字不放行"（单元级 + 端到端），
 C115 钉住"触发消息是追加指令时不让位"（含一条疑问句反例，证明没有让位过头）。
+**1.0.34 只加三条用例**（C116~C118，见上），C1~C115 的断言一条都没改、也没放宽。
 
 
 ## 安装
 
 1. 安装至少一个受支持的生图插件（nai_artist 或 image_generator_plugin-neo）；
-2. 将本插件目录（或 `char_prompt_guard-1.0.33.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
+2. 将本插件目录（或 `char_prompt_guard-1.0.34.mfp` 包）放入 Neo-MoFox 的 `plugins/` 目录；
 3. 重启 bot，插件会自动生成默认配置：`config/plugins/char_prompt_guard/config.toml`。
 
 ## 配置说明
@@ -1111,6 +1141,8 @@ skip_on_self_reference = true  # 自我指代（本尊/你本人/你自己/…�
 true_self = ""            # 「本尊」对应的角色（角色表里的名字或别名）；留空自动读人格配置 personality.nickname
 notify_tag_rule = true    # 在 system reminder 里要求主模型把角色标准标签写在生图参数最前面
 tag_first_hint = true     # 1.0.17：把同一句要求直接追加进生图动作的「参数说明」（纯内存改动）
+runtime_framework_compat = true  # 1.0.34：探测到框架缺少执行前事件时在内存里补一层
+                                 # （已打补丁 / 上游原生则不动；不写任何文件；false=不探测）
 translate_model = ""      # 提取用模型名（留空用 UTILS_SMALL）
 llm_timeout = 20.0        # LLM 提取超时秒数（0=不限时；防模型挂起卡住生图）
 append_format = "（画面角色：“{name}”，出自游戏《{game}》）"
@@ -1393,7 +1425,7 @@ python tests\check_privacy.py
 > python -m char_prompt_guard.tests.check_logic
 > ```
 
-## 框架依赖（重要，不打补丁在 agent 聊天器下不会生效）
+## 框架依赖（1.0.34 起自动检测：运行时兼容 或 静态补丁）
 
 插件靠「执行前事件」改写提示词，而**上游框架在 agent 聊天器路径下不发布这个事件**：
 
@@ -1401,12 +1433,63 @@ python tests\check_privacy.py
 | --- | --- |
 | `ActionManager.execute_action` | ✅ `before_action_call` |
 | `ToolManager.execute_tool` | ✅ `before_tool_call` |
-| **agent 聊天器**（`default_chatter` / `neo_default_chatter`）→ `run_tool_call` → `create_llm_usable_execution` → `_wrap_execute` | ❌ **什么都不发** |
+| **agent 聊天器**（`default_chatter` / `neo_default_chatter` / KFC 等）→ `run_tool_call` → `create_llm_usable_execution` → `_wrap_execute` | ❌ **什么都不发**（1.0.34 起由插件在内存里补上，见下节） |
 
-也就是说：在 agent 聊天器下插件收不到任何通知，表现是「装上去毫无反应、日志里连一条记录都没有」。
-**这不是插件坏了，是钩子没来。** 解决办法是打框架补丁：
+也就是说：在 agent 聊天器下插件本来收不到任何通知，表现是「装上去毫无反应、日志里连一条记录都没有」。
+**1.0.34 起这不是问题了** —— 插件自己探测、自己补；你仍然可以打静态补丁，两者**自动二选一**，
+不需要你做任何选择。
 
-> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.33.mfp` / 插件目录只含插件自身；
+### 框架兼容：静态补丁 或 运行时兼容（1.0.34 起，二选一、自动检测）
+
+**一句话**：**检测没有就装、有了就不动、认不出就不装。**
+
+| 探测结果 | 插件做什么 | 日志（`unsupported` 是 WARNING，其余 INFO） |
+| --- | --- | --- |
+| 框架已经在发执行前事件（你打过静态补丁，或上游将来原生支持） | **一个字都不动**、一行代码都不执行（绝不重复包一层） | `检测到框架已含执行前事件（静态补丁），未重复包装` |
+| 框架没在发、但结构认得出 | 在**内存里**给 `run_tool_call` 补一层包装（等价补丁**二版**） | `已启用框架运行时兼容（等价 llm_tool_call-pre-events 补丁 v2）` |
+| 认不出（模块 / 函数不在、源码读不到） | **不装**（宁可这次不生效，也不重复发事件） | `框架版本不支持运行时兼容，已跳过（如需生效请应用 framework-patch/llm_tool_call-pre-events.patch）` |
+| 本进程里已经装过 | 跳过 | `运行时兼容已安装，跳过` |
+| 你自己关掉了开关 | 不探测、不包装 | `运行时框架兼容已关闭（general.runtime_framework_compat=false）` |
+
+**怎么判定「框架已经在发」**（`compat.looks_statically_patched`）：补丁源码里必然同时出现
+「执行前事件」（`BEFORE_ACTION_CALL` / `BEFORE_TOOL_CALL`）、「发布」（`.publish(`）、
+「写回 args」（`"args"`）三类标记 —— 三者齐了才算「已经在发」。扫描范围是
+`src/core/utils/llm_tool_call.py` **整个模块 + 三个相关函数**
+（`run_tool_call` / `create_llm_usable_execution` / `exec_llm_usable`）：静态补丁其实打在
+`create_llm_usable_execution` 里，**只扫 `run_tool_call` 会漏判**、进而重复发两条事件，
+所以刻意扫全。源码一处都读不到时**不装**（fail-closed：认不出就不碰）。
+
+**配置**（`config.toml` 的 `[general]`，默认开）：
+
+```toml
+runtime_framework_compat = true   # 1.0.34：探测到框架缺少执行前事件时在内存里补一层；
+                                  # 已打补丁 / 上游原生则不动；不写任何文件
+```
+
+**它做了什么**（等价 `framework-patch/llm_tool_call-pre-events.patch` **二版**）：
+
+- 补发 `before_action_call` / `before_tool_call`，参数与官方发布点同形：
+  `signature`（`插件名:action:动作名`）、`action_name` / `tool_name`、`args`、
+  `message`、`stream_id`；
+- 订阅者写回的 `args` 会交给原函数（所以「生图前改提示词」真的生效）；
+- **没有订阅者时一个事件都不发**（先 `get_subscribers` 判断，与框架自己的发布点同一口径）；
+- 只改**内存**：不写任何文件、不改框架源码、不 import 补丁的内部符号；
+- 任何异常都只记 DEBUG（最坏等于「没装 shim」），**绝不拦住生图**；
+- 顺手把**已经 import 过** `run_tool_call` 的模块（例如
+  `src/app/plugin_system/api/llm_api.py`）里的同名别名一起指到包装函数上 ——
+  否则那些调用方拿到的还是原函数，包装等于没装。
+
+**升级框架后无需再管**：`git pull` 不会覆盖内存里的改动，也不需要重新打补丁 ——
+下次启动插件会重新探测；上游如果哪天原生支持了，插件会自动让位（`already_patched`）。
+
+> **运行时兼容的边界（不粉饰）**：包装点是 `run_tool_call`，即 agent / KFC 聊天器的
+> **工具调用**入口。`BaseAgent` 的本地组件执行（`exec_llm_usable` →
+> `create_llm_usable_execution`）不在这层里；需要那种路径也覆盖时，仍然建议打下面的
+> 静态补丁 —— 两者可以共存，插件检测到补丁后会自动不再包装。
+
+### 想打静态补丁（可选，等价方案）
+
+> ⚠️ **补丁不在插件包里**。`char_prompt_guard-1.0.34.mfp` / 插件目录只含插件自身；
 > 补丁属于框架侧改动，随**交付包**的 `framework-patch/` 目录单独提供，请先把它拷到本机（例如
 > 放到框架根旁边的任意位置），再执行下面命令；路径按你实际存放位置替换。
 
@@ -1419,12 +1502,14 @@ git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch
 补丁只改 `src/core/utils/llm_tool_call.py`，在 `_wrap_execute` 之前补发对应事件；
 没订阅者时直接跳过（对其它部署零开销），发布失败静默降级、不阻断组件执行。
 
-### 打完补丁怎么确认生效
+### 怎么确认生效（打了补丁 / 用了运行时兼容都一样）
 
-1. 启动后日志里应能看到插件的能力自检行：
+1. 启动后日志里应能看到两条自检行：能力自检（下一条）+ 框架兼容结论（`已启用框架运行时兼容`
+   或 `检测到框架已含执行前事件`）：
 
    ```
    char_prompt_guard | INFO | char_prompt_guard 运行环境自检：核心提供 before_tool_call，已同时订阅 …
+   char_prompt_guard | INFO | 已启用框架运行时兼容（等价 llm_tool_call-pre-events 补丁 v2）
    ```
 
    若这行是 `WARNING`（核心未提供 `before_tool_call`），说明核心偏旧，先更新核心。
@@ -1454,6 +1539,10 @@ git apply <交付包>/framework-patch/llm_tool_call-pre-events.patch
 
 ### 插件侧已经做的兼容
 
+- **框架兼容自动二选一（1.0.34）**：加载时探测框架有没有在发执行前事件 —— 已经在发
+  （静态补丁 / 上游原生支持）就什么都不做，没发才在**内存里**给 `run_tool_call` 补一层
+  （详见[上一节](#框架兼容静态补丁-或-运行时兼容1034-起二选一自动检测)）；
+  **不写任何文件**、认不出就不装、任何异常都不拦住生图；
 - **同时订阅 `before_action_call` 与 `before_tool_call`**，并兼容 agent 侧传来的
   工具名格式（`action-share_photo` 这种带前缀的写法）；
 - **内置目标表同时覆盖 nai_artist 新旧动作名**（1.3.6+ 的 `share_photo` / `share_drawing`
@@ -1479,7 +1568,9 @@ manifest 声明的是 `min_core_version = "1.0.0"`，**故意保持宽松**：�
 ## 依赖
 
 - Neo-MoFox `>= 1.0.0`（实测基于 `CORE_VERSION = 1.2.0`）
-- **框架补丁**：见上节（不打补丁则 agent 聊天器下不生效）。补丁随交付包提供，不在插件包内
+- **框架补丁**：**1.0.34 起不再是必需的** —— 插件加载时自动探测，缺事件就在内存里补一层
+  （见[框架兼容](#框架兼容静态补丁-或-运行时兼容1034-起二选一自动检测)）；静态补丁仍是
+  「覆盖所有执行路径」的可选方案，随交付包提供、不在插件包内
 - 生图插件（至少一个）：[nai_artist](https://github.com/bingyv92/nai_artist) 或 [image_generator_plugin-neo](https://github.com/tt-P607/image_generator_plugin-neo)
 
 > **本插件仓库/插件包不包含任何上游生图插件的源码**。上面两个插件请从各自仓库自行安装，

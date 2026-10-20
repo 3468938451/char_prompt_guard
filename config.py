@@ -195,6 +195,24 @@ class CharPromptGuardConfig(BaseConfig):
                 "general.enabled = false 或 targets.enabled = false 时同样不注入"
             ),
         )
+        runtime_framework_compat: bool = Field(
+            default=True,
+            description=(
+                "框架运行时兼容（1.0.34 起）：插件加载后探测 agent 聊天器的工具调用路径"
+                "（src/core/utils/llm_tool_call.py）**是否已经在发「执行前事件」**——"
+                "没发就在**内存里**给 run_tool_call 补一层包装（等价 "
+                "framework-patch/llm_tool_call-pre-events.patch 二版：补发 "
+                "before_action_call / before_tool_call，并把订阅者写回的 args 交给原函数；"
+                "**不写任何文件**、不改框架源码、不 import 补丁的内部符号），"
+                "让没打补丁的用户也能开箱生效；"
+                "**已打静态补丁（或上游将来原生支持）就一个字都不动**，一行代码都不执行；"
+                "认不出框架结构（模块 / 函数不在、源码读不到）时同样**不装**"
+                "（宁可不生效，也不重复发事件），行为与 1.0.33 逐字一致。"
+                "任何异常都只记日志，**绝不拦住生图**。"
+                "关闭后不探测、不包装，需要自己应用 "
+                "framework-patch/llm_tool_call-pre-events.patch"
+            ),
+        )
 
     @config_section("roster")
     class RosterSection(SectionBase):

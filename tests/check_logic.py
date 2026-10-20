@@ -265,6 +265,22 @@ C109~C111 新增；**原 C1~C103 与 C105/C106 的断言一个字都没改**）�
 | C114 | **归属句式的边界只放行句末语气词**（审计 🟠1）：1.0.31 放行的是**整张** ``outfit._OUTFIT_STOP_CHARS``（``的`` / ``是`` / ``我`` / ``你`` / ``都`` … 全在里面），于是「爱莉的**婚纱是**我挑的」「流萤的**校服被**雨淋了」「画的**婚纱的**话」这类**不含穿着意图**的话也会被当成穿着候选（1.0.30 不会）—— 抓错会把衣服画错，与"宁少勿多"相悖，而文档只承诺放行**句末语气词**。1.0.32 起边界只用 ``outfit._OUTFIT_TAIL_PARTICLES``（``吧吗呢啊呀哦嘛呗啦咯喔``）。两跑合一：① **单元级** —— 模式在"虚词尾巴"上不匹配（``是`` / ``被`` / ``的`` / ``我``）、在 C113 的语气词尾巴与 C107 的标点/串尾上照旧匹配，并钉住语气词表是 ``_OUTFIT_STOP_CHARS`` 的**真子集**；② **端到端** —— 四段不含穿着意图的话判定角色照旧注入、但**不注入**穿着（无 ``（穿着：`` / ``已追加穿着`` / ``穿着类型解析`` / ``穿着解析(LLM)``）、0 次模型调用，另加一条 ``画爱莉的婚纱吧～`` 的**正例**（C113 的形状）防收窄过头 |
 | C115 | **触发消息是追加指令时不再"只看前一条的单名"**（审计 🟠2）：``画爱莉和流萤一起``（2 分钟前）→ ``流萤这张不错``（1 分钟前）→ 触发 ``一起画吧``。主题跟踪结论 = **流萤** + ``换人还是追加不确定``（间隔 1 分钟 < ``multi.multi_window_minutes``）。1.0.31 的让位会直接按前一条的单名拍板（``判定依据=用户点名(最新消息):流萤``）并 return，**压过**主题跟踪的不确定与 LLM 仲裁 → 该画两人只画一人；1.0.32 起 ``handler._additive_trigger_needs_tracking`` 判定"追加指令 + 原来会生效的结论没定死一个人"→ **不让位**，走跟踪 + LLM 仲裁（假模型给出两人）→ **两人同框**、日志出现 ``用户最新点名不采用（1.0.32）`` / ``换人还是追加不确定`` / ``判定依据=LLM 仲裁``，且**不出现** ``判定依据=用户点名(最新消息)``。反例（同一段上文、触发换成 ``都试试？``）：兜底只认"追加指令"，含 ``？`` 的疑问句照旧让位给 ``流萤这张不错``（``判定依据=用户点名(最新消息):流萤``）、一次模型都不问 —— 反例通过即证明没有"让位过头"。``FakeOutfit`` 在这条里同样不用加桩（本用例不开 ``[outfits]``） |
 
+**1.0.34 只加三条用例（C116~C118 新增；原 C1~C115 的断言一条都没改、也没放宽）**：
+这一版把「用户必须手工打框架补丁」这条依赖，改成**插件自己在运行时探测 + 内存里补一层**
+（新模块 ``compat``，只改内存、不写任何文件）。三条用例全部用**离线桩**跑：假宿主模块 +
+假事件总线（替换 ``compat.host_module`` / ``compat.event_bus`` / ``compat.event_type``
+三个接缝），**不真导入** ``src.core.utils.llm_tool_call``，也不需要框架真的在发事件。
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C116 | **已打静态补丁就一个字都不改**：假宿主 ``run_tool_call`` 的**源码**里带着补丁标记（事件名 ``BEFORE_ACTION_CALL`` / ``BEFORE_TOOL_CALL``、``.publish(``、写回 ``"args"``）→ ``install()`` 返回 ``already_patched``，模块属性仍是**同一个函数对象**、也**没有**包装标记（"已打补丁的机器一行代码都不执行"） |
+| C117 | **没打补丁就补上，而且真的能改写参数**：未打补丁的假宿主 → ``install()`` 返回 ``applied``，``run_tool_call`` 被 ``functools.wraps`` 包装（``__wrapped__`` 指回原函数）。三跑：**A** 有订阅者 → 恰好发一次 ``before_action_call``（带 ``signature`` / ``action_name`` / ``args`` / ``message`` / ``stream_id``）、假订阅者改写 ``args`` → **原函数收到的就是改写后的 calls**（"生图前改提示词"的最小闭环）；**B** 清空订阅者 → **一个事件都不发**、原函数收到原样参数（零开销路径）；**C** ``tool-*`` 名字 → 发 ``before_tool_call``、``tool_name`` 与签名都对（agent 路径两种组件都覆盖） |
+| C118 | **三条兜底**：① ``general.runtime_framework_compat=false`` → ``disabled`` 且不替换；② 包装后原函数抛异常 → 异常**照旧向上传播**（不吞；抛之前事件照发）、且**不打乱后续调用**（第二次照常发事件、照常执行）；③ 桩里没有 ``run_tool_call``（以及"有但不是可调用"）→ ``unsupported``、不崩、不改任何东西 |
+
+``compat.install()`` 的返回值共五种（``disabled`` / ``unsupported`` /
+``already_patched`` / ``already_installed`` / ``applied``），插件入口按它各打一条
+INFO / WARNING（``unsupported`` 是唯一按 WARNING 打的那种）。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -278,11 +294,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
+import inspect
 import json
 import logging
 import os
 import sys
 import time
+import types
 import urllib.parse
 from pathlib import Path
 from typing import Annotated, Self
@@ -1023,6 +1042,196 @@ LATEST_NAMED_OUTFIT_REQUEST = "画爱莉的婚纱～"
 LATEST_NAMED_STICKY_REQUEST = "那画流萤吧"
 #: C108：画面描述里**已经写着流萤**的标签（1.0.19 的期望集合对账要替换掉它）
 FIREFLY_SCENE = f"{TAG_FIREFLY}, 银白色长发的少女站在镜头前，一身蓝裙，手里握着长杖"
+
+
+# ── 1.0.34（框架运行时兼容 shim）用例的离线桩 ───────────────────────────
+#
+# 三条约束：① **不真导入**宿主模块 ``src.core.utils.llm_tool_call``（``compat``
+# 留了 ``host_module`` 接缝，这里换成假模块，取不到真框架也能跑）；② 假模块里的
+# ``run_tool_call`` 是**本文件里的真函数**，于是 ``inspect.getsource`` 读得到源码
+# —— C116 靠"源码里有没有补丁标记"判定，用 lambda / exec 造的函数读不到源码；
+# ③ 事件总线用 :class:`FakeEventBus`（形状对齐真总线的 ``get_subscribers`` /
+# ``publish``），只记录"发布了什么、谁改了 args"。
+
+#: 假宿主函数收到的 ``calls``（每次调用一行，按先后顺序；用列表避免写 global）
+_STUB_CALLS: list[list] = []
+#: C118 ②：让假宿主函数在**补完事件之后**抛异常（验证异常不吞、不打乱后续调用）
+_STUB_STATE: dict = {"fail": False}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FakeToolCall:
+    """宿主 ``ToolCall`` 的替身（真实实现就是 frozen dataclass + slots）。"""
+
+    id: str | None
+    name: str
+    args: dict
+
+
+class FakeUsableAction:
+    """宿主组件类替身（action 分支）：用例只用到 ``get_signature()``。"""
+
+    @classmethod
+    def get_signature(cls) -> str:
+        """与真实 Action 同形：``插件名:action:动作名``。"""
+        return "nai_artist:action:share_photo"
+
+
+class FakeUsableTool:
+    """宿主组件类替身（tool 分支）：用例只用到 ``get_signature()``。"""
+
+    @classmethod
+    def get_signature(cls) -> str:
+        """与真实 Tool 同形：``插件名:tool:工具名``。"""
+        return "image_generator_plugin-neo:tool:draw_image"
+
+
+class FakeUsableMap:
+    """宿主 ``ToolRegistry`` 的替身：只需要 ``get(name)``。"""
+
+    def __init__(self, mapping: dict) -> None:
+        self._mapping = mapping
+
+    def get(self, name: str):
+        """按调用名取组件类（取不到返回 None，与真实注册表一致）。"""
+        return self._mapping.get(name)
+
+
+class FakeEventType:
+    """宿主 ``EventType`` 的替身：只用到两个执行前事件名。"""
+
+    BEFORE_ACTION_CALL = "before_action_call"
+    BEFORE_TOOL_CALL = "before_tool_call"
+
+
+class FakeEventBus:
+    """宿主事件总线的替身：``get_subscribers`` + 链式 ``publish``。
+
+    - ``received``：每次 publish 的**入参**（用例据它断言事件里到底带了什么）；
+    - ``published``：每次 publish 的**最终** params（订阅者改写之后的那一份）。
+    """
+
+    def __init__(self) -> None:
+        self._subscribers: dict[str, list] = {}
+        self.received: list[tuple[str, dict]] = []
+        self.published: list[tuple[str, dict]] = []
+
+    def subscribe(self, event_name: str, handler) -> None:
+        """登记一个订阅者（与真总线的 ``subscribe`` 同形，忽略优先级）。"""
+        self._subscribers.setdefault(event_name, []).append(handler)
+
+    def clear(self) -> None:
+        """清空订阅者（C117 用它验证"没有订阅者时零开销"）。"""
+        self._subscribers.clear()
+
+    def get_subscribers(self, event_name: str) -> list:
+        """返回订阅者列表（与真总线一致：没有订阅者时返回空列表）。"""
+        return list(self._subscribers.get(event_name, ()))
+
+    async def publish(self, event_name: str, params: dict):
+        """按订阅顺序链式发布（真总线还做 key 集合校验，这里只保留语义）。
+
+        订阅者**同步 / 异步都支持** —— 与真总线的 ``_execute_handler`` 同一口径
+        （插件侧的真实订阅者是 ``async def execute``）。
+        """
+        self.received.append((str(event_name), dict(params)))
+        current = dict(params)
+        expected = set(current)
+        for handler in self.get_subscribers(event_name):
+            outcome = handler(event_name, dict(current))
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            _decision, next_params = outcome
+            if isinstance(next_params, dict) and set(next_params) == expected:
+                current = next_params
+        self.published.append((str(event_name), dict(current)))
+        return None, current
+
+
+def _fake_event_type(name: str):
+    """假 ``EventType`` 查表（只认两个执行前事件名）；不认识就返回 ``None``。"""
+    return getattr(FakeEventType, name, None)
+
+
+class FakeHost:
+    """上下文管理器：把 ``compat`` 的三个接缝换成离线桩（C116~C118 用）。"""
+
+    def __init__(self, module: types.ModuleType) -> None:
+        self.module = module
+        self.bus = FakeEventBus()
+        self._saved: list = []
+
+    def __enter__(self) -> Self:
+        from .. import compat
+
+        self._saved = [compat.host_module, compat.event_bus, compat.event_type]
+
+        def fake_host_module():
+            return self.module
+
+        def fake_event_bus():
+            return self.bus
+
+        compat.host_module = fake_host_module  # type: ignore[assignment]
+        compat.event_bus = fake_event_bus  # type: ignore[assignment]
+        compat.event_type = _fake_event_type  # type: ignore[assignment]
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        from .. import compat
+
+        if self._saved:
+            compat.host_module, compat.event_bus, compat.event_type = self._saved
+        return False
+
+
+async def _stub_patched_run_tool_call(**_kwargs):
+    """假宿主 ``run_tool_call``：**已经打过静态补丁**（C116：识别到就不再包装）。
+
+    真实补丁的源码里同时出现下面三类标记，本替身原样带着它们 ——
+    ``compat.looks_statically_patched`` 就是对 ``inspect.getsource`` 做这三类子串匹配。
+    """
+    event_names = ("BEFORE_ACTION_CALL", "BEFORE_TOOL_CALL")
+    publish_call = "event_bus.publish(event_name, params)"
+    return {"events": event_names, "publish": publish_call, "args": dict(_kwargs)}
+
+
+async def _stub_plain_run_tool_call(
+    *,
+    calls,
+    response=None,
+    usable_map=None,
+    trigger_msg=None,
+    plugin=None,
+    stream_id=None,
+    resolve_component_plugin=None,
+    logger_name="chatter",
+    display_name="",
+    task_observer=None,
+):
+    """假宿主 ``run_tool_call``：**未打补丁**（C117/C118：包装后才会有事件）。
+
+    刻意与真实函数同形（全关键字参数 + 协程），并记录收到的 ``calls`` ——
+    用例据最后一行断言"订阅者对 args 的修改被写回并传给了原函数"。
+    注意：本函数的源码里**不能**出现补丁标记，否则会被判定成"已打补丁"。
+    """
+    _STUB_CALLS.append(list(calls))
+    if _STUB_STATE["fail"]:
+        raise RuntimeError("宿主原函数抛出的异常")
+    return [(True, True)]
+
+
+def _noop_subscriber(_event_name: str, params: dict):
+    """假订阅者：什么都不改（返回同一份 params，key 集合不变）。"""
+    return EventDecision.SUCCESS, params
+
+
+def _fake_host_module(func=None) -> types.ModuleType:
+    """造一个假宿主模块（``src.core.utils.llm_tool_call`` 的替身）。"""
+    module = types.ModuleType("cpg_fake_llm_tool_call")
+    if func is not None:
+        module.run_tool_call = func
+    return module
 
 
 def natural_params(
@@ -6339,6 +6548,275 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C115 触发消息是追加指令（一起画吧）→ 不让位，交回主题跟踪 + LLM 仲裁",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C116（1.0.34）已打静态补丁 → 认出来，且一个字都不改 ──────────────────
+    # 「已打补丁的机器一行代码都不执行」是这一版的硬约束：检测口径是「事件名 +
+    # .publish( + 写回 "args"」三类标记同时出现在宿主源码里（见
+    # ``compat.looks_statically_patched``）。桩的 run_tool_call **源码**里带着
+    # 这三类串，于是 install() 必须返回 already_patched，且模块属性仍是**同一个
+    # 函数对象**（没被包装、也没打包装标记）。
+    try:
+        from .. import compat
+
+        module = _fake_host_module(_stub_patched_run_tool_call)
+        original = module.run_tool_call
+        with FakeHost(module):
+            status = compat.install(logging.getLogger("char_prompt_guard"))
+        unchanged = module.run_tool_call is original
+        flagged = bool(getattr(module.run_tool_call, "__cpg_runtime_wrapped__", False))
+        check(
+            "C116 已打静态补丁 → already_patched（函数对象未被替换、未打包装标记）",
+            status == "already_patched" and unchanged and not flagged,
+            f"status={status!r} 同一对象={unchanged} 包装标记={flagged}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C116 已打静态补丁 → already_patched（函数对象未被替换、未打包装标记）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C117（1.0.34）未打补丁 → applied，事件真的发布 / args 真的写回 ─────────
+    # 三跑（合成一条用例，与 C111/C113 一样只占一个 check）：
+    #   A. 有订阅者：run_tool_call 被包装 → 事件带 signature / action_name / args /
+    #      message / stream_id 发到 before_action_call → 订阅者改写 args →
+    #      **原函数收到的就是改写后的 calls**（"插件真的生效"的最小闭环）；
+    #   B. 清空订阅者：**连事件都不发**（零开销路径），原函数收到原样的参数；
+    #   C. tool 分支：``tool-*`` 名字 → 发 before_tool_call，tool_name / 签名都对。
+    try:
+        from .. import compat
+
+        _STUB_CALLS.clear()
+        _STUB_STATE["fail"] = False
+        module = _fake_host_module(_stub_plain_run_tool_call)
+        original = module.run_tool_call
+        raw_content = "帮我画一张她战斗的样子"
+        message = FakeMessage("画爱莉希雅吧", stream_id="s-c117")
+        runs: list[tuple[str, bool, str]] = []
+
+        def subscriber(_event_name: str, params: dict):
+            """假订阅者：模拟插件在生图前把角色补进提示词。"""
+            params["args"] = {
+                **params["args"],
+                "content": f"{params['args']['content']}，已补角色",
+            }
+            return EventDecision.SUCCESS, params
+
+        def make_calls(call_id: str) -> list:
+            """一次 tool call 的替身（与 agent 聊天器给的名字同形：action- 前缀）。"""
+            return [
+                FakeToolCall(
+                    id=call_id,
+                    name="action-share_photo",
+                    args={"content": raw_content},
+                )
+            ]
+
+        with FakeHost(module) as host:
+            host.bus.subscribe("before_action_call", subscriber)
+            status = compat.install(logging.getLogger("char_prompt_guard"))
+            await module.run_tool_call(
+                calls=make_calls("call-1"),
+                response=None,
+                usable_map=FakeUsableMap({"action-share_photo": FakeUsableAction}),
+                trigger_msg=message,
+                plugin=None,
+                stream_id="s-c117",
+            )
+            event_name, received = (
+                host.bus.received[-1] if host.bus.received else ("", {})
+            )
+            delivered = _STUB_CALLS[-1][0].args.get("content", "") if _STUB_CALLS else ""
+            runs.append(
+                (
+                    "A 有订阅者：发布执行前事件 + 回写 args",
+                    status == "applied"
+                    and module.run_tool_call is not original
+                    and getattr(module.run_tool_call, "__cpg_runtime_wrapped__", False)
+                    is True
+                    and getattr(module.run_tool_call, "__wrapped__", None) is original
+                    and len(host.bus.received) == 1
+                    and event_name == "before_action_call"
+                    and received.get("signature") == "nai_artist:action:share_photo"
+                    and received.get("action_name") == "share_photo"
+                    and received.get("args") == {"content": raw_content}
+                    and received.get("message") is message
+                    and received.get("stream_id") == "s-c117"
+                    and delivered == f"{raw_content}，已补角色",
+                    (f"status={status!r} 发布={host.bus.received!r} "
+                    f"原函数收到={delivered!r}"),
+                )
+            )
+
+            # B. 没有订阅者 → 零开销路径：不发事件、原样调用原函数
+            host.bus.clear()
+            await module.run_tool_call(
+                calls=make_calls("call-2"),
+                response=None,
+                usable_map=FakeUsableMap({"action-share_photo": FakeUsableAction}),
+                trigger_msg=message,
+                stream_id="s-c117",
+            )
+            runs.append(
+                (
+                    "B 无订阅者：不发事件、原样调用（零开销）",
+                    len(host.bus.received) == 1  # ★ 没有新增发布
+                    and _STUB_CALLS[-1][0].args.get("content") == raw_content,
+                    (f"发布次数={len(host.bus.received)} "
+                    f"原函数收到={_STUB_CALLS[-1][0].args!r}"),
+                )
+            )
+
+            # C. tool 分支：注册表里是 ``tool-*`` 名字 → 发 before_tool_call（带 tool_name）
+            host.bus.clear()
+            host.bus.subscribe("before_tool_call", _noop_subscriber)
+            await module.run_tool_call(
+                calls=[
+                    FakeToolCall(
+                        id="call-3",
+                        name="tool-draw_image",
+                        args={"content": "画一张"},
+                    )
+                ],
+                response=None,
+                usable_map=FakeUsableMap({"tool-draw_image": FakeUsableTool}),
+                trigger_msg=message,
+                stream_id="s-c117",
+            )
+            tool_event, tool_received = (
+                host.bus.received[-1] if host.bus.received else ("", {})
+            )
+            runs.append(
+                (
+                    "C tool 分支：发 before_tool_call（tool_name / signature 都对）",
+                    tool_event == "before_tool_call"
+                    and tool_received.get("tool_name") == "draw_image"
+                    and tool_received.get("signature")
+                    == "image_generator_plugin-neo:tool:draw_image"
+                    and tool_received.get("stream_id") == "s-c117",
+                    f"事件={tool_event!r} 参数={tool_received!r}",
+                )
+            )
+
+        check(
+            "C117 未打补丁 → applied（发布执行前事件，订阅者改写的 args 传给原函数）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C117 未打补丁 → applied（发布执行前事件，订阅者改写的 args 传给原函数）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C118（1.0.34）三条兜底：开关关掉 / 原函数抛异常 / 认不出结构 ──────────
+    # ① ``general.runtime_framework_compat=false`` → disabled，函数对象不动；
+    # ② 包装之后原函数抛异常 → **异常照旧向上传播**（不吞），且**不打乱后续调用**
+    #    （第二次照常发布事件、照常执行 —— 一次失败不该把包装层搞坏）；
+    # ③ 桩里没有 run_tool_call（以及"有但不是可调用"）→ unsupported，不崩、不改。
+    try:
+        from .. import compat
+
+        runs: list[tuple[str, bool, str]] = []
+
+        # ① 配置关掉
+        off_module = _fake_host_module(_stub_plain_run_tool_call)
+        off_original = off_module.run_tool_call
+        cfg = CharPromptGuardConfig()
+        cfg.general.runtime_framework_compat = False
+        with FakeHost(off_module):
+            off_status = compat.install(logging.getLogger("char_prompt_guard"), cfg)
+        runs.append(
+            (
+                "① 配置关掉 → disabled 且未替换",
+                off_status == "disabled" and off_module.run_tool_call is off_original,
+                (f"status={off_status!r} "
+                f"同一对象={off_module.run_tool_call is off_original}"),
+            )
+        )
+
+        # ② 包装后原函数抛异常 → 异常向上传播；第二次调用照常工作
+        _STUB_CALLS.clear()
+        _STUB_STATE["fail"] = False
+        fail_module = _fake_host_module(_stub_plain_run_tool_call)
+        message = FakeMessage("画爱莉希雅吧", stream_id="s-c118")
+        raised = ""
+        with FakeHost(fail_module) as host:
+            host.bus.subscribe("before_action_call", _noop_subscriber)
+            compat.install(logging.getLogger("char_prompt_guard"))
+            _STUB_STATE["fail"] = True
+            try:
+                await fail_module.run_tool_call(
+                    calls=[
+                        FakeToolCall(
+                            id="call-1",
+                            name="action-share_photo",
+                            args={"content": "画一张"},
+                        )
+                    ],
+                    response=None,
+                    usable_map=FakeUsableMap({"action-share_photo": FakeUsableAction}),
+                    trigger_msg=message,
+                )
+            except RuntimeError as e:
+                raised = str(e)
+            first_events = len(host.bus.received)
+            _STUB_STATE["fail"] = False
+            result = await fail_module.run_tool_call(
+                calls=[
+                    FakeToolCall(
+                        id="call-2",
+                        name="action-share_photo",
+                        args={"content": "画一张"},
+                    )
+                ],
+                response=None,
+                usable_map=FakeUsableMap({"action-share_photo": FakeUsableAction}),
+                trigger_msg=message,
+            )
+        runs.append(
+            (
+                "② 原函数抛异常 → 向上传播且不影响后续调用",
+                raised == "宿主原函数抛出的异常"
+                and first_events == 1  # ★ 抛异常之前事件照发（"执行前"）
+                and result == [(True, True)]
+                and len(_STUB_CALLS) == 2
+                and len(host.bus.received) == 2,
+                (f"raised={raised!r} 事件={len(host.bus.received)} "
+                f"第二次={result!r} 收到次数={len(_STUB_CALLS)}"),
+            )
+        )
+
+        # ③ 桩里没有 run_tool_call / 有但不是可调用 → unsupported（不崩）
+        empty_module = _fake_host_module(None)
+        broken_module = _fake_host_module(None)
+        broken_module.run_tool_call = 42
+        with FakeHost(empty_module):
+            empty_status = compat.install(logging.getLogger("char_prompt_guard"))
+        with FakeHost(broken_module):
+            broken_status = compat.install(logging.getLogger("char_prompt_guard"))
+        runs.append(
+            (
+                "③ 没有 run_tool_call → unsupported（不崩、不改）",
+                empty_status == "unsupported"
+                and broken_status == "unsupported"
+                and broken_module.run_tool_call == 42,
+                f"没有={empty_status!r} 不可调用={broken_status!r}",
+            )
+        )
+
+        check(
+            "C118 开关关掉 / 原函数抛异常 / 没有 run_tool_call 三条兜底",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C118 开关关掉 / 原函数抛异常 / 没有 run_tool_call 三条兜底",
             False,
             f"{type(e).__name__}: {e}",
         )

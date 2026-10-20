@@ -42,6 +42,7 @@ PLUGIN_NAME = PLUGIN_DIR.name
 MODULES = [
     PLUGIN_NAME,
     f"{PLUGIN_NAME}.character",
+    f"{PLUGIN_NAME}.compat",
     f"{PLUGIN_NAME}.config",
     f"{PLUGIN_NAME}.handler",
     f"{PLUGIN_NAME}.memory",
@@ -241,6 +242,12 @@ def main() -> int:
             "1.0.17 默认注入参数说明（tag_first_hint）",
             cfg.general.tag_first_hint is True,
             f"tag_first_hint={cfg.general.tag_first_hint!r}",
+        )
+        # 1.0.34 新增：框架运行时兼容（探测到框架不发执行前事件时，在内存里补一层）
+        check(
+            "1.0.34 默认启用框架运行时兼容（runtime_framework_compat）",
+            cfg.general.runtime_framework_compat is True,
+            f"runtime_framework_compat={cfg.general.runtime_framework_compat!r}",
         )
         # 1.0.18 新增：外部记忆库（[memory] 节，Booku Memory）
         check(
@@ -1183,6 +1190,67 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         check("皮肤/时装模块可调用", False, f"{type(e).__name__}: {e}")
+
+    # ── 5.23 框架运行时兼容（1.0.34）：五种状态 + 静态补丁检测口径 ────────
+    # 这里只做「装得上、判得对」的冒烟 —— 完整的安装 / 包装 / 回写行为在
+    # check_logic.py 的 C116~C118（那里用离线桩，不真导入宿主模块）。
+    # 本节点**不调用 install()**：那会在本进程里真的替换宿主模块的函数，
+    # 冒烟脚本不该产生这种副作用。
+    try:
+        from .. import compat
+
+        statuses = {
+            compat.STATUS_DISABLED,
+            compat.STATUS_UNSUPPORTED,
+            compat.STATUS_ALREADY_PATCHED,
+            compat.STATUS_ALREADY_INSTALLED,
+            compat.STATUS_APPLIED,
+        }
+        check(
+            "1.0.34 install 的 5 种状态都有定义、入口可调用",
+            callable(compat.install) and len(statuses) == 5,
+            f"statuses={sorted(statuses)!r}",
+        )
+        # 插件入口按状态各打一条 INFO / WARNING：五种状态都要有文案、且互不重复
+        from ..plugin import _RUNTIME_COMPAT_LOG, _RUNTIME_COMPAT_WARNING
+
+        check(
+            "1.0.34 五种状态各有一条日志文案（unsupported 是唯一的 WARNING）",
+            set(_RUNTIME_COMPAT_LOG) == statuses
+            and _RUNTIME_COMPAT_WARNING == compat.STATUS_UNSUPPORTED
+            and len(set(_RUNTIME_COMPAT_LOG.values())) == 5,
+            f"WARNING={_RUNTIME_COMPAT_WARNING!r} 文案={sorted(_RUNTIME_COMPAT_LOG)!r}",
+        )
+        # 三类标记齐了才算「已打补丁」：少任何一类都不能误判（否则会重复发事件）
+        patched_src = (
+            "event = EventType.BEFORE_ACTION_CALL\n"
+            'modified = {"args": kwargs}\n'
+            "await bus.publish(event, params)\n"
+        )
+        check(
+            "1.0.34 静态补丁检测：三类标记齐了才判「已打补丁」，缺一类就判「没有」",
+            compat.looks_statically_patched(patched_src) is True
+            and compat.looks_statically_patched("args = dict(call.args)") is False
+            and compat.looks_statically_patched(
+                "event = EventType.BEFORE_ACTION_CALL\n"
+                'modified = {"args": kwargs}\n'
+            )
+            is False  # 缺 .publish(
+            and compat.looks_statically_patched(
+                'modified = {"args": kwargs}\nbws.publish(e, p)\n'
+            )
+            is False,  # 缺事件名
+            f"patched_src={patched_src!r}",
+        )
+        check(
+            "1.0.34 宿主结构常量与实际框架路径一致（不写文件、只读结构）",
+            compat.HOST_MODULE == "src.core.utils.llm_tool_call"
+            and compat.TARGET_FUNC == "run_tool_call"
+            and compat.WRAP_FLAG == "__cpg_runtime_wrapped__",
+            f"{compat.HOST_MODULE}.{compat.TARGET_FUNC}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("框架运行时兼容模块可调用", False, f"{type(e).__name__}: {e}")
 
     print("-" * 72)
     if _failures:
