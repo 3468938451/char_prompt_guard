@@ -909,18 +909,53 @@ _QUOTED_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
 #: 主要 / 只要 / 不要 / 将要 / 快要 / 必要 / 概要 / 摘要 / 纪要 / 既要 / 又要 /
 #: 硬要 / 偏要」里的「要」也不是用户点名的动词。
 #: ``披上X这层壳`` 的壳前允许「这层 / 这具 / 这个 / 的」或直接接「壳」。
-_OUTSIDE_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"披上({_NAME_CHAR_CLASS}{{2,12}})(?:这层|这具|这个|的)?壳"),
-    re.compile(rf"扮演({_NAME_CHAR_CLASS}{{2,12}})"),
-    re.compile(
-        rf"(?<![计动漫壁图年油国名刻勾描绘作策规笔插版字诗贴沙瓷漆岩])"
-        rf"画({_NAME_CHAR_CLASS}{{2,12}})"
+_OUTSIDE_SENTENCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "披上X这层壳",
+        re.compile(rf"披上({_NAME_CHAR_CLASS}{{2,12}})(?:这层|这具|这个|的)?壳"),
     ),
-    re.compile(rf"(?<![重需主只不将快必概摘纪既又硬偏])要({_NAME_CHAR_CLASS}{{2,12}})"),
-    re.compile(rf"看看({_NAME_CHAR_CLASS}{{2,12}})"),
-    re.compile(rf"换成({_NAME_CHAR_CLASS}{{2,12}})"),
-    re.compile(rf"来张({_NAME_CHAR_CLASS}{{2,12}})"),
+    ("按X的样子", re.compile(rf"按({_NAME_CHAR_CLASS}{{2,12}})的样子")),
+    ("按X那层壳", re.compile(rf"按({_NAME_CHAR_CLASS}{{2,12}})那层壳")),
+    # 裸的「X那层壳」：覆盖「要X那层壳上来」「我要的就是X那层壳」这类说法
+    ("X那层壳", re.compile(rf"({_NAME_CHAR_CLASS}{{2,12}})那层壳")),
+    ("X的那种", re.compile(rf"({_NAME_CHAR_CLASS}{{2,12}})的那种")),
+    ("按X来", re.compile(rf"按({_NAME_CHAR_CLASS}{{2,12}})来")),
+    ("摆一张X", re.compile(rf"摆一张({_NAME_CHAR_CLASS}{{2,12}})")),
+    ("画一张X", re.compile(rf"画一张({_NAME_CHAR_CLASS}{{2,12}})")),
+    ("扮演X", re.compile(rf"扮演({_NAME_CHAR_CLASS}{{2,12}})")),
+    (
+        "画X",
+        re.compile(
+            rf"(?<![计动漫壁图年油国名刻勾描绘作策规笔插版字诗贴沙瓷漆岩])"
+            rf"画({_NAME_CHAR_CLASS}{{2,12}})"
+        ),
+    ),
+    (
+        "要X",
+        re.compile(rf"(?<![重需主只不将快必概摘纪既又硬偏])要({_NAME_CHAR_CLASS}{{2,12}})"),
+    ),
+    ("看看X", re.compile(rf"看看({_NAME_CHAR_CLASS}{{2,12}})")),
+    ("换成X", re.compile(rf"换成({_NAME_CHAR_CLASS}{{2,12}})")),
+    ("来张X", re.compile(rf"来张({_NAME_CHAR_CLASS}{{2,12}})")),
 )
+
+#: **1.0.373 新增：多人枚举**（``A、B 和 C`` / ``A，B，还有 C`` / ``A和B还有C`` /
+#: ``画 A、B、C 三个人``）—— 顿号 / 逗号串起来的名字列表。
+#:
+#: 只在消息里**同时出现人数词**（:data:`_OUTSIDE_ENUM_COUNT_PATTERN`）时才启用：
+#: 没有人数词时，``银白色长发、蓝裙、长杖`` 这种画面要素列表会被当成三个"名字"，
+#: 而它们会进「表外点名候选集」，把本次判定带偏。1.0.373 的取舍是**宁可漏** ——
+#: 漏了只是退回逐条句式的旧行为，误判却会让守卫本次弃权（宁可缺，但也不能无谓地缺）。
+_OUTSIDE_ENUM_LIST_PATTERN = re.compile(
+    rf"({_NAME_CHAR_CLASS}{{2,12}}(?:\s*[、,，]\s*{_NAME_CHAR_CLASS}{{2,12}})+"
+    rf"(?:\s*(?:还有|和|与|＋|\+)\s*{_NAME_CHAR_CLASS}{{2,12}})*)"
+)
+#: 人数词：``三个人 / 两个人 / 3 人 / 3人 / 双人 / 多人``。
+_OUTSIDE_ENUM_COUNT_PATTERN = re.compile(
+    r"(?:[两二三四五六七八九3-9]\s*(?:个|位|名|人)|双人|多人)"
+)
+#: 枚举列表的分隔符（``还有`` 也算：「A 和 B 还有 C」）。
+_OUTSIDE_ENUM_SPLIT_PATTERN = re.compile(r"[、,，]|还有|和|与|＋|\+")
 
 #: 「表外点名」的小黑名单：这些词指代词 / 泛指 / 画面元素本身，不是角色名。
 #:
@@ -984,6 +1019,29 @@ OUTSIDE_NAME_BLACKLIST: tuple[str, ...] = (
     "其他",
     "每个",
     "所有",
+    # 1.0.373：``按X来`` / ``X的那种`` 这两条新句式最容易误抓的"非名字"词
+    "顺序",
+    "步骤",
+    "计划",
+    "要求",
+    "习惯",
+    "想法",
+    "心情",
+    "风格",
+    "设定",
+    "节奏",
+    "剧情",
+    "剧本",
+    "模板",
+    "说明",
+    "提示",
+    "规则",
+    "参数",
+    "配置",
+    "参考",
+    "比例",
+    "尺寸",
+    "角度",
 )
 
 #: 引号候选的「不像名字」字符：虚词 / 语气词 / 代词 / 量词 / 常见动词。
@@ -1087,6 +1145,14 @@ OUTSIDE_NAME_SCENE_WORDS: tuple[str, ...] = (
     "远景",
     "中景",
     "氛围",
+    # 1.0.373：``摆一张X`` / ``画一张X`` 后面紧跟的常见静物（不是角色名）
+    "桌子",
+    "椅子",
+    "沙发",
+    "床铺",
+    "窗帘",
+    "地毯",
+    "花束",
 )
 
 
@@ -1176,6 +1242,7 @@ def extract_outside_names(
     exclude: Iterable[str] = (),
     *,
     dropped: list[str] | None = None,
+    labels: dict[str, str] | None = None,
 ) -> list[str]:
     """从一段**用户消息**里提取「用户点名的角色表外角色名」（1.0.20）。
 
@@ -1186,6 +1253,10 @@ def extract_outside_names(
     2. **句式模式**：``披上X这层壳`` / ``扮演X`` / ``画X`` / ``要X`` / ``看看X`` /
        ``换成X`` / ``来张X``（X = 2~12 个非标点字符；过滤用
        :data:`_SENTENCE_NAME_STOP_CHARS` + :data:`OUTSIDE_NAME_SCENE_WORDS`）；
+       **1.0.373 追加**：``按X来`` / ``按X的样子`` / ``按X那层壳`` / ``X那层壳`` /
+       ``X的那种`` / ``摆一张X`` / ``画一张X``，以及**多人枚举**
+       （``X、Y 和 Z``，只在同一条消息里有人数词时才扫）；每条句式都带标签，
+       供 ``labels`` 出参与日志使用；
     3. **过滤**：长度 / 纯标点 / 黑名单 / 角色表内的名字与别名（见 :func:`_name_like`）；
     4. **豁免**（1.0.23）：``exclude`` 里的名字是**皮肤 / 时装名**
        （``outfit.extract_outfit_names`` 认出来的），它们**不算表外角色名** ——
@@ -1203,6 +1274,11 @@ def extract_outside_names(
         dropped: 可选**出参**：被 ``exclude`` 豁免掉的候选会追加到这里
             （只记通过其它全部过滤的那些）。调用方据此打一条 DEBUG，
             用户核对"是不是把真的表外角色名也豁免掉了"就靠它
+        labels: 可选**出参**（1.0.373）：``名字 → 命中的句式标签``，
+            形如 ``{"艾克斯": "句式=按X来"}``（引号模式是 ``"引号"``、
+            枚举是 ``"句式=枚举列表"``）。调用方据此打一条
+            ``表外点名(句式=按X来): 艾克斯``，用户就能核对"这次凭什么
+            把某某当成表外角色了"。同一个名字命中多条句式时**保留第一次**的
 
     Returns:
         表外名字列表（去重、保序；没有则空列表）
@@ -1220,7 +1296,9 @@ def extract_outside_names(
     names: list[str] = []
     seen: set[str] = set()
 
-    def add(raw: str, stop_chars: str, *, scene_filter: bool) -> None:
+    def add(
+        raw: str, stop_chars: str, *, scene_filter: bool, label: str = ""
+    ) -> None:
         candidate = (raw or "").strip()
         if scene_filter and _scene_word_hit(candidate):
             return
@@ -1238,13 +1316,31 @@ def extract_outside_names(
             return
         seen.add(key)
         names.append(candidate)
+        if labels is not None and label:
+            # 1.0.373：记下"是哪条句式抓到的"（同一个名字命中多条句式时保留第一次）
+            labels.setdefault(candidate, label)
 
     for pattern in _QUOTED_NAME_PATTERNS:
         for match in pattern.finditer(text):
-            add(match.group(1), _QUOTED_NAME_STOP_CHARS, scene_filter=False)
-    for pattern in _OUTSIDE_SENTENCE_PATTERNS:
+            add(match.group(1), _QUOTED_NAME_STOP_CHARS, scene_filter=False, label="引号")
+    for pattern_label, pattern in _OUTSIDE_SENTENCE_PATTERNS:
         for match in pattern.finditer(text):
-            add(match.group(1), _SENTENCE_NAME_STOP_CHARS, scene_filter=True)
+            add(
+                match.group(1),
+                _SENTENCE_NAME_STOP_CHARS,
+                scene_filter=True,
+                label=f"句式={pattern_label}",
+            )
+    # 1.0.373：多人枚举（``A、B 和 C`` 这类）—— 只在有人数词时才扫（见上面的注释）
+    if _OUTSIDE_ENUM_COUNT_PATTERN.search(text):
+        for match in _OUTSIDE_ENUM_LIST_PATTERN.finditer(text):
+            for part in _OUTSIDE_ENUM_SPLIT_PATTERN.split(match.group(1)):
+                add(
+                    part,
+                    _SENTENCE_NAME_STOP_CHARS,
+                    scene_filter=True,
+                    label="句式=枚举列表",
+                )
     return names
 
 
@@ -1285,15 +1381,18 @@ def delete_character_reference(text: str, entry: CharacterEntry) -> tuple[str, i
                 continue
             result, hits = _replace_literal(result, variant, "")
             count += hits
+    # ①.5 先把「名字 + 紧跟的作品名括号」整块清掉（1.0.373：排在删名字**之前**，
+    # 否则名字一删就再也定位不到"这个括号属于谁"，只能按内容一刀切 —— 而两个角色
+    # 同属一个游戏时，那一刀会砍到别的角色身上）
+    result, extra = _drop_work_name_groups(result, entry)
+    count += extra
     # ② 名字与别名（长的先删，避免短别名先下手把长名字切碎、留下残渣）
     for keyword in sorted(entry.keywords(), key=len, reverse=True):
         result, hits = _replace_literal(result, keyword, "")
         count += hits
     if count <= 0:
         return text, 0
-    # ③ 只清「与这个角色的作品名一致」的括号残渣，绝不动别的括号
-    result, extra = _drop_work_name_groups(result, entry)
-    return _tidy_prompt_after_removal(result), count + extra
+    return _tidy_prompt_after_removal(result), count
 
 
 #: 括号块（含 NAI 的转义写法 ``\\(…\\)``），用于清掉删除角色后剩下的作品名
@@ -1334,15 +1433,33 @@ def _work_name_variants(entry: CharacterEntry) -> set[str]:
 
 
 def _drop_work_name_groups(text: str, entry: CharacterEntry) -> tuple[str, int]:
-    """删掉文本里**与 ``entry`` 作品名一致**的括号块；其它括号一律不动。
+    """删掉**紧跟在本角色名字/别名后面**、且内容与 ``entry`` 作品名一致的括号块。
 
     典型场景：画面里写的是 ``Hanabi (Honkai: Star Rail)``，而角色表的标准标签带转义
     （``hanabi \\(honkai: star rail\\)``）—— 只按关键词删掉 ``hanabi`` 会剩下
     ``(Honkai: Star Rail)`` 这个半截残渣，这里把它一起清掉。
+
+    **1.0.373 收窄**（实测）：早先它删掉文本里**所有**与作品名一致的括号块 —— 两个角色
+    同属一个游戏时（``aaa \\(game one\\), bbb \\(game one\\)``），删掉其中一个的
+    名字之后，清理会把**另一个（要保留的）角色**的 ``\\(game one\\)`` 也当残渣删掉，
+    于是保留下来的正确标签被打断成裸名字（``aaa ,两个少女…``）。
+    现在只清「名字后面紧跟的那个作品名括号」，别的角色的同名括号**一个字不动**。
     """
     variants = _work_name_variants(entry)
     if not variants:
         return text, 0
+    keywords = sorted(
+        [keyword for keyword in entry.keywords() if keyword], key=len, reverse=True
+    )
+    if not keywords:
+        return text, 0
+    pattern = re.compile(
+        "(?:"
+        + "|".join(re.escape(keyword) for keyword in keywords)
+        + r")\s*"
+        + _GROUP_PATTERN.pattern,
+        re.IGNORECASE,
+    )
     removed = 0
 
     def replace(match: re.Match[str]) -> str:
@@ -1352,7 +1469,7 @@ def _drop_work_name_groups(text: str, entry: CharacterEntry) -> tuple[str, int]:
             return " "
         return match.group(0)
 
-    return _GROUP_PATTERN.sub(replace, text), removed
+    return pattern.sub(replace, text), removed
 
 
 def _tidy_prompt_after_removal(text: str) -> str:

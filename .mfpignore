@@ -11,3 +11,12 @@ logs/
 *.log
 *.local.*
 *.local.toml
+# 打包污染：历史遗留的损坏 README 备份（1.0.372 起已移出插件目录，这里再排除一次）
+README.md.corrupted_bak
+*.corrupted_bak
+# 工具缓存
+.ruff_cache/
+.mypy_cache/
+# 注意：MPDT 当前的打包器（mpdt 25.x package_manager）**不读 .mfpignore**，
+# 它只按硬编码规则排除隐藏文件 / __pycache__ / dist/ 等；这份文件是给别的工具
+# 与将来的打包器看的，别指望它拦得住东西 —— 真不想进包的文件要移出插件目录。

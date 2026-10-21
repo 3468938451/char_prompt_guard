@@ -1483,6 +1483,31 @@ class MemoryContext:
 # 证据都参与对账，画面里的角色只要落在期望集合之外就是冲突。
 
 
+#: **1.0.373：多人语义词**（决定「双标签拦截」敢不敢删多余标签）。
+#:
+#: 命中任一 → 说明用户可能在要多人同框，**只告警、绝不删**（宁可留一个多余的标签，
+#: 也不能把合法的第二个角色删掉）。口径 = ``ADDITIVE_WORDS``（还有 / 一起 / 俩 / 都 /
+#: 加上 / 和她 / and / both）+ 人数与并列说法（两个 / 俩人 / 双人 / 她们 / 同框 /
+#: 并肩 / 和 / 与 / +）。
+_MULTI_HINT_WORDS: tuple[str, ...] = (
+    *ADDITIVE_WORDS,
+    "两个",
+    "俩人",
+    "双人",
+    "她们",
+    "他们",
+    "她俩",
+    "他俩",
+    "同框",
+    "并肩",
+    "和",
+    "与",
+    "＋",
+    "+",
+    "多人",
+)
+
+
 def _entry_label(entry: CharacterEntry) -> str:
     """角色在日志里的可读标签：``花火（hanabi \\(honkai: star rail\\)）``。
 
@@ -1614,12 +1639,19 @@ class UserNamingScope:
             常见词黑名单 / 角色表内的名字与别名），去重、保序
         sources: 每个表外名字**来自哪条消息**（与 ``names`` 一一对应，1.0.21 起）：
             解析角色时用它当「触发语」写回记忆库（「这身是？」比裸名字信息更多）
+        labels: 每个表外名字**由哪条句式抓到**（1.0.373）：``{"艾克斯": "句式=按X来"}``，
+            走引号模式的是 ``"引号"``、多人枚举是 ``"句式=枚举列表"``
+        latest_names: **最新一条用户消息**（``texts[0]``，即触发消息）里的表外名字
+            （1.0.373）。它决定「先 B 后 A」那条硬规则要不要生效 —— 用户最新说的话
+            里出现了角色表外的名字候选时，**禁止**拿主题粘性角色去补（宁可缺，不补错）
     """
 
     texts: list[str] = field(default_factory=list)
     scanned: int = 0
     names: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
+    latest_names: list[str] = field(default_factory=list)
 
     def names_text(self) -> str:
         """表外名字的可读列表（进日志）：``刻律德拉、卡芙卡``。"""
@@ -1989,6 +2021,41 @@ class CharacterGuardHandler(BaseEventHandler):
                 outfit=outfit,
                 region=region_swap,
                 appearance=appearance_override,
+            )
+
+        # ── 1.0.373：表外点名「先 B 后 A」 ──────────────────────────────
+        # 用户**最新一条消息**里出现了"角色表外的名字候选"时，禁止用主题粘性角色去补。
+        # B（解析成功）：上面入口② 已经补入并返回；走不到这里时交给 _finalize 的
+        #   入口① 做替换，同样**不再补**粘性角色。
+        # A（解析失败 / 异常 / 关键字全被丢弃）：**什么都不补** + 一条 WARNING ——
+        #   宁可缺，绝不补错（实测事故：用户要的是角色X，插件补了上文的另一个人）。
+        blocked = self._outside_naming_sticky_block(
+            user_naming=user_naming, resolved=resolved
+        )
+        if blocked is not None:
+            is_warning, blocked_note = blocked
+            if is_warning:
+                logger.warning(blocked_note)
+            else:
+                logger.info(blocked_note)
+            return await self._finalize(
+                params=params,
+                args=args,
+                spec=spec,
+                original=raw_content,
+                final_content=content,
+                decided=[],
+                roster=roster,
+                config=config,
+                basis="判定依据=表外点名（先 B 后 A）：本次不补角色",
+                track=None,
+                memory=None,
+                naming_scope=user_naming,
+                resolved=resolved,
+                outfit=outfit,
+                region=region_swap,
+                appearance=appearance_override,
+                sticky_blocked=True,
             )
 
         # 1.0.18：判定**不确定**且描述里没有角色表内角色时，先去外部记忆库
@@ -3684,19 +3751,28 @@ class CharacterGuardHandler(BaseEventHandler):
 
             names: list[str] = []
             sources: dict[str, str] = {}
+            labels: dict[str, str] = {}
+            latest_names: list[str] = []
             exempted: list[str] = []
-            for text in texts:
+            for index, text in enumerate(texts):
+                found_labels: dict[str, str] = {}
                 found = extract_outside_names(
                     text,
                     roster,
                     exclude=exclude or (),
                     dropped=exempted,
+                    labels=found_labels,
                 )
                 for name in found:
                     if name not in names:
                         names.append(name)
                         # 记住它来自哪句话（1.0.21：解析成功后写回记忆库时的触发语）
                         sources[name] = text
+                        labels[name] = found_labels.get(name, "")
+                        # 1.0.373：``texts[0]`` 就是最新一条用户消息（触发消息在前），
+                        # 它里面的候选决定「先 B 后 A」那条硬规则
+                        if index == 0:
+                            latest_names.append(name)
             if exempted:
                 # 去重保序：同一套皮肤可能在好几条消息里被抓到
                 unique = list(dict.fromkeys(exempted))
@@ -3707,9 +3783,20 @@ class CharacterGuardHandler(BaseEventHandler):
                     "不算表外角色名）"
                 )
             scope = UserNamingScope(
-                texts=texts, scanned=scanned, names=names, sources=sources
+                texts=texts,
+                scanned=scanned,
+                names=names,
+                sources=sources,
+                labels=labels,
+                latest_names=latest_names,
             )
             if names:
+                # 1.0.373：先说清「每条名字是被哪条句式抓到的」（用户核对全靠这几行），
+                # 再打一行汇总
+                for name in names:
+                    logger.debug(
+                        f"表外点名({labels.get(name) or '未知来源'}): {name}"
+                    )
                 logger.debug(f"表外点名扫描: {scope.label()}")
             return scope
         except Exception as e:  # noqa: BLE001 —— 多一条检查，失败即静默退回
@@ -4569,14 +4656,16 @@ class CharacterGuardHandler(BaseEventHandler):
            与既有的「已含角色」检测同一口径）。注意：**画面里那个表外角色的中文名
            不算** —— 描述里写了「刻律德拉」而没写任何标准标签时，仍然属于"没有标签"，
            正是本入口要处理的场景；
-        3. 用户最近说过的话里**没有**这个解析结果（已经写过就没必要再补）。
+        3. ~~用户最近说过的话里没有这个解析结果~~ —— **1.0.373 起取消这条**：
+           表外名字本来就是从用户消息里抓出来的，这条等于让入口②永远不生效
+           （实测事故：用户说「按角色X来」、画面里又没有角色标签 → 什么都没补，
+           反而让判定链补了上文粘性的另一个人）。"已经写过就不必再补" 由
+           :meth:`_resolved_presentation` 里的 ``content_contains_tag`` 兜住。
 
         画面里已经有角色标签时不在这里动：那种情况属于**替换**（入口①，
         见 :meth:`_apply_outside_naming_check`），两条入口不会互相打架。
         """
         if resolved is None or not resolved.resolved_tag():
-            return None
-        if user_naming is not None and character_in_texts(resolved, user_naming.texts):
             return None
         texts = self._detection_texts(content, spec, args)
         if any(character_in_texts(entry, texts) for entry in roster):
@@ -4680,6 +4769,91 @@ class CharacterGuardHandler(BaseEventHandler):
         origin = f"{entry.name} → {english or entry.resolved_tag()}"
         game = entry.game.strip()
         return f"{origin}，作品《{game}》" if game else origin
+
+    @staticmethod
+    def _outside_naming_sticky_block(
+        *,
+        user_naming: UserNamingScope | None,
+        resolved: CharacterEntry | None,
+    ) -> tuple[bool, str] | None:
+        """「先 B 后 A」：最新消息里有表外名字候选时，是否**禁止**用粘性角色补（1.0.373）。
+
+        修的是这条实测事故（1.0.38 已部署）：用户说的是「要角色X那层壳上来、眼睛换成
+        本尊的紫红。摆一张紫红瞳的角色X。」—— 角色X**不在角色表**，旧句式一条都
+        抓不到；画面内容里又没有角色标签，于是判定链按**主题粘性**补了上文那个角色，
+        用户要的人**一个字都没进提示词**。
+
+        用户选定的策略是「**先 B 后 A**」：
+
+        - **B**：能解析出表外角色（``resolved`` 非空）→ 用解析出的标准标签（走既有
+          入口② / 入口①），并且**不得**再补粘性角色；
+        - **A**：解析不出来 / 出错 → **什么都不补**（宁可缺，绝不补错），只留一条
+          WARNING 建议把该角色加进 ``[roster]``。
+
+        只看**最新一条用户消息**（``latest_names``，即 ``texts[0]``）里的候选：
+        更早几条消息里的表外点名由 1.0.20 那条独立检查负责，不在这里扩大弃权范围
+        （否则"半小时前顺口提过一个表外角色"会让本次也不补，太激进）。
+
+        Returns:
+            ``None`` = 不适用（最新消息里没有表外名字候选）；
+            ``(是否 WARNING, 日志文案)`` = 适用 —— 调用方**不补任何角色**，
+            直接以「画面原样」进 :meth:`_finalize`（``sticky_blocked=True``）。
+        """
+        if user_naming is None or not user_naming.latest_names:
+            return None
+        name = user_naming.latest_names[0]
+        if resolved is not None:
+            return (
+                False,
+                (
+                    f"用户最新消息里的「{name}」不在角色表，但已解析为"
+                    f"「{resolved.name or resolved.tag or '?'}」→ 按解析结果处理，"
+                    "本次**不补**主题粘性角色（宁可缺，不补错）"
+                ),
+            )
+        return (
+            True,
+            (
+                f"用户说的「{name}」不在角色表且未能解析，本次不补角色"
+                "（宁可缺，不补错）；建议把它加入 [roster]"
+            ),
+        )
+
+    @staticmethod
+    def _recent_multi_hint(
+        texts: list[str],
+        roster: list[CharacterEntry],
+        naming_scope: UserNamingScope | None = None,
+    ) -> str:
+        """用户最近消息里的**多人语义**（1.0.373；空串 = 没有）。
+
+        「双标签拦截」要靠它决定敢不敢删：消息里只要出现 ``一起 / 两个 / 她们 /
+        同框 / 并肩 / 和 / 与 …``，或者点名了 ≥2 个角色（表内 + 表外），就说明这
+        很可能是**合法的双人图**，此时**只能告警**，绝不能把第二个角色删掉。
+
+        Returns:
+            命中的说法（``一起、两个``）或 ``点名了 2 个角色``；都没有返回 ``""``。
+        """
+        # 只看**最新一条**用户消息：``一起 / 两个 / 和`` 出现在更早的对话里并不代表
+        # 这次要多人（1.0.30 的实测场景「那画流萤吧」→「画爱莉的婚纱～」就是**换人**
+        # 而不是追加，把上文也算进来会永远判成"多人语义"）。
+        latest = next((text for text in texts if text), "")
+        if not latest:
+            return ""
+        lowered = latest.lower()
+        hits = [
+            word
+            for word in _MULTI_HINT_WORDS
+            if word and (word in latest or word.lower() in lowered)
+        ]
+        named = {
+            entry_key(entry) for entry in roster if character_in_texts(entry, [latest])
+        }
+        outside = list(getattr(naming_scope, "latest_names", []) or [])
+        total = len(named) + len(outside)
+        if total >= 2:
+            hits.append(f"点名了 {total} 个角色")
+        return "、".join(dict.fromkeys(hits))
 
     async def _apply_outside_naming_check(
         self,
@@ -4879,6 +5053,7 @@ class CharacterGuardHandler(BaseEventHandler):
         outfit: ResolvedOutfit | None = None,
         region: region_api.RegionSwap | None = None,
         appearance: appearance_api.AppearanceOverride | None = None,
+        sticky_blocked: bool = False,
     ) -> tuple[EventDecision, dict[str, Any]]:
         """统一的收尾：跑二次一致性检测 → 追加皮肤 → 追加分区覆盖 → 前置外观覆盖 → 回写 args。
 
@@ -4953,6 +5128,13 @@ class CharacterGuardHandler(BaseEventHandler):
             basis=basis,
             track=track,
             memory=memory,
+            # 1.0.373：``sticky_blocked`` = 本次「先 B 后 A」弃权了 —— 不能用粘性
+            # 角色去替换 / 删除画面里的标签（只在日志里说明）
+            allow_sticky=not sticky_blocked,
+            recent_texts=list(naming_scope.texts) if naming_scope else [],
+            naming_scope=naming_scope,
+            # 注入**前**的画面：双标签拦截靠它判断"本来就多"，而不是被本次注入带偏
+            initial_content=original,
         )
         checked = await self._apply_outside_naming_check(
             content=checked,
@@ -5090,6 +5272,10 @@ class CharacterGuardHandler(BaseEventHandler):
         basis: str,
         track: SubjectTrack | None = None,
         memory: memory_api.MemoryLookup | None = None,
+        allow_sticky: bool = True,
+        recent_texts: list[str] | None = None,
+        naming_scope: UserNamingScope | None = None,
+        initial_content: str | None = None,
     ) -> str:
         """二次一致性检测：对账「最终提示词里的角色表内角色」vs「**期望集合**」。
 
@@ -5135,6 +5321,20 @@ class CharacterGuardHandler(BaseEventHandler):
             return content
 
         texts = self._detection_texts(content, spec, args)
+        # 1.0.373：画面里**实际**出现了几个角色表内角色（双标签拦截要用）
+        picture = [entry for entry in roster if character_in_texts(entry, texts)]
+        # …但"本来就多"要看**注入前**：本次刚补进去的判定角色不能算成多余的那一个
+        # （否则「画面只有 1 个错标签 → 替换成判定角色」这条 1.0.19 的既有修法
+        # 会退化成"删掉错标签"、判定角色的标准标签反而进不去，用例 C108 就是这么红的）
+        picture_before = (
+            [
+                entry
+                for entry in roster
+                if character_in_texts(entry, [initial_content])
+            ]
+            if initial_content
+            else list(picture)
+        )
         expected_keys = expected.keys()
         extras = [
             entry
@@ -5157,6 +5357,13 @@ class CharacterGuardHandler(BaseEventHandler):
 
         if mode != "fix":
             logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suffix}")
+            # 1.0.373：warn 模式对「画面里 ≥2 个角色标签、判定只要 1 个」只报不改
+            if len(expected.entries) == 1 and len(picture_before) >= 2:
+                logger.warning(
+                    f"发现 {len(picture_before)} 个角色标签但判定只有 1 个"
+                    f"（warn 只报不改）：画面={_entry_names(picture_before)}，"
+                    f"期望={expected.names()}{suffix}"
+                )
             return content
 
         # 1.0.38：**多角色画面只补不替换** —— 拦在所有 fix 动作之前
@@ -5171,6 +5378,57 @@ class CharacterGuardHandler(BaseEventHandler):
         )
         if guarded is not None:
             return guarded
+
+        # 1.0.373：**本次弃权（先 B 后 A）时不要用粘性角色去替换 / 删除**。
+        # 用户最新消息里点名了角色表外的角色、而那个角色没能解析出来 —— 此时
+        # 任何"按主题粘性换人"的动作都是在赌另一个角色，宁可什么都不做。
+        if not allow_sticky:
+            logger.warning(
+                "一致性检查=冲突但本次不用主题粘性角色替换"
+                f"（用户最新消息里点名了角色表外的角色、且没能解析）：{detail}{suffix}"
+            )
+            return content
+
+        # ── 1.0.373：④ 双角色标签拦截 ──────────────────────────────────
+        # 实测事故的另一半：画面里同时挂着两个角色标准标签（nait_artist 自己加了一个
+        # 错的），判定只要 1 个。旧逻辑是"把多余的**替换**成判定角色"，可判定角色
+        # 本来就在画面里 → 结果多出一个**一模一样**的标签。
+        # 现在：判定角色已在画面里时**删除多余**，而不是替换。
+        # **三条闸门同时成立才删**（另一半是"只告警"），防误删合法双人图：
+        #   ① 判定本身只要 1 人（``len(expected.entries) == 1`` 且 ``len(decided) < 2``）；
+        #   ② 画面里角色标签 ≥2 个；
+        #   ③ 用户最近消息里**没有多人语义**，且只点名了 1 个角色。
+        # 任一不成立 → 只 WARN（多角色守卫 / 旧替换路径照旧），绝不删。
+        if len(expected.entries) == 1 and len(picture_before) >= 2:
+            multi_hint = self._recent_multi_hint(
+                recent_texts or [], roster, naming_scope
+            )
+            if multi_hint:
+                logger.warning(
+                    f"发现 {len(picture_before)} 个角色标签但判定只有 1 个，"
+                    f"且消息里有多人语义（{multi_hint}） → 不删（避免误删合法角色）；"
+                    f"画面={_entry_names(picture_before)}，期望={expected.names()}"
+                    f"{suffix}"
+                )
+                return content
+            right = expected.entries[0]
+            if character_in_texts(right, texts):
+                cleaned = content
+                hits_total = 0
+                removed_names: list[str] = []
+                for entry in list(extras):
+                    cleaned, hits = delete_character_reference(cleaned, entry)
+                    if hits:
+                        hits_total += hits
+                        removed_names.append(entry.name or entry.tag or "?")
+                if hits_total > 0:
+                    logger.warning(
+                        f"一致性检查=冲突已修正（fix）：发现 {len(picture_before)} 个角色标签，"
+                        f"保留判定角色「{right.name or right.tag or '?'}」，"
+                        f"删除多余：「{'、'.join(removed_names)}」"
+                        f"（删除 {hits_total} 处）{suffix}"
+                    )
+                    return cleaned
 
         if len(expected.entries) != 1 or len(extras) != 1:
             logger.warning(

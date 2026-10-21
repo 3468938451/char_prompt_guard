@@ -300,6 +300,23 @@ INFO / WARNING（``unsupported`` 是唯一按 WARNING 打的那种）。
 C119~C124 全部离线（不调模型）：分区条目用**真的配置节类**
 （``config.RegionEntrySection``）构造，触发消息里直接写入口语言。
 
+## 1.0.373（表外点名「先 B 后 A」/ 双标签拦截 / 多人枚举，C129~C135）
+
+| 用例 | 覆盖 |
+| --- | --- |
+| C129 | 新句式 ``按X来`` 认出**角色表外**的名字 → 解析成功就用解析结果：断言解析出的标准标签**真的进**了提示词、日志有 ``表外点名(句式=按X来): <X>``、并且**没有**补任何角色表内角色（尤其没有上文粘性那个） |
+| C130 | 同场景但解析 ``unknown`` → **什么都不补**：内容与「没有角色注入」的基线**逐字一致**、WARN 写明 ``…不在角色表且未能解析，本次不补角色（宁可缺，不补错）`` |
+| C131 | 同场景但解析**抛异常** → 同样不补、不崩，``角色解析(LLM)失败`` 与弃权 WARN 都在 |
+| C132 | ``fix`` + 画面**本来就有 2 个**角色标签 + 判定只要 1 个 + 最新消息**没有**多人语义且只点名 1 人 → **删除多余、保留判定角色**（不会替换成两个一样的标签） |
+| C133 | **保护条件**（C132 的反面）：同样两个标签，但最新消息含「她们俩一起」→ **只 WARN、两个标签都留**（防误删合法双人图） |
+| C134 | 三人枚举：``画 角色A、角色B 和 角色C 三个人一起`` → ``decided`` 恰好 3 人；``natural_max=3`` 时三人**都**进画面；默认 ``natural_max=2`` 时只补前 2 个并 WARN 写明截断原因 |
+| C135 | 3 人 + ``fix`` + 画面只有 2 个标签 → **只补第 3 个**、已有的两个一个不少也没被改写（多角色守卫对 3 人也生效） |
+
+C129~C135 全部离线：角色解析用 :class:`FakeResolve` 打桩；**角色名一律用占位名**
+（``角色A`` / ``角色B`` / ``角色C`` / ``艾克斯``），不写任何真实角色名。
+``艾克斯`` 之所以不叫「角色X」：``character.OUTSIDE_NAME_BLACKLIST`` 里的「角色」
+会把整条候选拦掉，用例就会空转。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -1191,6 +1208,44 @@ MULTI_SCENE = (
 )
 #: C127：用户**同时点了两个人**（`decided` 因此是 2 人 → 守卫必须拦住替换）
 MULTI_SCENE_REQUEST = "画花火和流萤，两人同框"
+
+# ── 1.0.373（表外点名「先 B 后 A」/ 双标签拦截 / 多人枚举）用例的夹具 ──────
+#
+# **全部用占位名**（用户要求："可能会遇到极端的角色厨子，我防一下"）：
+# 角色表是 ``角色A / 角色B / 角色C``（标签 ``aaa`` / ``bbb`` / ``ccc``），
+# 表外占位名是「艾克斯」（X 的音译）。
+# 注意：**不能**用「角色X」当表外占位名 —— ``character.OUTSIDE_NAME_BLACKLIST``
+# 里的「角色」会把整条候选拦掉，用例会变成空转（这条注释就是防后人踩这个坑的）。
+RS_ABC = (
+    r"角色A | 游戏一 (Game One) | aaa | aaa \(game one\)"
+    "\n"
+    r"角色B | 游戏一 (Game One) | bbb | bbb \(game one\)"
+    "\n"
+    r"角色C | 游戏二 (Game Two) | ccc | ccc \(game two\)"
+)
+TAG_AA = r"aaa \(game one\)"
+TAG_BB = r"bbb \(game one\)"
+TAG_CC = r"ccc \(game two\)"
+#: 表外占位角色（不在 ``RS_ABC`` 里）与它的假解析结果（字段与真实解析一一对应）
+OUTSIDE_X = "艾克斯"
+TAG_EX = r"exx \(game ex\)"
+EX_PAYLOAD = {
+    "unknown": False,
+    "name_cn": "艾克斯",
+    "name_en": "Exx",
+    "game_cn": "游戏艾 (Game Ex)",
+    "game_en": "Game Ex",
+    "tag": TAG_EX,
+    "confidence": 0.9,
+}
+#: 画面：**没有任何角色标签**（只有外观描述）—— 1.0.373 事故里的入参形状
+PLACEHOLDER_SCENE = "银白色长发的少女站在镜头前，一身蓝裙"
+#: C129~C131：事故原话的口语结构（``按X来`` + 外观说法）
+OUTSIDE_X_REQUEST = "按艾克斯来，眼睛换成紫红"
+#: C134/C135：三人枚举（顿号 + 和 + 人数词，四种写法里的两种）
+THREE_REQUEST = "画角色A、角色B和角色C三个人一起"
+#: C132/C133：双人画面（两个占位标签都写在内容里）
+TWO_TAG_SCENE = f"{TAG_AA}, {TAG_BB}, 两个少女并肩站着，银白长发与深色短发"
 
 
 # ── 1.0.34（框架运行时兼容 shim）用例的离线桩 ───────────────────────────
@@ -7669,6 +7724,355 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C128 enabled=false：零动作零日志（开/关两条路径都覆盖）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C129（1.0.373）新句式「按X来」认出表外角色 → 解析成功就用解析结果 ──────
+    # 实测事故（1.0.38 已部署）：用户说「要角色X那层壳上来、眼睛换成本尊的紫红。
+    # 摆一张紫红瞳的角色X。」—— 要的人**不在角色表**、旧句式一条都抓不到，画面里
+    # 又没有角色标签，于是判定链按**主题粘性**补了上文那个角色（用户要的人一个字没进）。
+    # 1.0.373 起：新句式（按X来 / X那层壳 / 摆一张X / X的那种 …）先把 X 抓成
+    # 「表外点名候选」，再按用户选定的「**先 B 后 A**」处理 —— 本条钉 **B**：
+    #   ① 解析出的标准标签**真的进**了提示词；
+    #   ② 日志写明是哪条句式抓到的（`表外点名(句式=按X来): …`）；
+    #   ③ **没有**补任何角色表内角色（粘性那条路一次都没走）。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        params = natural_params(PLACEHOLDER_SCENE, text=OUTSIDE_X_REQUEST)
+        params["stream_id"] = "s-c129"
+        with (
+            FakeResolve(EX_PAYLOAD) as resolve_stub,
+            # 上文里点名过角色B —— 旧行为正是把「角色B」当粘性补进画面的
+            FakeHistory([history_message("画角色B吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        debugs = logs.debugs()
+        records = logs.records_text()
+        ok = (
+            TAG_EX in c  # ★ B：解析结果的标准标签进了提示词
+            and "已按角色解析补入（LLM）" in records
+            and resolve_stub.calls == [OUTSIDE_X]  # 一次生图只解析一次
+            and f"表外点名(句式=按X来): {OUTSIDE_X}" in debugs  # ★ 日志写明句式来源
+            and TAG_AA not in c  # ★ 没有任何角色表内角色被补进来
+            and TAG_BB not in c  # ★ 尤其是上文粘性的那个
+            and TAG_CC not in c
+            and "角色B" not in c
+            and "已补入角色" not in records  # ★ 粘性那条路根本没走
+        )
+        check(
+            "C129 新句式「按X来」+ 解析成功 → 注入解析结果、不补粘性角色",
+            ok,
+            f"content = {c!r}\n        解析调用 = {resolve_stub.calls!r}\n"
+            f"        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C129 新句式「按X来」+ 解析成功 → 注入解析结果、不补粘性角色",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C130（1.0.373）同一句式但解析 `unknown` → **什么都不补**（A）────────────
+    # 用户选定的策略后半句：解析不出来就**弃权**，绝不拿上文粘性角色顶上
+    # （"宁可缺，不补错"）。断言三件事：内容与「没有角色注入」的基线**逐字一致**、
+    # 一个角色标签都没有、并且留下一条 WARN 说清为什么什么都没补。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        params = natural_params(PLACEHOLDER_SCENE, text=OUTSIDE_X_REQUEST)
+        params["stream_id"] = "s-c130"
+        with (
+            FakeResolve({"unknown": True}) as resolve_stub,
+            FakeHistory([history_message("画角色B吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        warns = logs.warnings()
+
+        # 基线：同一个画面、同一段上文，但触发消息里**没有**表外点名
+        cfg_base = make_config(roster=RS_ABC)
+        cfg_base.general.history_cache_ttl = 0.0
+        cfg_base.general.consistency_check = "warn"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as _base_logs,
+        ):
+            base_out = await fire(cfg_base, natural_params(PLACEHOLDER_SCENE, text="嗯～"))
+        baseline = base_out["args"]["content"]
+
+        ok = (
+            c == baseline  # ★ 与"没有角色注入"的基线逐字一致
+            and c == PLACEHOLDER_SCENE  # ★ 原文一个字都没改
+            and TAG_EX not in c
+            and TAG_AA not in c
+            and TAG_BB not in c
+            and TAG_CC not in c
+            and "角色B" not in c  # ★ 粘性角色没有被顶上来
+            and "已补入角色" not in logs.records_text()  # ★ 粘性那条路没走
+            and "不在角色表且未能解析，本次不补角色" in warns  # ★ A：WARN 说清弃权
+            and "宁可缺，不补错" in warns
+            and resolve_stub.calls == [OUTSIDE_X]
+        )
+        check(
+            "C130 解析 unknown → 什么都不补（与无注入基线逐字一致）+ WARN",
+            ok,
+            f"content = {c!r}\n        基线 = {baseline!r}\n"
+            f"        WARNING = {warns!r}\n        解析调用 = {resolve_stub.calls!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C130 解析 unknown → 什么都不补（与无注入基线逐字一致）+ WARN",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C131（1.0.373）同一场景但解析**抛异常**（超时 / 网络故障）→ 同样弃权 ────
+    # 异常绝不能拦住生图，也不能让判定链退回粘性去"猜一个人"。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "warn"
+        params = natural_params(PLACEHOLDER_SCENE, text=OUTSIDE_X_REQUEST)
+        params["stream_id"] = "s-c131"
+        with (
+            FakeResolve(error=TimeoutError("timed out")) as resolve_stub,
+            FakeHistory([history_message("画角色B吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        warns = logs.warnings()
+        ok = (
+            c == PLACEHOLDER_SCENE  # ★ 不崩、也不改内容
+            and TAG_EX not in c
+            and TAG_AA not in c
+            and TAG_BB not in c
+            and TAG_CC not in c
+            and "角色解析(LLM)失败" in warns  # 异常本身有记录
+            and "不在角色表且未能解析，本次不补角色" in warns  # ★ 弃权也说清了
+            and "已补入角色" not in logs.records_text()
+        )
+        check(
+            "C131 解析抛异常 → 同样不补、不崩，日志有 WARN",
+            ok,
+            f"content = {c!r}\n        WARNING = {warns!r}\n"
+            f"        解析调用 = {resolve_stub.calls!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C131 解析抛异常 → 同样不补、不崩，日志有 WARN",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C132（1.0.373）双角色标签：消息里**没有**多人语义 + 只点名 1 人 → 删多余 ──
+    # 实测事故的另一半：画面里同时挂着两个角色标准标签，判定只要 1 个。旧逻辑是
+    # "把多余的**替换**成判定角色" —— 可判定角色本来就在画面里，结果多出一个**一模一样**
+    # 的标签。现在：判定角色已在画面里 → **删除多余**，不再替换。
+    # 三条闸门（判定只要 1 人 / 画面本来就有 ≥2 个标签 / 消息里没有多人语义且只点名
+    # 1 人）同时成立才删；本条钉"该删的时候真的删了"。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(TWO_TAG_SCENE, text="画角色A吧")
+        params["stream_id"] = "s-c132"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            TAG_BB not in c  # ★ 多余的那个被删掉
+            and TAG_AA in c  # ★ 判定角色保留
+            and c.count(TAG_AA) == 1  # ★ 而且不会多出一个一模一样的标签
+            and "两个少女并肩站着" in c  # 画面描述原文保留
+            and "发现 2 个角色标签" in records
+            and "保留判定角色" in records
+            and "删除多余" in records
+        )
+        check(
+            "C132 fix 双标签 + 消息无多人语义 + 只点名 1 人 → 删多余、保留判定角色",
+            ok,
+            f"content = {c!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C132 fix 双标签 + 消息无多人语义 + 只点名 1 人 → 删多余、保留判定角色",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C133（1.0.373）**保护条件**：消息里有「她们俩一起」→ 只 WARN、两个标签都留 ───
+    # 这是 C132 的反面，也是这条规则存在的理由：真实双人图但判定链只认出 1 人时，
+    # 照 C132 直接删就会把**合法的第二个角色**删掉。所以只要消息里有多人语义
+    # （一起 / 两个 / 她们 / 同框 / 并肩 / 和 / 与 …）或点名了 ≥2 个角色，**只告警**。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(TWO_TAG_SCENE, text="画角色A，她们俩一起")
+        params["stream_id"] = "s-c133"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            TAG_AA in c  # ★ 两个标签都保留（宁可留一个多余的，也不误删合法的）
+            and TAG_BB in c
+            and "两个少女并肩站着" in c
+            and "且消息里有多人语义" in records
+            and "不删（避免误删合法角色）" in records
+            and "删除多余" not in records  # ★ 一个都没删
+            and "冲突已修正" not in records
+        )
+        check(
+            "C133 fix 双标签但消息含多人语义 → 只 WARN、不删（防误删合法角色）",
+            ok,
+            f"content = {c!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C133 fix 双标签但消息含多人语义 → 只 WARN、不删（防误删合法角色）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C134（1.0.373）三人枚举：判定集合按**人数**枚举（3 个，不是 1 个）──────
+    # 三跑，把"判定能枚举几个人"与"实际能注入几个人"分开钉死：
+    #   ① 判定集合（单元级）：`画角色A、角色B和角色C三个人一起` → decided 恰好 3 个；
+    #   ② natural_max=3（放开上限）：三个人**都**进画面（各一段中文说明 + 标准标签）；
+    #   ③ 默认 natural_max=2（nai_artist 这类没有多角色槽位的插件）：只补前 2 个，
+    #      并且**日志写明截断原因**（这一条就是"上限值"的实测答案）。
+    try:
+        from ..character import parse_roster
+        from ..handler import CharacterGuardHandler as _ThreeHandler
+
+        roster_abc = parse_roster(RS_ABC)
+        runs = []
+
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        handler = _ThreeHandler(FakePlugin(cfg))
+        params = natural_params(PLACEHOLDER_SCENE, text=THREE_REQUEST)
+        params["stream_id"] = "s-c134-unit"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            result = await handler._collect_candidates(
+                params, cfg, roster_abc, PLACEHOLDER_SCENE, [THREE_REQUEST]
+            )
+        decided_names = [entry.name for entry in result.decided]
+        runs.append(
+            (
+                "① 判定集合按人数枚举（decided = 3 个）",
+                decided_names == ["角色A", "角色B", "角色C"],
+                f"decided = {decided_names!r}\n        日志 = {logs.records_text()!r}",
+            )
+        )
+
+        cfg3 = make_config(roster=RS_ABC)
+        cfg3.general.history_cache_ttl = 0.0
+        cfg3.general.consistency_check = "off"
+        cfg3.multi.natural_max = 3
+        params = natural_params(PLACEHOLDER_SCENE, text=THREE_REQUEST)
+        params["stream_id"] = "s-c134-3"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs3,
+        ):
+            out3 = await fire(cfg3, params)
+        c3 = out3["args"]["content"]
+        runs.append(
+            (
+                "② natural_max=3 → 三个人都补进画面",
+                all(tag in c3 for tag in (TAG_AA, TAG_BB, TAG_CC))
+                and c3.count("（画面角色：“") == 3,
+                f"content = {c3!r}\n        日志 = {logs3.records_text()!r}",
+            )
+        )
+
+        cfg2 = make_config(roster=RS_ABC)
+        cfg2.general.history_cache_ttl = 0.0
+        cfg2.general.consistency_check = "off"
+        params = natural_params(PLACEHOLDER_SCENE, text=THREE_REQUEST)
+        params["stream_id"] = "s-c134-2"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs2,
+        ):
+            out2 = await fire(cfg2, params)
+        c2 = out2["args"]["content"]
+        runs.append(
+            (
+                "③ 默认 natural_max=2 → 只补前 2 个、日志写明截断原因",
+                sum(tag in c2 for tag in (TAG_AA, TAG_BB, TAG_CC)) == 2
+                and "本次只补前 2 个角色" in logs2.warnings(),
+                f"content = {c2!r}\n        WARNING = {logs2.warnings()!r}",
+            )
+        )
+        check(
+            "C134 三人枚举：判定 3 人 / natural_max=3 全补 / 默认 2 人截断并写明",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C134 三人枚举：判定 3 人 / natural_max=3 全补 / 默认 2 人截断并写明",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C135（1.0.373）3 人 + fix + 画面只有 2 个标签 → **只补第 3 个、不删不改** ──
+    # 多角色守卫（1.0.38 的「只补不替换」）对 3 人也必须生效：画面里已有的两个标签
+    # 一个不少、每个只出现一次，只把缺的那个补上；全程不出现任何删除 / 替换。
+    try:
+        cfg = make_config(roster=RS_ABC)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(TWO_TAG_SCENE, text=THREE_REQUEST)
+        params["stream_id"] = "s-c135"
+        with (
+            FakeHistory([history_message("我们说点别的吧", 1.0)]),
+            LogCapture() as logs,
+        ):
+            out = await fire(cfg, params)
+        c = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            TAG_AA in c  # ★ 已有的两个一个不少
+            and TAG_BB in c
+            and c.count(TAG_AA) == 1  # ★ 也没被改写 / 重复
+            and c.count(TAG_BB) == 1
+            and TAG_CC in c  # ★ 只补第 3 个
+            and "角色C" in c
+            and "两个少女并肩站着" in c  # 画面描述原文保留
+            and "已补入角色" in records
+            and "多人" in records
+            and "冲突已修正" not in records  # ★ 没删也没改已有标签
+            and "删除多余" not in records
+        )
+        check(
+            "C135 3 人 + fix + 画面只有 2 个标签 → 只补第 3 个、不删不改",
+            ok,
+            f"content = {c!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C135 3 人 + fix + 画面只有 2 个标签 → 只补第 3 个、不删不改",
             False,
             f"{type(e).__name__}: {e}",
         )
