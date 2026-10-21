@@ -237,6 +237,35 @@ system reminder 的形式告知主模型，让它可以按需决定本次要单�
 日志、**绝不拦住生图**，最坏等价"没装 shim"（行为与 1.0.33 逐字一致）。用例
 C116~C118 用离线桩覆盖「已打补丁不重复装」「没打补丁则补上并能改写 args」「开关关掉 /
 原函数抛异常 / 桩里没有 run_tool_call」三组行为。
+
+1.0.36 起新增一个**实验性功能**「分区覆盖」（``[region_override]``，**默认关闭**，
+见 :mod:`region` 与 :meth:`handler.CharacterGuardHandler._apply_region_override`）：
+
+- ⚠️ **实验性功能：打开后生图效果可能不理想。** 分区拼接只是"按词重画"，模型可能把
+  两个角色的特征混在一起（串味）、比例异常或细节崩坏；**默认关闭，普通使用完全不受
+  影响**（关着时不解析、不额外读上文、不调模型、不打日志，行为与 1.0.34 逐字一致）；
+- 打开后可以指定「**头 / 头发 / 眼睛** 用 A 的、**身子 / 体型** 用 B 的」这类分区拼接，
+  也允许单分区（只换头）。入口语言形如 ``头是流萤的，身子是爱莉的`` / ``头换成流萤`` /
+  ``用爱莉的身子配流萤的头``，识别「**分区词 + 角色名 + 归属句式**」**三重条件**
+  （缺一不认），识别不到**什么都不做**；
+- 各分区的特征词来自**独立的条目列表** ``[[region_override.entries]]``
+  （**不写进** ``[roster]`` / ``[outfits]``）：每个条目一个角色（``name`` 支持角色表的
+  名字 / 别名），``head`` / ``body`` / ``outfit`` / ``pose`` / ``background`` 分别填该
+  角色各分区的特征词；
+- **注入**按 ``regions`` 的顺序（默认 head → body → outfit → pose → background，
+  **head 在最前**）拼成一段，追加在**角色说明与皮肤/穿着之后**（既有注入通道，
+  角色在前）；``negative_swap`` 把「被换掉的那个角色在**同一分区**的原特征」写进负向，
+  ``anti_mix`` 多角色时追加 ``mixed attributes, blended eyes``，``stylized_swap``
+  才追加 ``stitched neck, visible seam, head slightly tilted``（默认不出现）；
+- **负向写到哪**：只有目标动作**本身有负向参数**时才真的写进去
+  （``[targets] list`` 新增第 7 段「负向参数名」，内置已为
+  ``image_generator_plugin-neo:draw_image`` 填好 ``negative_prompt``）；
+  nai_artist 的 ``share_photo`` / ``share_drawing`` **没有**负向参数（它的负向词在
+  nai_artist 自己的 ``character.negative_tags`` 里，本插件不碰别的插件配置），
+  那种情况只打一条 DEBUG；
+- **不碰**角色判定、二次一致性检查、幂等、归属校验与记忆库写回：追加排在它们之后，
+  特征词也不是角色表里的字符串，``fix`` 的替换 / 删除碰不到它。
+  新增用例 C119~C124（离线），原 C1~C118 的断言一条都没改，全套变为 C124 条。
 """
 
 from __future__ import annotations
@@ -335,7 +364,7 @@ class CharPromptGuardPlugin(BasePlugin):
         "生图前检测角色提示词：已含角色则放行，否则根据上文自动补入角色名+游戏名"
         "（或 NAI 角色标签），支持多角色同框"
     )
-    plugin_version: str = "1.0.34"
+    plugin_version: str = "1.0.36"
 
     # 注意：这里刻意**不加** ClassVar 注解 —— MPDT 的 ConfigValidator 用 libcst 只识别
     # 普通赋值（cst.Assign），写成 `configs: list[type] = [...]` 会被判成"插件未定义配置类"。

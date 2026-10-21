@@ -7,6 +7,51 @@ from typing import ClassVar
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 
+class RegionEntrySection(SectionBase):
+    """分区覆盖的一个条目：**某个角色在各分区里的特征词**（1.0.36，实验性功能）。
+
+    这是「分区覆盖」**自己的条目列表**里的**一项** —— 它**不是** ``[roster]`` 的一行，
+    也**不是** ``[outfits]`` 的一行：这里写的是"这个角色的头/身子/衣服/姿势/背景
+    分别长什么样"，供把不同角色的不同分区拼到同一张画面里用。
+    **默认不生效**：整份条目只在 ``[region_override] enabled = true`` 时才被读取。
+    """
+
+    name: str = Field(
+        default="",
+        description=(
+            "角色名：**必须是角色表里的名字或别名**（对不上 → 该角色不参与分区，"
+            "只打一条 DEBUG，其它注入照旧）"
+        ),
+    )
+    head: str = Field(
+        default="",
+        description=(
+            "head 分区（头 / 头发 / 眼睛）的特征词，英文、逗号分隔，"
+            "如 silver hair, long hair, blue eyes, headband"
+        ),
+    )
+    body: str = Field(
+        default="",
+        description=(
+            "body 分区（身子 / 体型）的特征词，如 slender, flat chest, pale skin"
+        ),
+    )
+    outfit: str = Field(
+        default="",
+        description="outfit 分区（衣服 / 穿着）的特征词，如 white dress",
+    )
+    pose: str = Field(
+        default="",
+        description="pose 分区（姿势 / 动作）的特征词，如 standing, hands on hips",
+    )
+    background: str = Field(
+        default="",
+        description=(
+            "background 分区（背景 / 场景）的特征词，如 night city, neon lights"
+        ),
+    )
+
+
 class CharPromptGuardConfig(BaseConfig):
     """角色提示词守卫插件配置类。"""
 
@@ -247,14 +292,20 @@ class CharPromptGuardConfig(BaseConfig):
             default="",
             description=(
                 "需要接管的生图 Action，每段："
-                "「插件名:action:动作名 | 提示词参数名 | 追加模式 | 模式参数 | 额外检测参数」，"
-                "后三项可省略。追加模式 natural=追加中文说明（生图插件会再翻译成标签，适配 nai_artist）；"
+                "「插件名:action:动作名 | 提示词参数名 | 追加模式 | 模式参数 | 额外检测参数 | "
+                "角色槽位参数 | 负向参数名」，后几项可省略。追加模式 natural=追加中文说明"
+                "（生图插件会再翻译成标签，适配 nai_artist）；"
                 "tags=直接追加 NAI 角色标签（提示词本身就是标签，适配 image_generator_plugin-neo）。"
-                "留空使用内置默认："
+                "**1.0.36 起最后一段是负向参数名**（可空）：只给「分区覆盖」的 "
+                "negative_swap 用 —— 动作用哪个参数承载负向提示词（neo 是 negative_prompt），"
+                "留空表示该动作没有负向参数（负向词只进 DEBUG，不改画面）。"
+                "留空使用内置默认（内置已为 neo 的 draw_image 填好 negative_prompt，"
+                "nai_artist 的三个动作留空）："
                 "nai_artist:action:share_photo | content | natural ; "
                 "nai_artist:action:share_drawing | content | natural ; "
                 "nai_artist:action:share_visual | content | natural | mode（nai_artist 1.2.x 及更早的旧动作名）; "
-                "image_generator_plugin-neo:action:draw_image | content_description | tags"
+                "image_generator_plugin-neo:action:draw_image | content_description | tags | "
+                "| characters | characters | negative_prompt"
             ),
         )
 
@@ -584,6 +635,89 @@ class CharPromptGuardConfig(BaseConfig):
             ),
         )
 
+    @config_section("region_override")
+    class RegionOverrideSection(SectionBase):
+        """实验性功能（默认关闭）：分区覆盖。
+
+        指定「头 / 头发 / 眼睛 用 A 的、身子 / 体型 用 B 的」这类分区拼接，也允许
+        单分区（只换头）。⚠️ 实验性功能：打开后**生图效果可能不理想** —— 分区拼接
+        只是"按词重画"，模型可能把两个角色的特征混在一起（串味）、比例异常或细节
+        崩坏；默认关闭，普通使用完全不受影响。识别不到说法时**零动作**
+        （不额外读上文、不调模型、不注入）。
+
+        本节的 ``entries`` 是**独立条目列表**，**不写进** ``[roster]`` / ``[outfits]``。
+        """
+
+        enabled: bool = Field(
+            default=False,
+            description=(
+                "实验性功能（默认关闭）：分区覆盖。打开后生图效果可能不理想 —— "
+                "分区拼接只是「按词重画」，模型可能把两个角色的特征混在一起（串味）、"
+                "比例异常或细节崩坏；默认关闭，普通使用完全不受影响。"
+                "打开后支持「头是流萤的，身子是爱莉的」「头换成流萤」"
+                "「用爱莉的身子配流萤的头」这类说法：识别「分区词 + 角色名 + 归属句式」"
+                "三重条件（缺一不认），把各分区条目里的特征词按 regions 的顺序拼进提示词"
+                "（head 写在最前面）。只从**用户最近几条消息**里做纯字符串解析，不调模型；"
+                "关闭 / 识别不到 / 条目里没有该角色 → 零动作"
+                "（不额外读上文、不调模型、不注入，其它注入照旧）"
+            ),
+        )
+        regions: list[str] = Field(
+            default_factory=lambda: [
+                "head",
+                "body",
+                "outfit",
+                "pose",
+                "background",
+            ],
+            description=(
+                "允许参与拼接的分区**列表** —— **顺序就是注入顺序**（head 在最前面）。"
+                "可用值：head（头 / 头发 / 眼睛）、body（身子 / 体型）、"
+                "outfit（衣服 / 穿着）、pose（姿势 / 动作）、background（背景 / 场景）。"
+                "没列出来的分区不会被注入；整份都写错/留空时按默认五个分区处理"
+            ),
+        )
+        stylized_swap: bool = Field(
+            default=False,
+            description=(
+                "额外加入「接缝 / 过渡」类描述词"
+                "（stitched neck, visible seam, head slightly tilted），"
+                "让拼接处更明显一些；默认 false（这些词一个都不出现）"
+            ),
+        )
+        negative_swap: bool = Field(
+            default=True,
+            description=(
+                "把「被换掉的那个角色在**同一个分区**里的原特征」写进负向提示词，"
+                "抑制两个角色串味（例：头用了流萤、身子用了爱莉希雅 → 负向里放"
+                "爱莉希雅的头/头发/眼睛特征与流萤的身子/体型特征；"
+                "与正向重复的词一律不放）。**只有当目标动作本身带负向参数时才真的写进去**："
+                "image_generator_plugin-neo 的 draw_image 有 negative_prompt；"
+                "nai_artist 的 share_photo / share_drawing 没有负向参数（它的负向词在"
+                "nai_artist 自己的 character.negative_tags 里，本插件不碰别的插件配置），"
+                "那种情况只打一条 DEBUG，画面一个字都不改"
+            ),
+        )
+        anti_mix: bool = Field(
+            default=True,
+            description=(
+                "多角色分区拼接时追加防串味负向词（mixed attributes, blended eyes）；"
+                "只有一句话里出现 ≥2 个不同角色时才加"
+            ),
+        )
+        entries: list[RegionEntrySection] = Field(
+            default_factory=list,
+            description=(
+                "★ 分区覆盖**自己的条目列表**（独立于 [roster] 与 [outfits]）："
+                "每个条目一个角色 —— name 填角色表里的名字或别名，"
+                "head / body / outfit / pose / background 分别填该角色各分区的特征词"
+                "（英文、逗号分隔）。用法见上面的 enabled 说明；"
+                "示例：name = 流萤 / head = silver hair, long hair, blue eyes, headband / "
+                "body = slender, flat chest, pale skin / outfit = white dress。"
+                "找不到条目 → 退回「不分区」并打一条 DEBUG（宁可少拼，也不瞎拼）"
+            ),
+        )
+
     general: GeneralSection = Field(default_factory=GeneralSection)
     roster: RosterSection = Field(default_factory=RosterSection)
     targets: TargetsSection = Field(default_factory=TargetsSection)
@@ -591,3 +725,6 @@ class CharPromptGuardConfig(BaseConfig):
     monitor: MonitorSection = Field(default_factory=MonitorSection)
     memory: MemorySection = Field(default_factory=MemorySection)
     outfits: OutfitsSection = Field(default_factory=OutfitsSection)
+    region_override: RegionOverrideSection = Field(
+        default_factory=RegionOverrideSection
+    )

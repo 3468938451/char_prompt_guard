@@ -49,6 +49,7 @@ MODULES = [
     f"{PLUGIN_NAME}.monitor",
     f"{PLUGIN_NAME}.outfit",
     f"{PLUGIN_NAME}.plugin",
+    f"{PLUGIN_NAME}.region",
     f"{PLUGIN_NAME}.tag_hint",
 ]
 
@@ -374,6 +375,98 @@ def main() -> int:
             and "照抄改掉即可" in wear_desc
             and "不是具体皮肤名" in wear_desc,
             f"wear_types.description={wear_desc!r}",
+        )
+        # 1.0.36 新增：**实验性功能**「分区覆盖」（[region_override]）—— 默认关闭，
+        # 独立的条目列表（不写进 [roster] / [outfits]），五个分区字段 + 一个角色名。
+        check(
+            "1.0.36 分区覆盖默认关闭（region_override.enabled=false）",
+            cfg.region_override.enabled is False,
+            f"region_override.enabled={cfg.region_override.enabled!r}",
+        )
+        check(
+            "1.0.36 分区覆盖条目默认空列表（独立列表，不塞进 [roster]/[outfits]）",
+            cfg.region_override.entries == [],
+            f"region_override.entries={cfg.region_override.entries!r}",
+        )
+        check(
+            "1.0.36 分区覆盖默认：negative_swap/anti_mix 开、stylized_swap 关",
+            cfg.region_override.negative_swap is True
+            and cfg.region_override.anti_mix is True
+            and cfg.region_override.stylized_swap is False,
+            (
+                f"negative_swap={cfg.region_override.negative_swap!r} "
+                f"anti_mix={cfg.region_override.anti_mix!r} "
+                f"stylized_swap={cfg.region_override.stylized_swap!r}"
+            ),
+        )
+        check(
+            "1.0.36 分区顺序默认 head→body→outfit→pose→background",
+            cfg.region_override.regions
+            == ["head", "body", "outfit", "pose", "background"],
+            f"region_override.regions={cfg.region_override.regions!r}",
+        )
+        region_enabled_field = type(cfg.region_override).__dict__.get("enabled")
+        if region_enabled_field is None:
+            region_enabled_field = type(cfg.region_override).model_fields.get(
+                "enabled"
+            )
+        region_desc = str(getattr(region_enabled_field, "description", "") or "")
+        check(
+            "1.0.36 分区覆盖的说明第一句就是「实验性功能（默认关闭）」+ 效果警告",
+            region_desc.startswith("实验性功能（默认关闭）：分区覆盖。")
+            and "生图效果可能不理想" in region_desc
+            and "默认关闭，普通使用完全不受影响" in region_desc,
+            f"enabled.description={region_desc!r}",
+        )
+        from ..region import (
+            DEFAULT_REGIONS,
+            RegionSwap,
+            parse_region_entries,
+            parse_region_overrides,
+            parse_regions,
+        )
+
+        entry = {
+            "name": "流萤",
+            "head": "silver hair, blue eyes",
+            "body": "slender",
+        }
+        parsed_entries = parse_region_entries([entry])
+        check(
+            "1.0.36 分区条目解析：name + 各分区字段 → RegionEntry",
+            len(parsed_entries) == 1
+            and parsed_entries[0].name == "流萤"
+            and parsed_entries[0].keywords("head") == ("silver hair", "blue eyes")
+            and parsed_entries[0].keywords("body") == ("slender",)
+            and parsed_entries[0].keywords("pose") == (),
+            f"entries={parsed_entries!r}",
+        )
+        check(
+            "1.0.36 分区顺序解析：非法值丢弃、整份都非法时用默认五个分区",
+            parse_regions("body, head, 不存在") == ("body", "head")
+            and parse_regions("") == DEFAULT_REGIONS,
+            (
+                f"parse_regions('body, head, 不存在')="
+                f"{parse_regions('body, head, 不存在')!r}"
+            ),
+        )
+        check(
+            "1.0.36 三重条件缺一不认：只有角色名 / 只有分区词都不解析",
+            parse_region_overrides("画流萤", [], parsed_entries) == {}
+            and parse_region_overrides("头疼", [], parsed_entries) == {}
+            and parse_region_overrides(
+                "头换成流萤", [], parsed_entries
+            )
+            == {"head": "流萤"},
+            (
+                f"画流萤={parse_region_overrides('画流萤', [], parsed_entries)!r} "
+                f"头换成流萤="
+                f"{parse_region_overrides('头换成流萤', [], parsed_entries)!r}"
+            ),
+        )
+        check(
+            "1.0.36 RegionSwap 空结果不算成功（没拼出东西就不注入）",
+            RegionSwap().ok is False and RegionSwap().parts == (),
         )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")

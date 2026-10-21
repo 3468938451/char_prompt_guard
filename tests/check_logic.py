@@ -281,6 +281,25 @@ C109~C111 新增；**原 C1~C103 与 C105/C106 的断言一个字都没改**）�
 ``already_patched`` / ``already_installed`` / ``applied``），插件入口按它各打一条
 INFO / WARNING（``unsupported`` 是唯一按 WARNING 打的那种）。
 
+**1.0.36 新增六条（C119~C124；原 C1~C118 的断言一条都没改、也没放宽）**：
+这一版加的是 **实验性功能**「分区覆盖」（``[region_override]``，**默认关闭**）——
+打开后生图效果可能不理想（模型可能把两个角色的特征混在一起、比例异常或细节崩坏），
+普通使用完全不受影响。实现拆成「纯字符串解析（``region.py``）」+「最后一步追加
+（``handler._apply_region_override``）」，**不碰**角色判定 / 一致性检查 / 幂等 /
+归属校验 / 记忆库写回。
+
+| 用例 | 钉住什么 |
+| --- | --- |
+| C119 | **分区解析 = 三重条件**（分区词 + 角色名 + 归属句式，缺一不认）：三种入口语言各断言一次 —— ``头是流萤的，身子是爱莉的`` → ``{head: 流萤, body: 爱莉希雅}``、``头换成流萤`` → ``{head: 流萤}``、``用爱莉的身子配流萤的头`` → ``{head: 流萤, body: 爱莉希雅}``；别名「爱莉」归一到角色表正式名「爱莉希雅」 |
+| C120 | **注入**（两跑）：A nai_artist（natural）→ 正向段含 head 与 body 特征词且 **head 在前**、段落在角色说明之后；``negative_swap=true`` 时"被换掉那个角色在同分区的原特征"（爱莉希雅的头 / 流萤的身子）出现在 DEBUG —— nai_artist 的 Action 没有负向参数；B image_generator_plugin-neo（tags）→ 关键词追加进 ``content_description``，负向词**真的**写进 ``negative_prompt`` 并带上 ``anti_mix`` 的防串味词 |
+| C121 | **单分区**：``头换成流萤`` 只动 head（``头=流萤`` 恰好一段），流萤条目里的 body / outfit 特征词**一个都不出现**，且角色仍在分区段之前 |
+| C122 | **防误触发**：``流萤的头饰很好看`` / ``头疼`` / ``画流萤`` 三句 → 解析为空、没有分区注入、**没有任何"分区覆盖"相关日志**、没有负向参数被写 |
+| C123 | **开关与降级**：① ``region_override.enabled=false``（默认）→ 零动作（内容与"没配条目"时逐字一致、日志无 ``分区覆盖``）；② 开着但 ``entries`` 里没有该角色 → **不分区** + DEBUG（``分区覆盖=跳过`` / ``entries 里没有该角色的条目``），角色注入照旧 |
+| C124 | ``stylized_swap``：true → 正向段出现 ``stitched neck`` / ``visible seam`` / ``head slightly tilted``（``接缝过渡`` 标签）；false（默认）→ 这三句**正向与负向都不出现** |
+
+C119~C124 全部离线（不调模型）：分区条目用**真的配置节类**
+（``config.RegionEntrySection``）构造，触发消息里直接写入口语言。
+
 用法（用实例自带 venv）：
 
     $env:NEO_ROOT="<你的 Neo-MoFox 框架根>"
@@ -387,6 +406,12 @@ def make_config(
     outfits_enabled: bool = False,
     outfits_auto_resolve: bool = True,
     outfits_infer_unnamed: bool = False,
+    region_entries: list | None = None,
+    region_enabled: bool = False,
+    region_regions: list[str] | None = None,
+    region_stylized: bool = False,
+    region_negative_swap: bool = True,
+    region_anti_mix: bool = True,
 ) -> CharPromptGuardConfig:
     """按用例参数构造配置。
 
@@ -402,6 +427,10 @@ def make_config(
     1.0.28 的穿着类型表 ``outfits.wear_types`` 同样**默认留空**（= 只用内置表），
     用例里没有额外开关要传。
     （插件配置类里的默认值仍是 ``true`` —— 见 tests/check_import.py 的默认值断言。）
+    1.0.36 起 ``[region_override]``（**实验性功能**：分区覆盖）**默认关掉**，与配置
+    类里的 ``enabled = false`` 一致：C1~C118 是 1.0.34 及以前的行为回归，不该因为
+    本机恰好配了分区条目而变红；需要分区覆盖的用例（C119~C124）显式传
+    ``region_enabled=True`` 与 ``region_entries=...``。
     """
     cfg = CharPromptGuardConfig()
     cfg.general.enabled = general_enabled
@@ -416,6 +445,16 @@ def make_config(
     cfg.outfits.entries = outfits
     cfg.outfits.auto_resolve = outfits_auto_resolve
     cfg.outfits.infer_unnamed = outfits_infer_unnamed
+    # 1.0.36：分区覆盖（实验性功能，默认关闭）
+    cfg.region_override.enabled = region_enabled
+    cfg.region_override.entries = list(region_entries or [])
+    if region_regions is not None:
+        # 默认不覆盖 → 用配置类给的列表（["head", "body", ...]）；
+        # 想换顺序 / 只留部分分区时传一个列表进来（`region.parse_regions` 也认字符串写法）
+        cfg.region_override.regions = region_regions
+    cfg.region_override.stylized_swap = region_stylized
+    cfg.region_override.negative_swap = region_negative_swap
+    cfg.region_override.anti_mix = region_anti_mix
     return cfg
 
 
@@ -1042,6 +1081,70 @@ LATEST_NAMED_OUTFIT_REQUEST = "画爱莉的婚纱～"
 LATEST_NAMED_STICKY_REQUEST = "那画流萤吧"
 #: C108：画面描述里**已经写着流萤**的标签（1.0.19 的期望集合对账要替换掉它）
 FIREFLY_SCENE = f"{TAG_FIREFLY}, 银白色长发的少女站在镜头前，一身蓝裙，手里握着长杖"
+
+
+# ── 1.0.36（分区覆盖：**实验性功能**，默认关闭）用例的夹具 ────────────────
+#
+# 需求原话：「可以指定「头/头发/眼睛 用 A 的、身子/体型 用 B 的」这类分区拼接；
+# 也允许单分区（只换头）」，入口语言至少覆盖下面三句，识别不到就什么都不做。
+# 角色表用 RS3（流萤 / 爱莉希雅），分区特征词全部走**独立条目列表**
+# ``[region_override] entries``（不是 [roster]、也不是 [outfits]）。
+
+#: C119：一句里两个分区（`头是…的，身子是…的`）
+REGION_SWAP_PHRASE = "头是流萤的，身子是爱莉的"
+#: C121：单分区（只换头）
+REGION_SINGLE_PHRASE = "头换成流萤"
+#: C119：「用…的」+「配…的」两个归属句式拼在一句里
+REGION_COMPOSE_PHRASE = "用爱莉的身子配流萤的头"
+#: C122：三句**都不该触发**（分区词后面不是归属句式 / 没有分区词 / 没有归属句式）
+REGION_FALSE_PHRASES = ("流萤的头饰很好看", "头疼", "画流萤")
+
+#: 流萤 / 爱莉希雅在两个分区里的特征词（负向要能看出"被换掉的那个人的原词"）
+REGION_FIREFLY_HEAD = ("silver hair", "long hair", "blue eyes", "headband")
+REGION_FIREFLY_BODY = ("slender", "flat chest", "pale skin")
+REGION_FIREFLY_OUTFIT = ("white dress",)
+REGION_ELYSIA_HEAD = ("pink hair", "purple eyes", "elf ears")
+REGION_ELYSIA_BODY = ("curvy", "tall", "soft skin")
+REGION_ELYSIA_OUTFIT = ("pink elf dress",)
+
+#: C124：`stylized_swap` 打开时才出现的「接缝 / 过渡」类描述词
+REGION_STYLIZED_TERMS = ("stitched neck", "visible seam", "head slightly tilted")
+#: C120/C124：`anti_mix` 多角色时追加的防串味负向词
+REGION_ANTI_MIX_TERMS = ("mixed attributes", "blended eyes")
+
+
+def region_entries(
+    *,
+    include_firefly: bool = True,
+    include_elysia: bool = True,
+) -> list:
+    """造 ``[region_override] entries``：流萤 + 爱莉希雅两条（可各关掉一条）。
+
+    用**真的配置节类**（``RegionEntrySection``）而不是字典：这样用例同时钉住
+    「配置段 / 条目列表的形状就是插件读的那一份」（字段名、默认值都一致）。
+    """
+    from ..config import RegionEntrySection
+
+    entries = []
+    if include_firefly:
+        entries.append(
+            RegionEntrySection(
+                name="流萤",
+                head=", ".join(REGION_FIREFLY_HEAD),
+                body=", ".join(REGION_FIREFLY_BODY),
+                outfit=", ".join(REGION_FIREFLY_OUTFIT),
+            )
+        )
+    if include_elysia:
+        entries.append(
+            RegionEntrySection(
+                name="爱莉希雅",  # 角色表里的**正式名**；用户写别名「爱莉」也归一到它
+                head=", ".join(REGION_ELYSIA_HEAD),
+                body=", ".join(REGION_ELYSIA_BODY),
+                outfit=", ".join(REGION_ELYSIA_OUTFIT),
+            )
+        )
+    return entries
 
 
 # ── 1.0.34（框架运行时兼容 shim）用例的离线桩 ───────────────────────────
@@ -6817,6 +6920,318 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C118 开关关掉 / 原函数抛异常 / 没有 run_tool_call 三条兜底",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C119（1.0.36）分区解析：三种归属句式 → {分区: 角色} ─────────────────
+    # 1.0.36 的「分区覆盖」是**实验性功能、默认关闭**（见 [region_override]）。
+    # 解析侧是**三重条件**（分区词 + 角色名 + 归属句式），缺一不认 —— 这里只钉
+    # "三种入口语言都能解析出正确的分区归属"，且角色一律归一到**角色表里的正式名**
+    # （用户写别名「爱莉」→「爱莉希雅」）。三种句式各断言一次：
+    #   ① ``头是流萤的，身子是爱莉的``（「是…的」两句连写）
+    #   ② ``头换成流萤``（「换成」，单分区）
+    #   ③ ``用爱莉的身子配流萤的头``（「用…的」+「配…的」）
+    try:
+        from ..character import parse_roster
+        from ..region import parse_region_entries, parse_region_overrides
+
+        roster = parse_roster(RS3)
+        entries = parse_region_entries(region_entries())
+        runs = [
+            (REGION_SWAP_PHRASE, {"head": "流萤", "body": "爱莉希雅"}),
+            (REGION_SINGLE_PHRASE, {"head": "流萤"}),
+            (REGION_COMPOSE_PHRASE, {"head": "流萤", "body": "爱莉希雅"}),
+        ]
+        parsed = [
+            (phrase, parse_region_overrides(phrase, roster, entries), expected)
+            for phrase, expected in runs
+        ]
+        check(
+            "C119 分区解析：三种归属句式各解析一次（角色归一到正式名）",
+            all(got == expected for _, got, expected in parsed),
+            "\n        ".join(
+                f"{phrase!r} → {got!r}（期望 {expected!r}）"
+                for phrase, got, expected in parsed
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C119 分区解析：三种归属句式各解析一次（角色归一到正式名）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C120（1.0.36）注入：正向拼装（head 靠前）+ negative_swap 负向 ────────
+    # 两跑：
+    #   A. nai_artist（natural）→ 角色说明之后追加
+    #      ``（分区覆盖：头=流萤：…；身子=爱莉希雅：…）``，head 特征词**在 body 之前**；
+    #      nai_artist 的 Action **没有**负向参数 → negative_swap 只进 DEBUG
+    #      （"负向词无槽位可写"那一行里能看到"被换掉那个人"的原词），画面一字不改；
+    #   B. image_generator_plugin-neo（tags）→ 关键词追加进 content_description，
+    #      负向词**真的**写进 negative_prompt（动作本身有这个参数，见 target.negative_arg），
+    #      并带上 anti_mix 的防串味词。
+    try:
+        entries = region_entries()
+        runs: list[tuple[str, bool, str]] = []
+
+        cfg_natural = make_config(
+            roster=RS3, region_enabled=True, region_entries=entries
+        )
+        cfg_natural.general.history_cache_ttl = 0.0
+        params = natural_params("帮我画一张她战斗的样子", text=REGION_SWAP_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg_natural, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "A natural：正向 head/body 都在且 head 靠前，负向进 DEBUG",
+                all(word in content for word in REGION_FIREFLY_HEAD)
+                and all(word in content for word in REGION_ELYSIA_BODY)
+                and content.index("silver hair") < content.index("curvy")
+                and "分区覆盖" in content
+                and "负向词无槽位可写" in records
+                # 被换掉的「头」= 爱莉希雅的头；被换掉的「身子」= 流萤的身子
+                and all(word in records for word in REGION_ELYSIA_HEAD)
+                and all(word in records for word in REGION_FIREFLY_BODY)
+                and "negative_prompt" not in out["args"],
+                f"content = {content!r}\n        日志 = {records!r}",
+            )
+        )
+
+        cfg_tags = make_config(
+            roster=RS3, region_enabled=True, region_entries=entries
+        )
+        cfg_tags.general.history_cache_ttl = 0.0
+        params = tags_params("1girl, solo, standing", text=REGION_SWAP_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg_tags, params)
+        content = out["args"]["content_description"]
+        negative = str(out["args"].get("negative_prompt") or "")
+        runs.append(
+            (
+                "B tags：正向关键词追加 + 负向写进 negative_prompt",
+                all(word in content for word in REGION_FIREFLY_HEAD)
+                and all(word in content for word in REGION_ELYSIA_BODY)
+                and content.index("silver hair") < content.index("curvy")
+                and all(word in negative for word in REGION_ELYSIA_HEAD)
+                and all(word in negative for word in REGION_FIREFLY_BODY)
+                and all(word in negative for word in REGION_ANTI_MIX_TERMS),
+                f"content = {content!r}\n        负向 = {negative!r}",
+            )
+        )
+        check(
+            "C120 分区注入：正向按 head→body 拼装、negative_swap 写入被换掉角色的特征词",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C120 分区注入：正向按 head→body 拼装、negative_swap 写入被换掉角色的特征词",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C121（1.0.36）单分区：`头换成流萤` 只动 head，body / outfit 不变 ─────
+    # 需求原话「也允许单分区（只换头）」：正向段里只出现一个分区（头），
+    # 条目里流萤的 body / outfit 特征词**一个都不许出现**（它们没被指定）。
+    try:
+        cfg = make_config(
+            roster=RS3, region_enabled=True, region_entries=region_entries()
+        )
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params("帮我画一张她战斗的样子", text=REGION_SINGLE_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        ok = (
+            "silver hair" in content
+            and "blue eyes" in content
+            and "分区覆盖" in content
+            and content.count("头=流萤") == 1
+            and "身子=" not in content  # ★ 单分区：没有 body 段
+            and "衣服=" not in content  # ★ 单分区：没有 outfit 段
+            and all(word not in content for word in REGION_FIREFLY_BODY)
+            and all(word not in content for word in REGION_FIREFLY_OUTFIT)
+            # 角色在前、分区覆盖在后（走的还是既有注入通道）
+            and content.index("流萤") < content.index("silver hair")
+            and "分区覆盖: 头=流萤" in records
+        )
+        check(
+            "C121 单分区（头换成流萤）：只动 head，body / outfit 不变",
+            ok,
+            f"content = {content!r}\n        日志 = {records!r}",
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C121 单分区（头换成流萤）：只动 head，body / outfit 不变",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C122（1.0.36）防误触发：三句都**不该**命中 ───────────────────────────
+    # 三重条件缺一不认，所以：
+    #   ① ``流萤的头饰很好看`` —— 有角色名、也"看起来有分区词"，但「头」后面是「饰」
+    #      不是归属句式 → 不命中（尾边界挡住 `用…的<分区词>` 那一族）；
+    #   ② ``头疼`` —— 只有分区词，没有角色、没有归属句式；
+    #   ③ ``画流萤`` —— 只有角色名，没有分区词。
+    # 三条都要求：**没有分区注入、没有任何"分区覆盖"相关日志**（识别不到 = 零动作）。
+    try:
+        from ..character import parse_roster
+        from ..region import parse_region_entries, parse_region_overrides
+
+        roster = parse_roster(RS3)
+        entries = parse_region_entries(region_entries())
+        cfg = make_config(
+            roster=RS3, region_enabled=True, region_entries=region_entries()
+        )
+        cfg.general.history_cache_ttl = 0.0
+        runs: list[tuple[str, bool, str]] = []
+        for phrase in REGION_FALSE_PHRASES:
+            parsed = parse_region_overrides(phrase, roster, entries)
+            params = natural_params("帮我画一张她战斗的样子", text=phrase)
+            with LogCapture() as logs:
+                out = await fire(cfg, params)
+            content = out["args"]["content"]
+            records = logs.records_text()
+            runs.append(
+                (
+                    phrase,
+                    parsed == {}
+                    and "分区覆盖" not in content
+                    and "分区覆盖" not in records
+                    and "negative_prompt" not in out["args"],
+                    f"解析={parsed!r} content={content!r}",
+                )
+            )
+        check(
+            "C122 防误触发：头饰 / 头疼 / 画流萤 都不命中（无注入、无相关日志）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C122 防误触发：头饰 / 头疼 / 画流萤 都不命中（无注入、无相关日志）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C123（1.0.36）开关与降级：enabled=false 零动作 / 条目缺角色→DEBUG ────
+    # A. ``region_override.enabled = false``（默认）→ **零动作**：内容与"没配条目"
+    #    时逐字一致，日志里连"分区覆盖"都没有；
+    # B. 开着但 ``entries`` 里没有该角色（只配了爱莉希雅，说的是流萤）→
+    #    **退回不分区**、打一条 DEBUG、角色注入照旧（流萤照常补进来）。
+    try:
+        runs: list[tuple[str, bool, str]] = []
+
+        scene = "帮我画一张她战斗的样子"
+        cfg_off = make_config(
+            roster=RS3, region_enabled=False, region_entries=region_entries()
+        )
+        cfg_off.general.history_cache_ttl = 0.0
+        cfg_bare = make_config(roster=RS3, region_enabled=False)
+        cfg_bare.general.history_cache_ttl = 0.0
+        params = natural_params(scene, text=REGION_SWAP_PHRASE)
+        with LogCapture() as logs_off:
+            out_off = await fire(cfg_off, params)
+        with LogCapture() as logs_bare:
+            out_bare = await fire(cfg_bare, params)
+        content_off = out_off["args"]["content"]
+        records_off = logs_off.records_text()
+        runs.append(
+            (
+                "A enabled=false → 零动作",
+                content_off == out_bare["args"]["content"]
+                and "分区覆盖" not in content_off
+                and "分区覆盖" not in records_off
+                and "分区覆盖" not in logs_bare.records_text(),
+                f"content = {content_off!r}\n        日志 = {records_off!r}",
+            )
+        )
+
+        cfg_missing = make_config(
+            roster=RS3,
+            region_enabled=True,
+            region_entries=region_entries(include_firefly=False),
+        )
+        cfg_missing.general.history_cache_ttl = 0.0
+        params = natural_params(scene, text=REGION_SINGLE_PHRASE)
+        with LogCapture() as logs_missing:
+            out_missing = await fire(cfg_missing, params)
+        content_missing = out_missing["args"]["content"]
+        debugs_missing = logs_missing.debugs()
+        runs.append(
+            (
+                "B 条目里没有该角色 → 不分区、打 DEBUG、其它注入照旧",
+                "流萤" in content_missing  # 角色注入照旧
+                and "分区覆盖" not in content_missing  # 没有分区段
+                and all(word not in content_missing for word in REGION_FIREFLY_HEAD)
+                and "分区覆盖=跳过" in debugs_missing
+                and "entries 里没有该角色的条目" in debugs_missing,
+                f"content = {content_missing!r}\n        DEBUG = {debugs_missing!r}",
+            )
+        )
+        check(
+            "C123 开关与降级：enabled=false 零动作 / 条目缺角色 → 不分区 + DEBUG",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C123 开关与降级：enabled=false 零动作 / 条目缺角色 → 不分区 + DEBUG",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C124（1.0.36）stylized_swap：开 → 出现「接缝/过渡」词，关 → 一个都不出现 ──
+    # 两跑同一句话：`stylized_swap=true` 时正向段末尾多一段
+    # ``接缝过渡：stitched neck, visible seam, head slightly tilted``；
+    # `false`（默认）时这三句**正向与负向都不许出现**（关掉就是逐字不加）。
+    try:
+        runs: list[tuple[str, bool, str]] = []
+        for stylized in (True, False):
+            cfg = make_config(
+                roster=RS3,
+                region_enabled=True,
+                region_entries=region_entries(),
+                region_stylized=stylized,
+            )
+            cfg.general.history_cache_ttl = 0.0
+            params = natural_params(
+                "帮我画一张她战斗的样子", text=REGION_SWAP_PHRASE
+            )
+            with LogCapture() as logs:
+                out = await fire(cfg, params)
+            content = out["args"]["content"]
+            records = logs.records_text()
+            present = [term for term in REGION_STYLIZED_TERMS if term in content]
+            in_logs = [term for term in REGION_STYLIZED_TERMS if term in records]
+            if stylized:
+                hit = (
+                    len(present) == len(REGION_STYLIZED_TERMS)
+                    and "接缝过渡" in content
+                    # 这些词是**正向**的（画面里就该有那道接缝），不是负向
+                    and "分区覆盖" in content
+                )
+            else:
+                hit = not present and not in_logs
+            runs.append(
+                (
+                    f"stylized_swap={stylized}",
+                    hit,
+                    f"content = {content!r}\n        日志 = {records!r}",
+                )
+            )
+        check(
+            "C124 stylized_swap：true → 接缝/过渡词出现；false → 一个都不出现",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C124 stylized_swap：true → 接缝/过渡词出现；false → 一个都不出现",
             False,
             f"{type(e).__name__}: {e}",
         )

@@ -354,15 +354,31 @@ off/warn/fix，与期望集合那套互不影响）：
 （标点 / 空白 / 串尾 / emoji）即放行，另外额外放行那 10 个句末语气词；实词汉字不放行**），
 正则、常量、判定链与用例（仍是 C1~C115 共 115 条）一个字都没动。
 
-1.0.34 起**只加一层运行时兼容，判定链一个字都没动**（本文件**一行未改**）：插件加载时由
+1.0.34 起**只加一层运行时兼容，判定链一个字都没动**（当时本文件**一行未改**）：插件加载时由
 :mod:`compat` 探测 ``src/core/utils/llm_tool_call.py`` 是否已经在发本文件订阅的那两个
 「执行前事件」（``before_action_call`` / ``before_tool_call``）—— 没发就在**内存里**给
 ``run_tool_call`` 补一层包装（**不写任何文件**、不改框架源码、不 import 补丁的内部符号），
 已打静态补丁 / 上游原生支持时**一行代码都不执行**。事件参数与既有发布点同形
 （``signature`` / ``action_name`` / ``tool_name`` / ``args`` / ``message`` / ``stream_id``），
 ``stream_id`` 的解析照旧走本文件的 :func:`resolve_stream_id`，所以**判定链无需任何改动**。
-新增用例 C116~C118（离线桩）覆盖「识别已打补丁 / 补上并改写 args / 开关与异常兜底」，
-全套用例因此变为 C1~C118 共 118 条。
+新增用例 C116~C118（离线桩）覆盖「识别已打补丁 / 补上并改写 args / 开关与异常兜底」。
+
+1.0.36 起新增一个**实验性功能**「分区覆盖」（``[region_override]``，**默认关闭**，
+解析与拼装在 :mod:`region`，注入在本文件的 :meth:`CharacterGuardHandler._apply_region_override`）：
+
+- ⚠️ 实验性功能：打开后**生图效果可能不理想**（模型可能把两个角色的特征混在一起、
+  比例异常或细节崩坏）；**默认关闭，普通使用完全不受影响** —— 关着时
+  ``_resolve_region_override`` 第一行就返回（不解析、不额外读上文、不调模型、不打日志）；
+- 打开后「头/头发/眼睛 用 A 的、身子/体型 用 B 的」这类说法会被解析成
+  ``{head: 流萤, body: 爱莉希雅}``（**分区词 + 角色名 + 归属句式**三重条件，缺一不认），
+  按 ``regions`` 的顺序（默认 head 在最前）拼成一段追加在**角色与皮肤/穿着之后**；
+  各分区特征词来自**独立的条目列表** ``[[region_override.entries]]``
+  （不是 ``[roster]``、也不是 ``[outfits]``），找不到条目 → 退回不分区 + DEBUG；
+- ``negative_swap`` 的负向词只写进目标动作**自己**的负向参数
+  （``TargetSpec.negative_arg``，内置只有 neo 的 ``draw_image`` 有），
+  nai_artist 没有负向参数 → 只打 DEBUG；
+- **不碰**判定链、一致性检查、幂等、归属校验与记忆库写回（注入排在它们之后）。
+  新增用例 C119~C124（离线），原 C1~C118 的断言一条都没改，全套变为 C1~C124 共 124 条。
 """
 
 from __future__ import annotations
@@ -385,6 +401,7 @@ from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
 from . import memory as memory_api
+from . import region as region_api
 from . import tag_hint
 from .character import (
     ADDITIVE_WORDS,
@@ -634,6 +651,11 @@ class TargetSpec:
         mode_arg: 需要按 ``general.apply_modes`` 过滤的参数名（如 nai_artist 的 mode）
         detect_args: 额外参与"是否已含角色"判断的参数名
         characters_arg: 独立角色槽位参数名（tags 模式多人时使用）
+        negative_arg: 负向提示词参数名（1.0.36，**只给分区覆盖的 ``negative_swap`` 用**）。
+            留空 = 这个动作**没有负向参数**，负向词只写进 DEBUG 日志、不改画面：
+            nai_artist 的 ``share_photo`` / ``share_drawing`` 就是这样（它的负向词在
+            nai_artist 自己的 ``character.negative_tags`` 里，本插件不碰别的插件配置）；
+            ``image_generator_plugin-neo`` 的 ``draw_image`` 是 ``negative_prompt``
     """
 
     plugin: str
@@ -643,6 +665,7 @@ class TargetSpec:
     mode_arg: str = ""
     detect_args: tuple[str, ...] = ()
     characters_arg: str = ""
+    negative_arg: str = ""
 
 
 @dataclass
@@ -715,6 +738,8 @@ _BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
         append_mode=APPEND_MODE_TAGS,
         detect_args=("characters",),
         characters_arg="characters",
+        # 1.0.36：这个动作**有**负向参数，分区覆盖的 negative_swap 才能真的写进去
+        negative_arg="negative_prompt",
     ),
 )
 
@@ -722,7 +747,7 @@ _BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
 def parse_targets(raw_text: str) -> list[TargetSpec]:
     """解析目标 Action 表。
 
-    每段格式：``插件名:action:动作名 | 提示词参数名 | 追加模式 | 模式参数 | 额外检测参数 | 角色槽位参数``。
+    每段格式：``插件名:action:动作名 | 提示词参数名 | 追加模式 | 模式参数 | 额外检测参数 | 角色槽位参数 | 负向参数名``。
     第 2 段必填，其余可省略。未配置时返回内置默认目标。
     """
     entries = iter_config_entries(raw_text)
@@ -758,6 +783,9 @@ def parse_targets(raw_text: str) -> list[TargetSpec]:
                 if name.strip()
             )
         characters_arg = parts[5] if len(parts) > 5 else ""
+        # 1.0.36：第 7 段是**负向提示词参数名**（可空）—— 只有动作本身有负向参数时
+        # 才填，填了分区覆盖的 negative_swap 才会真的把负向词写进去
+        negative_arg = parts[6] if len(parts) > 6 else ""
         targets.append(
             TargetSpec(
                 plugin=plugin,
@@ -767,6 +795,7 @@ def parse_targets(raw_text: str) -> list[TargetSpec]:
                 mode_arg=mode_arg,
                 detect_args=detect_args,
                 characters_arg=characters_arg,
+                negative_arg=negative_arg,
             )
         )
     return targets or list(_BUILTIN_TARGETS)
@@ -1036,6 +1065,22 @@ def _outfit_entries(config: CharPromptGuardConfig) -> list[OutfitEntry]:
     return _cached_parse(
         str(getattr(section, "entries", "") or ""), _outfits_cache, parse_outfits
     )
+
+
+def _region_entries(config: CharPromptGuardConfig) -> list[region_api.RegionEntry]:
+    """把 ``region_override.entries``（数组节，**独立条目列表**）归一成条目对象。
+
+    1.0.36 的「分区覆盖」是**实验性功能、默认关闭**：只有
+    ``region_override.enabled = true`` 时才会走到这里（见
+    :meth:`CharacterGuardHandler._resolve_region_override` 的第一行）。
+    列表本身由框架按 ``[[region_override.entries]]`` 解析成
+    ``RegionEntrySection`` 实例；:func:`region.parse_region_entries` 对
+    "节实例 / 字典 / 单条"三种形状都能接，条目为空时返回空列表 → 调用方直接
+    **退回不分区**（不解析、不打日志）。
+    """
+    section = getattr(config, "region_override", None)
+    raw = getattr(section, "entries", None) if section is not None else None
+    return region_api.parse_region_entries(raw)
 
 
 def _wear_types(config: CharPromptGuardConfig) -> dict[str, WearTypeMatch]:
@@ -1841,6 +1886,18 @@ class CharacterGuardHandler(BaseEventHandler):
         outfit = await self._resolve_outfit(
             params=params, config=config, roster=roster, scope=outfit_scope
         )
+        # 1.0.36：**实验性功能**「分区覆盖」（[region_override]，默认关闭）——
+        # 与角色判定 / 一致性检查 / 幂等 / 归属校验 / 记忆库写回**全部解耦**：
+        # 只拿上面**已经读到的**那批用户消息（outfit_scope.texts，触发消息在前）
+        # 做一次纯字符串解析，得到「哪个分区用谁的特征词」，注入统一放在
+        # _finalize 的最后一步（角色 → 皮肤/穿着 → 分区覆盖）。
+        # 开关关闭时本调用**立刻返回**（不解析、不额外读上文、不调模型、不打日志）。
+        region_swap = self._resolve_region_override(
+            params=params,
+            config=config,
+            roster=roster,
+            texts=outfit_scope.texts,
+        )
         # 1.0.20：「用户点名了角色表外角色」这条判断要看**用户最近说过什么**，
         # 所以先把焦点范围内的用户消息扫一遍（触发消息 + 触发前最近 N 条用户消息，
         # 只取用户消息）。consistency_check="off" 时**一次都不扫**（连上文都不读），
@@ -1913,6 +1970,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 naming_scope=user_naming,
                 resolved=injected,
                 outfit=outfit,
+                region=region_swap,
             )
 
         # 1.0.18：判定**不确定**且描述里没有角色表内角色时，先去外部记忆库
@@ -2006,6 +2064,7 @@ class CharacterGuardHandler(BaseEventHandler):
                     naming_scope=user_naming,
                     resolved=resolved,
                     outfit=outfit,
+                    region=region_swap,
                 )
             target_characters = candidates[:1]
         else:
@@ -2036,6 +2095,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 naming_scope=user_naming,
                 resolved=resolved,
                 outfit=outfit,
+                region=region_swap,
             )
 
         new_content = self._apply(
@@ -2062,6 +2122,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 naming_scope=user_naming,
                 resolved=resolved,
                 outfit=outfit,
+                region=region_swap,
             )
 
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
@@ -2087,6 +2148,7 @@ class CharacterGuardHandler(BaseEventHandler):
             naming_scope=user_naming,
             resolved=resolved,
             outfit=outfit,
+            region=region_swap,
         )
 
     # ── 记忆库再确认（1.0.18）─────────────────────────────────────
@@ -4771,8 +4833,9 @@ class CharacterGuardHandler(BaseEventHandler):
         naming_scope: UserNamingScope | None = None,
         resolved: CharacterEntry | None = None,
         outfit: ResolvedOutfit | None = None,
+        region: region_api.RegionSwap | None = None,
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """统一的收尾：跑二次一致性检测 → 追加皮肤 → 内容有变化才回写 args。
+        """统一的收尾：跑二次一致性检测 → 追加皮肤 → 追加分区覆盖 → 回写 args。
 
         ``track``（本次主题跟踪的完整结果）与 ``memory``（1.0.19 描述点名时的
         **对账用**记忆库查询结果）都只是给一致性检测提供「期望集合」的证据，
@@ -4808,6 +4871,14 @@ class CharacterGuardHandler(BaseEventHandler):
         ``（穿着：“…”：…）``、幂等标记换成 :data:`WEAR_NATURAL_MARKER`。
         「穿着不参与角色对账 / 不被 fix 碰」这一点由下面这个**调用顺序**直接保证。
 
+        **1.0.36**：``region`` 是本次解析出的**分区覆盖**（实验性功能，默认关闭，
+        见 :meth:`_resolve_region_override` 与 :mod:`region`），由
+        :meth:`_apply_region_override` 追加在**更后面**的一步 —— 角色 → 皮肤/穿着
+        → 分区覆盖。它同样**不参与**角色判定、两条一致性检查、幂等与归属校验：
+        分区特征词不是角色表里的字符串，``fix`` 替换 / 删除碰不到它；
+        负向词只写进目标动作**自己**的负向参数（:attr:`TargetSpec.negative_arg`），
+        没有负向参数时只打一条 DEBUG。
+
         .. note::
            1.0.21 修正（实测回归）：解析结果**不再并进第 1 条的判定集合**。
            并进去时 ``fix`` 模式的对账会抢在入口①之前做替换，日志依据被写成
@@ -4842,6 +4913,12 @@ class CharacterGuardHandler(BaseEventHandler):
             spec=spec,
             outfit=outfit,
             decided=list(decided),
+        )
+        checked = self._apply_region_override(
+            content=checked,
+            spec=spec,
+            args=args,
+            region=region,
         )
         if checked != original:
             args[spec.prompt_arg] = checked
@@ -5407,3 +5484,199 @@ class CharacterGuardHandler(BaseEventHandler):
             f"{outfit.name} → {outfit.keywords_text()}"
         )
         return merged
+
+    # ── 分区覆盖（实验性功能，默认关闭，1.0.36）─────────────────────
+    #
+    # ⚠️ 实验性功能：打开后生图效果可能不理想 —— 分区拼接只是"按词重画"，模型可能
+    # 把两个角色的特征混在一起（串味）、比例异常或细节崩坏；默认关闭，
+    # 普通使用完全不受影响。
+    #
+    # 与 1.0.22 的皮肤 / 1.0.28 的穿着同一套分层：**识别与拼装在 :mod:`region`**
+    # （纯字符串，不调模型），**注入在 _finalize 的最后一步**（角色 → 皮肤/穿着 →
+    # 分区覆盖），**开关关闭时零动作**（不解析、不额外读上文、不调模型、不打日志）。
+    #
+    # 三条解耦保证（需求硬约束）：
+    #   ① 角色判定：本方法**不参与**任何判定链，只读已经算好的 `roster`；
+    #   ② 一致性检查 / 幂等 / 归属校验：分区覆盖跑在它们**之后**，特征词也不是角色表
+    #      里的字符串，fix 的替换 / 删除碰不到它；
+    #   ③ 记忆库写回：完全不碰（不写回、也不查询）。
+
+    def _resolve_region_override(
+        self,
+        *,
+        params: dict[str, Any],
+        config: CharPromptGuardConfig,
+        roster: list[CharacterEntry],
+        texts: list[str] | None = None,
+    ) -> region_api.RegionSwap | None:
+        """解析本次的**分区覆盖**（实验性功能，默认关闭）；不需要/不可用时返回 ``None``。
+
+        流程：
+
+        1. ``region_override.enabled = false``（默认）→ **立刻返回**：不读配置、
+           不解析字符串、不额外读上文、不调模型、**一条日志都不打**（零动作）；
+        2. 归一 ``region_override.entries``（**独立条目列表**，不是 ``[roster]`` /
+           不是 ``[outfits]``）：整份为空 → 返回 ``None``（同样是零动作）；
+        3. 在 ``texts``（**触发消息在前、其后由新到旧**，就是本次生图已经读到的
+           那批用户消息）里找**第一条**能解析出分区归属的消息 ——
+           :func:`region.parse_region_overrides` 的**三重条件**（分区词 + 角色名 +
+           归属句式）缺一不认，所以「流萤的头饰很好看」「头疼」「画流萤」都不会命中；
+        4. :func:`region.build_region_swap` 按 ``regions`` 的顺序（默认
+           head → body → outfit → pose → background）拼正向段，并算负向词：
+           ``negative_swap`` = 被换掉的角色在**同一分区**的原特征，
+           ``anti_mix`` = 多角色时的防串味词；
+        5. 条目里找不到该角色 / 条目没填这个分区 → :meth:`RegionSwap.skip_line`
+           打一条 **DEBUG** 并返回 ``None``：**退回不分区**，其它注入一个字都不改。
+
+        ``texts`` 为空时只拿**触发消息**（:meth:`_trigger_text`，不读库）兜底。
+        任何异常只记 DEBUG 并返回 ``None`` —— 这是"多一层外观"，绝不拦住生图。
+        """
+        section = getattr(config, "region_override", None)
+        if section is None or not bool(getattr(section, "enabled", False)):
+            # 默认关闭 → 零动作（连配置都不解析、日志都不打）
+            return None
+        try:
+            entries = _region_entries(config)
+            if not entries:
+                # 没配条目就没有"各分区特征词"可用 → 什么都不做（也不打日志）
+                return None
+            focus = [text for text in (texts or []) if text]
+            if not focus:
+                trigger_text = self._trigger_text(params)
+                if trigger_text:
+                    focus = [trigger_text]
+            if not focus:
+                return None
+            assignments: dict[str, str] = {}
+            source = ""
+            for text in focus:
+                found = region_api.parse_region_overrides(text, roster, entries)
+                if found:
+                    assignments = found
+                    source = text
+                    break
+            if not assignments:
+                return None
+            swap = region_api.build_region_swap(
+                assignments,
+                entries,
+                roster=roster,
+                regions=region_api.parse_regions(
+                    getattr(section, "regions", "")
+                ),
+                negative_swap=bool(getattr(section, "negative_swap", True)),
+                anti_mix=bool(getattr(section, "anti_mix", True)),
+                stylized_swap=bool(getattr(section, "stylized_swap", False)),
+                source=source,
+            )
+            if not swap.ok:
+                logger.debug(swap.skip_line())
+                return None
+            # 把"到底拼了谁、每个分区用了哪些词、负向算了什么"一次写清楚：
+            # 这是实验性功能，用户核对效果全靠这一行
+            logger.info(swap.log_line())
+            return swap
+        except Exception as e:  # noqa: BLE001 —— 多一层外观，失败即静默退回
+            logger.debug(f"分区覆盖解析失败，本次跳过（{type(e).__name__}: {e}）")
+            return None
+
+    def _apply_region_override(
+        self,
+        *,
+        content: str,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        region: region_api.RegionSwap | None,
+    ) -> str:
+        """把分区覆盖**追加**在角色与皮肤/穿着之后（1.0.36，实验性功能）。
+
+        - ``natural``（nai_artist）：另起一行追加
+          ``（分区覆盖：头=流萤：silver hair, …；身子=爱莉希雅：…）`` ——
+          **分区顺序就是 regions 的顺序，head 在最前**；
+        - ``tags``（image_generator_plugin-neo）：把各分区特征词按同一顺序追加进
+          同一个提示词参数串末尾（``, silver hair, …, slender, …``）；
+        - **幂等**：natural 看 :data:`region.REGION_NATURAL_MARKER`
+          （``（分区覆盖：``），tags 看"关键词是否都已在提示词里" —— 多图轮的第 2、3 张
+          不重复追加；
+        - **负向**：只有 ``region.negatives`` 非空时才动
+          （见 :meth:`_write_region_negative`），且只写目标动作**自己**的负向参数；
+        - ``region`` 为 ``None`` / 没有正向段时**原样返回**，不留任何痕迹。
+        """
+        if region is None or not region.ok:
+            return content
+        if region.negatives:
+            self._write_region_negative(spec=spec, args=args, region=region)
+        if spec.append_mode == APPEND_MODE_TAGS:
+            missing = [
+                keyword
+                for keyword in region.positive_keywords()
+                if not content_contains_tag(content, keyword)
+            ]
+            if not missing:
+                logger.debug("分区覆盖关键词已在提示词里，不重复追加")
+                return content
+            joined = ", ".join(missing)
+            stripped = content.rstrip().rstrip(",").rstrip()
+            merged = f"{stripped}, {joined}" if stripped else joined
+            logger.info(
+                f"已追加分区覆盖（{spec.action} / tags）: "
+                f"{region.summary()} → {joined}"
+            )
+            return merged
+
+        clause = region.natural_clause()
+        if clause in content or region_api.REGION_NATURAL_MARKER in content:
+            # 1.0.36 幂等：同一轮多图时第 2、3 张的入参里已经带着这段说明
+            return content
+        merged = f"{content.rstrip()}\n{clause}" if content.strip() else clause
+        logger.info(
+            f"已追加分区覆盖（{spec.action} / natural）: {region.summary()}"
+        )
+        return merged
+
+    @staticmethod
+    def _write_region_negative(
+        *,
+        spec: TargetSpec,
+        args: dict[str, Any],
+        region: region_api.RegionSwap,
+    ) -> None:
+        """把分区覆盖的负向词写进目标动作**自己的**负向参数（1.0.36）。
+
+        **能写到哪**（确定口径，别指望它凭空出现负向约束）：
+
+        - 动作**本身有负向参数**（:attr:`TargetSpec.negative_arg` 非空）→ 追加进那个
+          参数（逗号分隔、已在里面的词不重复）。目前内置目标里只有
+          ``image_generator_plugin-neo`` 的 ``draw_image``（``negative_prompt``）符合；
+        - 动作**没有**负向参数（``targets.negative_arg`` 留空，nai_artist 的
+          ``share_photo`` / ``share_drawing`` / ``share_visual`` 都是这种）→
+          **一个字都不写**，只打一条 DEBUG 把"本该写进去的负向词"列出来。
+          原因：nai_artist 的负向词来自它自己的配置 ``character.negative_tags``，
+          运行时的 Action 参数里没有承载它的位置；本插件**不碰别的插件配置**
+          （既不读也不写它的 config、更不落盘），所以对 nai_artist 这条只能是
+          日志级信息。用户真要生效，就把这些词自己填进 nai_artist 的
+          ``character.negative_tags``。
+        """
+        terms = list(region.negatives)
+        if not terms:
+            return
+        arg_name = str(getattr(spec, "negative_arg", "") or "").strip()
+        if not arg_name:
+            logger.debug(
+                "分区覆盖：负向词无槽位可写（目标动作没有负向参数，"
+                "nai_artist 的负向词在它自己的 character.negative_tags 里）："
+                + ", ".join(terms)
+            )
+            return
+        existing = args.get(arg_name)
+        text = existing if isinstance(existing, str) else ""
+        missing = [term for term in terms if not content_contains_tag(text, term)]
+        if not missing:
+            logger.debug(f"分区覆盖负向词已在 {arg_name} 里，不重复追加")
+            return
+        stripped = text.rstrip().rstrip(",").rstrip()
+        joined = ", ".join(missing)
+        args[arg_name] = f"{stripped}, {joined}" if stripped else joined
+        logger.info(
+            f"已写入分区覆盖负向词（{spec.action} / {arg_name}）: {joined}"
+        )
