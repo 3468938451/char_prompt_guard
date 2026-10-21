@@ -370,7 +370,7 @@ off/warn/fix，与期望集合那套互不影响）：
   比例异常或细节崩坏）；**默认关闭，普通使用完全不受影响** —— 关着时
   ``_resolve_region_override`` 第一行就返回（不解析、不额外读上文、不调模型、不打日志）；
 - 打开后「头/头发/眼睛 用 A 的、身子/体型 用 B 的」这类说法会被解析成
-  ``{head: 流萤, body: 爱莉希雅}``（**分区词 + 角色名 + 归属句式**三重条件，缺一不认），
+  ``{head: B, body: A}``（**分区词 + 角色名 + 归属句式**三重条件，缺一不认），
   按 ``regions`` 的顺序（默认 head 在最前）拼成一段追加在**角色与皮肤/穿着之后**；
   各分区特征词来自**独立的条目列表** ``[[region_override.entries]]``
   （不是 ``[roster]``、也不是 ``[outfits]``），找不到条目 → 退回不分区 + DEBUG；
@@ -5520,7 +5520,7 @@ class CharacterGuardHandler(BaseEventHandler):
         3. 在 ``texts``（**触发消息在前、其后由新到旧**，就是本次生图已经读到的
            那批用户消息）里找**第一条**能解析出分区归属的消息 ——
            :func:`region.parse_region_overrides` 的**三重条件**（分区词 + 角色名 +
-           归属句式）缺一不认，所以「流萤的头饰很好看」「头疼」「画流萤」都不会命中；
+           归属句式）缺一不认，所以「B的头饰很好看」「头疼」「画B」都不会命中；
         4. :func:`region.build_region_swap` 按 ``regions`` 的顺序（默认
            head → body → outfit → pose → background）拼正向段，并算负向词：
            ``negative_swap`` = 被换掉的角色在**同一分区**的原特征，
@@ -5594,7 +5594,7 @@ class CharacterGuardHandler(BaseEventHandler):
         """把分区覆盖**追加**在角色与皮肤/穿着之后（1.0.36，实验性功能）。
 
         - ``natural``（nai_artist）：另起一行追加
-          ``（分区覆盖：头=流萤：silver hair, …；身子=爱莉希雅：…）`` ——
+          ``（分区覆盖：头=B：silver hair, …；身子=A：…）`` ——
           **分区顺序就是 regions 的顺序，head 在最前**；
         - ``tags``（image_generator_plugin-neo）：把各分区特征词按同一顺序追加进
           同一个提示词参数串末尾（``, silver hair, …, slender, …``）；

@@ -654,8 +654,8 @@ class CharPromptGuardConfig(BaseConfig):
                 "实验性功能（默认关闭）：分区覆盖。打开后生图效果可能不理想 —— "
                 "分区拼接只是「按词重画」，模型可能把两个角色的特征混在一起（串味）、"
                 "比例异常或细节崩坏；默认关闭，普通使用完全不受影响。"
-                "打开后支持「头是流萤的，身子是爱莉的」「头换成流萤」"
-                "「用爱莉的身子配流萤的头」这类说法：识别「分区词 + 角色名 + 归属句式」"
+                "打开后支持「头是B的，身子是A的」「头换成B」"
+                "「用A的身子配B的头」这类说法：识别「分区词 + 角色名 + 归属句式」"
                 "三重条件（缺一不认），把各分区条目里的特征词按 regions 的顺序拼进提示词"
                 "（head 写在最前面）。只从**用户最近几条消息**里做纯字符串解析，不调模型；"
                 "关闭 / 识别不到 / 条目里没有该角色 → 零动作"
@@ -689,8 +689,8 @@ class CharPromptGuardConfig(BaseConfig):
             default=True,
             description=(
                 "把「被换掉的那个角色在**同一个分区**里的原特征」写进负向提示词，"
-                "抑制两个角色串味（例：头用了流萤、身子用了爱莉希雅 → 负向里放"
-                "爱莉希雅的头/头发/眼睛特征与流萤的身子/体型特征；"
+                "抑制两个角色串味（例：头用了B、身子用了A → 负向里放"
+                "A的头/头发/眼睛特征与B的身子/体型特征；"
                 "与正向重复的词一律不放）。**只有当目标动作本身带负向参数时才真的写进去**："
                 "image_generator_plugin-neo 的 draw_image 有 negative_prompt；"
                 "nai_artist 的 share_photo / share_drawing 没有负向参数（它的负向词在"
@@ -716,7 +716,7 @@ class CharPromptGuardConfig(BaseConfig):
                 "每个条目一个角色 —— name 填角色表里的名字或别名，"
                 "head / body / outfit / pose / background 分别填该角色各分区的特征词"
                 "（英文、逗号分隔）。用法见上面的 enabled 说明；"
-                "示例：name = 流萤 / head = silver hair, long hair, blue eyes, headband / "
+                "示例：name = B / head = silver hair, long hair, blue eyes, headband / "
                 "body = slender, flat chest, pale skin / outfit = white dress。"
                 "找不到条目 → 退回「不分区」并打一条 DEBUG（宁可少拼，也不瞎拼）"
             ),
