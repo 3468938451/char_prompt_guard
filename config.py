@@ -695,7 +695,11 @@ class CharPromptGuardConfig(BaseConfig):
                 "image_generator_plugin-neo 的 draw_image 有 negative_prompt；"
                 "nai_artist 的 share_photo / share_drawing 没有负向参数（它的负向词在"
                 "nai_artist 自己的 character.negative_tags 里，本插件不碰别的插件配置），"
-                "那种情况只打一条 DEBUG，画面一个字都不改"
+                "那种情况只打一条 DEBUG，画面一个字都不改。"
+                "**如果你的 nai_artist 版本确实给某个动作加了负向参数**，把它填进 [targets] "
+                "list 的**第 7 段**即可（例："
+                "nai_artist:action:share_photo | content | natural | | | | negative_prompt），"
+                "不用改代码、也不用等插件更新"
             ),
         )
         anti_mix: bool = Field(

@@ -5528,7 +5528,10 @@ class CharacterGuardHandler(BaseEventHandler):
         5. 条目里找不到该角色 / 条目没填这个分区 → :meth:`RegionSwap.skip_line`
            打一条 **DEBUG** 并返回 ``None``：**退回不分区**，其它注入一个字都不改。
 
-        ``texts`` 为空时只拿**触发消息**（:meth:`_trigger_text`，不读库）兜底。
+        ``texts`` 为空时只拿**触发消息**（:meth:`_trigger_text`，不读库）兜底 ——
+        且与 1.0.30 闸门③ 同一个正文口径（:func:`character.strip_quoted_blocks`）：
+        ``[回复…]`` / ``[图片(…)]`` 这种中括号块里的文字是**别人说的**或媒体占位，
+        不算用户本次的说法。
         任何异常只记 DEBUG 并返回 ``None`` —— 这是"多一层外观"，绝不拦住生图。
         """
         section = getattr(config, "region_override", None)
@@ -5542,7 +5545,7 @@ class CharacterGuardHandler(BaseEventHandler):
                 return None
             focus = [text for text in (texts or []) if text]
             if not focus:
-                trigger_text = self._trigger_text(params)
+                trigger_text = strip_quoted_blocks(self._trigger_text(params))
                 if trigger_text:
                     focus = [trigger_text]
             if not focus:

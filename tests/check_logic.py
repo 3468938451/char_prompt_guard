@@ -293,7 +293,7 @@ INFO / WARNING（``unsupported`` 是唯一按 WARNING 打的那种）。
 | C119 | **分区解析 = 三重条件**（分区词 + 角色名 + 归属句式，缺一不认）：三种入口语言各断言一次 —— ``头是流萤的，身子是爱莉的`` → ``{head: 流萤, body: 爱莉希雅}``、``头换成流萤`` → ``{head: 流萤}``、``用爱莉的身子配流萤的头`` → ``{head: 流萤, body: 爱莉希雅}``；别名「爱莉」归一到角色表正式名「爱莉希雅」 |
 | C120 | **注入**（两跑）：A nai_artist（natural）→ 正向段含 head 与 body 特征词且 **head 在前**、段落在角色说明之后；``negative_swap=true`` 时"被换掉那个角色在同分区的原特征"（爱莉希雅的头 / 流萤的身子）出现在 DEBUG —— nai_artist 的 Action 没有负向参数；B image_generator_plugin-neo（tags）→ 关键词追加进 ``content_description``，负向词**真的**写进 ``negative_prompt`` 并带上 ``anti_mix`` 的防串味词 |
 | C121 | **单分区**：``头换成流萤`` 只动 head（``头=流萤`` 恰好一段），流萤条目里的 body / outfit 特征词**一个都不出现**，且角色仍在分区段之前 |
-| C122 | **防误触发**：``流萤的头饰很好看`` / ``头疼`` / ``画流萤`` 三句 → 解析为空、没有分区注入、**没有任何"分区覆盖"相关日志**、没有负向参数被写 |
+| C122 | **防误触发**：``流萤的头饰很好看`` / ``头疼`` / ``画流萤`` 三句 → 解析为空、没有分区注入、**没有任何"分区覆盖"相关日志**、没有负向参数被写；另钉**边界样本**（反例：``馒头是流萤的`` / ``石头是爱莉的`` / ``回头是爱莉的``（单字分区词前置边界）、``用流萤的头饰`` / ``配流萤的头像`` / ``和爱莉的头像拍照``（尾边界）、``流萤的头是红色``（角色解析不出）；正例：``我的头是流萤的`` / ``用流萤的头`` / ``配流萤的头吧`` / ``和爱莉的身子`` 照旧命中）与**引用块**（整条触发消息在 ``[回复 …]`` 里 → 清洗后无正文 → 不注入，与 1.0.30 闸门③ 同一 ``strip_quoted_blocks`` 口径） |
 | C123 | **开关与降级**：① ``region_override.enabled=false``（默认）→ 零动作（内容与"没配条目"时逐字一致、日志无 ``分区覆盖``）；② 开着但 ``entries`` 里没有该角色 → **不分区** + DEBUG（``分区覆盖=跳过`` / ``entries 里没有该角色的条目``），角色注入照旧 |
 | C124 | ``stylized_swap``：true → 正向段出现 ``stitched neck`` / ``visible seam`` / ``head slightly tilted``（``接缝过渡`` 标签）；false（默认）→ 这三句**正向与负向都不出现** |
 
@@ -7078,6 +7078,16 @@ async def run_cases() -> int:
     #   ② ``头疼`` —— 只有分区词，没有角色、没有归属句式；
     #   ③ ``画流萤`` —— 只有角色名，没有分区词。
     # 三条都要求：**没有分区注入、没有任何"分区覆盖"相关日志**（识别不到 = 零动作）。
+    #
+    # 1.0.36 定稿时把**边界**一起钉住（同一处 check，仍是 C122 一条）：
+    #   · 单元级**反例**（必须解析为空）：`馒头是流萤的` / `石头是爱莉的` /
+    #     `回头是爱莉的`（单字分区词的前置边界：复合词里的「头」不是分区词）、
+    #     `用流萤的头饰` / `配流萤的头像` / `和爱莉的头像拍照`（尾边界：后面是实词汉字）、
+    #     `流萤的头是红色`（角色解析不出 → 不认）；
+    #   · 单元级**正例**（必须照旧命中，防止收得太狠）：`我的头是流萤的` /
+    #     `用流萤的头` / `配流萤的头吧` / `和爱莉的身子`；
+    #   · 端到端**引用块**：整条触发消息都在 `[回复 …]` 里 → 清洗后没有正文 → 不注入
+    #     （与 1.0.30 闸门③ 同一个 `strip_quoted_blocks` 口径）。
     try:
         from ..character import parse_roster
         from ..region import parse_region_entries, parse_region_overrides
@@ -7106,14 +7116,64 @@ async def run_cases() -> int:
                     f"解析={parsed!r} content={content!r}",
                 )
             )
+
+        # 单元级边界样本：反例必须 `{}`，正例必须照旧命中（两条一起看，防"收得过头"）
+        boundary_negatives = (
+            "馒头是流萤的",
+            "石头是爱莉的",
+            "回头是爱莉的",
+            "用流萤的头饰",
+            "配流萤的头像",
+            "和爱莉的头像拍照",
+            "流萤的头是红色",
+        )
+        boundary_positives = (
+            ("我的头是流萤的", {"head": "流萤"}),
+            ("用流萤的头", {"head": "流萤"}),
+            ("配流萤的头吧", {"head": "流萤"}),
+            ("和爱莉的身子", {"body": "爱莉希雅"}),
+        )
+        bad = [
+            f"{phrase}→{parse_region_overrides(phrase, roster, entries)!r}"
+            for phrase in boundary_negatives
+            if parse_region_overrides(phrase, roster, entries) != {}
+        ]
+        weak = [
+            f"{phrase}→{parse_region_overrides(phrase, roster, entries)!r}"
+            f"（期望 {expected!r}）"
+            for phrase, expected in boundary_positives
+            if parse_region_overrides(phrase, roster, entries) != expected
+        ]
+        runs.append(
+            (
+                "边界样本：复合词 / 头像 不命中，助词前缀照旧命中",
+                not bad and not weak,
+                f"反例误命中={bad!r} 正例漏={weak!r}",
+            )
+        )
+
+        # 端到端：整条触发消息都在引用块里 → 清洗后没有正文 → 零动作
+        quoted = f"[回复 {REGION_SWAP_PHRASE}]"
+        params = natural_params("帮我画一张她战斗的样子", text=quoted)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "引用块里的分区说法不参与（strip_quoted_blocks 口径）",
+                "分区覆盖" not in content and "分区覆盖" not in records,
+                f"content={content!r} 日志={records!r}",
+            )
+        )
         check(
-            "C122 防误触发：头饰 / 头疼 / 画流萤 都不命中（无注入、无相关日志）",
+            "C122 防误触发：头饰 / 头疼 / 画流萤 + 边界样本都不命中（无注入、无日志）",
             all(hit for _, hit, _ in runs),
             "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
         )
     except Exception as e:  # noqa: BLE001
         check(
-            "C122 防误触发：头饰 / 头疼 / 画流萤 都不命中（无注入、无相关日志）",
+            "C122 防误触发：头饰 / 头疼 / 画流萤 + 边界样本都不命中（无注入、无日志）",
             False,
             f"{type(e).__name__}: {e}",
         )
