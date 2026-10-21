@@ -468,6 +468,79 @@ def main() -> int:
             "1.0.36 RegionSwap 空结果不算成功（没拼出东西就不注入）",
             RegionSwap().ok is False and RegionSwap().parts == (),
         )
+        # 1.0.38 新增：**实验性功能**「外观覆盖」（[appearance]）—— 默认关闭，
+        # 与 1.0.36 的 [region_override] **完全分开**（不同配置节 / 不同解析 /
+        # 不同注入位置）。权重语法默认 nai（``1.4::purple-red eyes::``）。
+        check(
+            "1.0.38 外观覆盖默认关闭（appearance.enabled=false）",
+            cfg.appearance.enabled is False,
+            f"appearance.enabled={cfg.appearance.enabled!r}",
+        )
+        check(
+            "1.0.38 外观覆盖默认：eye_weight=1.4 / tag_weight=0.8 / 语法=nai",
+            cfg.appearance.eye_weight == 1.4
+            and cfg.appearance.tag_weight == 0.8
+            and cfg.appearance.weight_syntax == "nai",
+            (
+                f"eye_weight={cfg.appearance.eye_weight!r} "
+                f"tag_weight={cfg.appearance.tag_weight!r} "
+                f"weight_syntax={cfg.appearance.weight_syntax!r}"
+            ),
+        )
+        check(
+            "1.0.38 外观覆盖允许的键默认 eyes→hair（顺序就是注入顺序）",
+            cfg.appearance.apply_to == ["eyes", "hair"],
+            f"appearance.apply_to={cfg.appearance.apply_to!r}",
+        )
+        appearance_enabled_field = type(cfg.appearance).__dict__.get("enabled")
+        if appearance_enabled_field is None:
+            appearance_enabled_field = type(cfg.appearance).model_fields.get(
+                "enabled"
+            )
+        appearance_desc = str(
+            getattr(appearance_enabled_field, "description", "") or ""
+        )
+        check(
+            "1.0.38 外观覆盖的说明第一句就是「实验性功能（默认关闭）」",
+            appearance_desc.startswith("实验性功能（默认关闭）：外观覆盖"),
+            f"enabled.description={appearance_desc!r}",
+        )
+        from ..appearance import (
+            DEFAULT_APPLY_TO,
+            AppearanceOverride,
+            parse_appearance_overrides,
+            parse_apply_to,
+            parse_weight_syntax,
+        )
+
+        check(
+            "1.0.38 外观解析：外观词 + 更换动词 + 颜色词，缺一不认",
+            parse_appearance_overrides("把眼睛换成本尊的紫红")
+            == {"eyes": "purple-red"}
+            and parse_appearance_overrides("发色换成银白") == {"hair": "silver"}
+            and parse_appearance_overrides("眼睛很好看") == {}
+            and parse_appearance_overrides("我想看看你的眼睛") == {},
+            (
+                f"紫红={parse_appearance_overrides('把眼睛换成本尊的紫红')!r} "
+                f"银白={parse_appearance_overrides('发色换成银白')!r}"
+            ),
+        )
+        check(
+            "1.0.38 apply_to / weight_syntax 解析：非法值退回默认",
+            parse_apply_to("hair, eyes, 不存在") == ("hair", "eyes")
+            and parse_apply_to("") == DEFAULT_APPLY_TO
+            and parse_weight_syntax("paren") == "paren"
+            and parse_weight_syntax("乱写") == "nai",
+            (
+                f"apply_to={parse_apply_to('hair, eyes, 不存在')!r} "
+                f"syntax={parse_weight_syntax('乱写')!r}"
+            ),
+        )
+        check(
+            "1.0.38 AppearanceOverride 空结果不算成功（没词就不注入）",
+            AppearanceOverride().ok is False
+            and AppearanceOverride().parts == (),
+        )
     except Exception as e:  # noqa: BLE001
         check("配置模型可实例化", False, f"{type(e).__name__}: {e}")
 

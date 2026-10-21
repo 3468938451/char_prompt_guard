@@ -412,6 +412,11 @@ def make_config(
     region_stylized: bool = False,
     region_negative_swap: bool = True,
     region_anti_mix: bool = True,
+    appearance_enabled: bool = False,
+    appearance_eye_weight: float = 1.4,
+    appearance_tag_weight: float = 0.8,
+    appearance_apply_to: list[str] | None = None,
+    appearance_weight_syntax: str = "nai",
 ) -> CharPromptGuardConfig:
     """按用例参数构造配置。
 
@@ -431,6 +436,9 @@ def make_config(
     类里的 ``enabled = false`` 一致：C1~C118 是 1.0.34 及以前的行为回归，不该因为
     本机恰好配了分区条目而变红；需要分区覆盖的用例（C119~C124）显式传
     ``region_enabled=True`` 与 ``region_entries=...``。
+    1.0.38 起 ``[appearance]``（**实验性功能**：外观覆盖）同样**默认关掉**，与配置类里
+    的 ``enabled = false`` 一致：需要外观覆盖的用例（C125/C126）显式传
+    ``appearance_enabled=True``；C128 正是用 ``appearance_enabled=False`` 钉"零动作"。
     """
     cfg = CharPromptGuardConfig()
     cfg.general.enabled = general_enabled
@@ -455,6 +463,15 @@ def make_config(
     cfg.region_override.stylized_swap = region_stylized
     cfg.region_override.negative_swap = region_negative_swap
     cfg.region_override.anti_mix = region_anti_mix
+    # 1.0.38：外观覆盖（实验性功能，默认关闭）
+    cfg.appearance.enabled = appearance_enabled
+    cfg.appearance.eye_weight = appearance_eye_weight
+    cfg.appearance.tag_weight = appearance_tag_weight
+    if appearance_apply_to is not None:
+        # 默认不覆盖 → 用配置类给的列表（["eyes", "hair"]）；
+        # 想只允许某个键时传一个列表进来（`appearance.parse_apply_to` 也认字符串写法）
+        cfg.appearance.apply_to = list(appearance_apply_to)
+    cfg.appearance.weight_syntax = appearance_weight_syntax
     return cfg
 
 
@@ -1145,6 +1162,35 @@ def region_entries(
             )
         )
     return entries
+
+
+# ── 1.0.38（外观覆盖：**实验性功能**，默认关闭）用例的夹具 ──────────────────
+#
+# 需求原话：「脸是薇塔的，眼睛换成本尊的紫红」→ 提示词里确实有 ``purple eyes``，
+# 但出图仍是**蓝眼**：角色标签 ``firefly (honkai: star rail)`` 自带「蓝眼」先验，
+# 权重高过裸词；而 nai_artist 的 Action **没有负向参数**（只有 ``content``），
+# 所以「塞负向」这条路无效 —— 只能正向加权 + 角色标签降权。
+# 与 1.0.36 的 ``[region_override]`` 完全分开：不同的配置节、不同的解析、
+# 不同的注入位置（外观覆盖**放最前**，分区覆盖追加在最后）。
+
+#: C125：用户原话（眼睛换成本尊的紫红；「本尊」在表外点名黑名单里，不会误触发解析）
+APPEARANCE_EYE_PHRASE = "把眼睛换成本尊的紫红"
+#: C126：发色
+APPEARANCE_HAIR_PHRASE = "发色换成银白"
+#: C125/C126：解析出来的英文词（语言/语法与 :data:`appearance.COLORS` 一致）
+APPEARANCE_EYE_TERM = "purple-red eyes"
+APPEARANCE_HAIR_TERM = "silver hair"
+#: C125：**画面里已经有流萤的中文名**（插件的既有通道会补上转义标签，
+#: 外观覆盖再把它降权）—— 这样一跑就能同时看到「加权词 + 降权标签」
+APPEARANCE_FIREFLY_SCENE = "流萤站在镜头前，一身蓝裙"
+#: C127：多角色画面（花火 + 流萤 + 爱莉希雅三个标签都写在画面里）
+MULTI_SCENE_TAGS = (TAG_HANABI, TAG_FIREFLY, TAG_ELYSIA)
+MULTI_SCENE = (
+    f"{TAG_HANABI}, {TAG_FIREFLY}, {TAG_ELYSIA}, "
+    "两个少女并肩站着，银白长发与深色短发，笑容很像"
+)
+#: C127：用户**同时点了两个人**（`decided` 因此是 2 人 → 守卫必须拦住替换）
+MULTI_SCENE_REQUEST = "画花火和流萤，两人同框"
 
 
 # ── 1.0.34（框架运行时兼容 shim）用例的离线桩 ───────────────────────────
@@ -7292,6 +7338,337 @@ async def run_cases() -> int:
     except Exception as e:  # noqa: BLE001
         check(
             "C124 stylized_swap：true → 接缝/过渡词出现；false → 一个都不出现",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C125（1.0.38）眼睛覆盖：解析 + 加权词放最前 + 角色标签降权 ────────────
+    # 需求原话「脸是薇塔的，眼睛换成本尊的紫红」→ 提示词里确实有 purple eyes，但出图
+    # 仍是**蓝眼**：角色标签 ``firefly (honkai: star rail)`` 自带「蓝眼」先验，权重高过
+    # 裸词；nai_artist 的 Action 又**没有负向参数**，所以「塞负向」这条路无效。
+    # 本用例钉四件事：
+    #   ① 解析（外观词 + 更换动词 + 颜色词，缺一不认）→ ``{eyes: purple-red}``；
+    #   ② 加权词的两种写法 + ``1.0`` 的降级形态（纯字符串，不依赖运行时）；
+    #   ③ 端到端 nai_artist（natural）：加权词**放最前**（内容以它开头、且在角色名之前），
+    #      画面里已有的角色标准标签被改写成 ``0.8::firefly \(honkai: star rail\)::``
+    #      —— **只改这一处**（那个标签在内容里只出现一次）；日志一行写完；
+    #   ④ ``eye_weight = 1.0``（+ ``tag_weight = 1.0``）→ 退化为「只把词放最前、不加权」，
+    #      这是需求给的降级开关（权重语法万一被下游翻译模型吞掉时用）。
+    try:
+        from ..appearance import (
+            build_appearance_override,
+            parse_appearance_overrides,
+        )
+
+        parsed = parse_appearance_overrides(APPEARANCE_EYE_PHRASE)
+        # 需求原话里那句完整的（「脸是薇塔的」不影响解析）也要能认出来
+        parsed_full = parse_appearance_overrides("脸是薇塔的，眼睛换成本尊的紫红")
+        nai_prefix = build_appearance_override({"eyes": "purple-red"}).prefix_text()
+        paren_prefix = build_appearance_override(
+            {"eyes": "purple-red"}, weight_syntax="paren"
+        ).prefix_text()
+        plain_prefix = build_appearance_override(
+            {"eyes": "purple-red"}, weight=1.0
+        ).prefix_text()
+
+        runs: list[tuple[str, bool, str]] = []
+        runs.append(
+            (
+                "解析",
+                parsed == {"eyes": "purple-red"}
+                and parsed_full == {"eyes": "purple-red"},
+                f"{APPEARANCE_EYE_PHRASE!r} → {parsed!r}；原话 → {parsed_full!r}",
+            )
+        )
+        runs.append(
+            (
+                "权重写法",
+                nai_prefix == "1.4::purple-red eyes::"
+                and paren_prefix == "((purple-red eyes:1.4))"
+                and plain_prefix == "purple-red eyes",
+                f"nai={nai_prefix!r} paren={paren_prefix!r} 1.0={plain_prefix!r}",
+            )
+        )
+
+        cfg = make_config(roster=RS3, appearance_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text=APPEARANCE_EYE_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        weighted_tag = r"0.8::firefly \(honkai: star rail\)::"
+        runs.append(
+            (
+                "端到端 natural：加权词最前 + 角色标签降权",
+                content.startswith("1.4::purple-red eyes::")  # ★ 需求原话「放最前」
+                and content.index(APPEARANCE_EYE_TERM) < content.index("流萤")
+                and weighted_tag in content  # ★ 只改这一处
+                and content.count(r"firefly \(honkai: star rail\)") == 1
+                and "外观覆盖：眼睛 → purple-red eyes（权重 1.4）；"
+                "角色标签降权 0.8" in records
+                and "已追加外观覆盖（share_visual / natural）" in records
+                and "外观覆盖：角色标签已降权 → 0.8::firefly" in records,
+                f"content = {content!r}\n        日志 = {records!r}",
+            )
+        )
+
+        cfg = make_config(
+            roster=RS3,
+            appearance_enabled=True,
+            appearance_eye_weight=1.0,
+            appearance_tag_weight=1.0,
+        )
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text=APPEARANCE_EYE_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "eye_weight=1.0 → 只放最前、不加权",
+                content.startswith("purple-red eyes,")
+                and "1.4::" not in content
+                and "0.8::" not in content
+                and "外观覆盖：眼睛 → purple-red eyes（权重 1）" in records
+                and "角色标签降权" not in records,
+                f"content = {content!r}\n        日志 = {records!r}",
+            )
+        )
+        check(
+            "C125 眼睛覆盖：解析 + 加权词放最前 + 角色标签降权",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C125 眼睛覆盖：解析 + 加权词放最前 + 角色标签降权",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C126（1.0.38）发色覆盖：同一个通道、另一个键 ──────────────────────────
+    # 「发色换成银白」→ ``{hair: silver}`` → 内容以 ``1.4::silver hair::`` 开头，
+    # 角色标签同样降权。另钉 ``apply_to`` 的门：只允许 eyes 时，发色说法**零动作**
+    # （不加词、不打日志）—— 需求原话是「允许覆盖的键」。
+    try:
+        from ..appearance import parse_appearance_overrides
+
+        parsed = parse_appearance_overrides(APPEARANCE_HAIR_PHRASE)
+
+        cfg = make_config(roster=RS3, appearance_enabled=True)
+        cfg.general.history_cache_ttl = 0.0
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text=APPEARANCE_HAIR_PHRASE)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+
+        cfg_gated = make_config(
+            roster=RS3, appearance_enabled=True, appearance_apply_to=["eyes"]
+        )
+        cfg_gated.general.history_cache_ttl = 0.0
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text=APPEARANCE_HAIR_PHRASE)
+        with LogCapture() as logs_gated:
+            out_gated = await fire(cfg_gated, params)
+        content_gated = out_gated["args"]["content"]
+        records_gated = logs_gated.records_text()
+
+        runs = [
+            (
+                "解析 + 注入",
+                parsed == {"hair": "silver"}
+                and content.startswith("1.4::silver hair::")
+                and "外观覆盖：发色 → silver hair（权重 1.4）；角色标签降权 0.8"
+                in records
+                and r"0.8::firefly \(honkai: star rail\)::" in content,
+                f"解析={parsed!r}\n        content = {content!r}\n        日志 = {records!r}",
+            ),
+            (
+                "apply_to 不含 hair → 零动作",
+                "silver hair" not in content_gated
+                and "外观覆盖" not in content_gated
+                and "外观覆盖" not in records_gated,
+                f"content = {content_gated!r}\n        日志 = {records_gated!r}",
+            ),
+        ]
+        check(
+            "C126 发色覆盖：解析 + 加权词放最前 + apply_to 门",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C126 发色覆盖：解析 + 加权词放最前 + apply_to 门",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C127（1.0.38）多角色画面**只补不替换**（复现用户那条 2girls 日志）────────
+    # 实测事故：用户要「花火 + 流萤」两人，日志却是
+    #   ``一致性检查=冲突已修正（fix）：把画面里的「花火」替换为「流萤」``
+    # —— 合法的第二个角色标签被当冲突换掉了，两人被揉成一个。用例钉三件事：
+    #   ① fix + 判定本身 ≥2 人 + 画面 ≥2 个角色标签 → **不做替换**，只 WARN，
+    #      三个标签一个不少，日志写 ``一致性检查=多角色画面，不做替换（画面：…；期望：…）``；
+    #   ② 期望集合里**有人缺失** → **只补不删**（单元级直接调守卫，避开注入链）；
+    #   ③ **边界**：判定只点名 1 人时守卫**不拦**（照旧替换）—— 那是另一种合法情形
+    #      （主模型把角色标签写错了，用例 C108 锁着「写错标签要能修」）。
+    #      两种情形在"画面里有几个角色"上完全一样，能区分的只有判定自己，
+    #      所以守卫必须带 ``decision_multi`` 这个条件，日志会写清楚为什么没拦。
+    try:
+        from ..character import parse_roster
+        from ..handler import CharacterGuardHandler as _Handler
+        from ..handler import TargetSpec, build_expectation_set
+
+        roster = parse_roster(RS3)
+        runs = []
+
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(MULTI_SCENE, text=MULTI_SCENE_REQUEST)
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "① fix：三人画面 + 判定 2 人 → 不做替换、只 WARN",
+                "一致性检查=多角色画面，不做替换" in records
+                and "画面：爱莉希雅、花火、流萤" in records
+                and "期望：花火、流萤" in records
+                and "一致性检查=冲突已修正" not in records
+                and TAG_HANABI in content
+                and TAG_FIREFLY in content
+                and TAG_ELYSIA in content,
+                f"content = {content!r}\n        日志 = {records!r}",
+            )
+        )
+
+        # ② 只补不删（单元级）：期望 3 人、画面只有花火 + 流萤 → 补上爱莉希雅的标签
+        guard = _Handler(FakePlugin(make_config(roster=RS3)))
+        spec = TargetSpec(
+            plugin="nai_artist", action="share_visual", prompt_arg="content"
+        )
+        expected = build_expectation_set(decided=list(roster), roster=roster)
+        scene = f"{TAG_HANABI}, {TAG_FIREFLY}, 并肩站着"
+        guarded = guard._multi_character_guard(
+            content=scene,
+            spec=spec,
+            texts=[scene],
+            roster=roster,
+            expected_names=expected.names(),
+            decision_multi=True,
+            expected=expected,
+        )
+        runs.append(
+            (
+                "② 期望里有人缺失 → 只补不删",
+                isinstance(guarded, str)
+                and TAG_HANABI in guarded
+                and TAG_FIREFLY in guarded
+                and TAG_ELYSIA in guarded,
+                f"guarded = {guarded!r}",
+            )
+        )
+
+        # ③ 边界：判定只点名 1 人 → 不拦，照旧替换
+        cfg = make_config(roster=RS3)
+        cfg.general.history_cache_ttl = 0.0
+        cfg.general.consistency_check = "fix"
+        params = natural_params(
+            f"{TAG_HANABI}, {TAG_FIREFLY}, 并肩站着", text="画花火吧"
+        )
+        with LogCapture() as logs:
+            out = await fire(cfg, params)
+        content = out["args"]["content"]
+        records = logs.records_text()
+        runs.append(
+            (
+                "③ 边界：判定只点名 1 人 → 不拦（照旧替换）",
+                "一致性检查=多角色画面但判定只点名 1 人，照旧按替换处理" in records
+                and "一致性检查=冲突已修正（fix）" in records
+                and TAG_FIREFLY not in content,
+                f"content = {content!r}\n        日志 = {records!r}",
+            )
+        )
+        check(
+            "C127 多角色画面只补不替换（含单角色判定的边界）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C127 多角色画面只补不替换（含单角色判定的边界）",
+            False,
+            f"{type(e).__name__}: {e}",
+        )
+
+    # ── C128（1.0.38）enabled=false 零动作 ────────────────────────────────────
+    # 需求硬约束：``[appearance] enabled = false``（默认）→ **零动作零日志**
+    # （不解析、不额外读上文、不调模型、不注入）。三跑：
+    #   ① 默认关 + 外观说法 → 内容与"没有外观说法"时**逐字一致**、日志里一个字都没有；
+    #   ② 开着 + 与外观无关的说法 → 同样零动作（识别不到就不做任何事）；
+    #   ③ 关着时不读配置：``apply_to`` / 权重写错也不影响其它注入。
+    try:
+        cfg_off = make_config(roster=RS3)
+        cfg_off.general.history_cache_ttl = 0.0
+        cfg_off.general.consistency_check = "off"
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text=APPEARANCE_EYE_PHRASE)
+        with LogCapture() as logs_off:
+            out_off = await fire(cfg_off, params)
+        content_off = out_off["args"]["content"]
+        records_off = logs_off.records_text()
+
+        cfg_plain = make_config(roster=RS3)
+        cfg_plain.general.history_cache_ttl = 0.0
+        cfg_plain.general.consistency_check = "off"
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text="我们聊点别的吧")
+        with LogCapture() as _logs_plain:
+            out_plain = await fire(cfg_plain, params)
+        content_plain = out_plain["args"]["content"]
+
+        cfg_neutral = make_config(roster=RS3, appearance_enabled=True)
+        cfg_neutral.general.history_cache_ttl = 0.0
+        cfg_neutral.general.consistency_check = "off"
+        params = natural_params(APPEARANCE_FIREFLY_SCENE, text="我们聊点别的吧")
+        with LogCapture() as logs_neutral:
+            out_neutral = await fire(cfg_neutral, params)
+        content_neutral = out_neutral["args"]["content"]
+        records_neutral = logs_neutral.records_text()
+
+        runs = [
+            (
+                "① 默认关 + 外观说法 → 零动作（内容逐字一致、无日志）",
+                content_off == content_plain
+                and "外观覆盖" not in content_off
+                and "1.4::" not in content_off
+                and "0.8::" not in content_off
+                and "外观覆盖" not in records_off,
+                (
+                    f"关={content_off!r}\n        基线={content_plain!r}\n"
+                    f"        日志={records_off!r}"
+                ),
+            ),
+            (
+                "② 开着但识别不到 → 零动作（与关掉时逐字一致）",
+                content_neutral == content_plain
+                and "外观覆盖" not in records_neutral,
+                (
+                    f"开={content_neutral!r}\n        基线={content_plain!r}\n"
+                    f"        日志={records_neutral!r}"
+                ),
+            ),
+        ]
+        check(
+            "C128 enabled=false：零动作零日志（开/关两条路径都覆盖）",
+            all(hit for _, hit, _ in runs),
+            "\n        ".join(f"{label}: {detail}" for label, _, detail in runs),
+        )
+    except Exception as e:  # noqa: BLE001
+        check(
+            "C128 enabled=false：零动作零日志（开/关两条路径都覆盖）",
             False,
             f"{type(e).__name__}: {e}",
         )
