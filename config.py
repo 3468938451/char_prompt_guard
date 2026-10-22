@@ -654,8 +654,8 @@ class CharPromptGuardConfig(BaseConfig):
                 "实验性功能（默认关闭）：分区覆盖。打开后生图效果可能不理想 —— "
                 "分区拼接只是「按词重画」，模型可能把两个角色的特征混在一起（串味）、"
                 "比例异常或细节崩坏；默认关闭，普通使用完全不受影响。"
-                "打开后支持「头是B的，身子是A的」「头换成B」"
-                "「用A的身子配B的头」这类说法：识别「分区词 + 角色名 + 归属句式」"
+                "打开后支持「头是流萤的，身子是爱莉的」「头换成流萤」"
+                "「用爱莉的身子配流萤的头」这类说法：识别「分区词 + 角色名 + 归属句式」"
                 "三重条件（缺一不认），把各分区条目里的特征词按 regions 的顺序拼进提示词"
                 "（head 写在最前面）。只从**用户最近几条消息**里做纯字符串解析，不调模型；"
                 "关闭 / 识别不到 / 条目里没有该角色 → 零动作"
@@ -689,8 +689,8 @@ class CharPromptGuardConfig(BaseConfig):
             default=True,
             description=(
                 "把「被换掉的那个角色在**同一个分区**里的原特征」写进负向提示词，"
-                "抑制两个角色串味（例：头用了B、身子用了A → 负向里放"
-                "A的头/头发/眼睛特征与B的身子/体型特征；"
+                "抑制两个角色串味（例：头用了流萤、身子用了爱莉希雅 → 负向里放"
+                "爱莉希雅的头/头发/眼睛特征与流萤的身子/体型特征；"
                 "与正向重复的词一律不放）。**只有当目标动作本身带负向参数时才真的写进去**："
                 "image_generator_plugin-neo 的 draw_image 有 negative_prompt；"
                 "nai_artist 的 share_photo / share_drawing 没有负向参数（它的负向词在"
@@ -716,80 +716,9 @@ class CharPromptGuardConfig(BaseConfig):
                 "每个条目一个角色 —— name 填角色表里的名字或别名，"
                 "head / body / outfit / pose / background 分别填该角色各分区的特征词"
                 "（英文、逗号分隔）。用法见上面的 enabled 说明；"
-                "示例：name = B / head = silver hair, long hair, blue eyes, headband / "
+                "示例：name = 流萤 / head = silver hair, long hair, blue eyes, headband / "
                 "body = slender, flat chest, pale skin / outfit = white dress。"
                 "找不到条目 → 退回「不分区」并打一条 DEBUG（宁可少拼，也不瞎拼）"
-            ),
-        )
-
-    @config_section("appearance")
-    class AppearanceSection(SectionBase):
-        """实验性功能（默认关闭）：外观覆盖（换眼睛 / 换发色）。
-
-        解决的是这条实测问题：角色标签 ``firefly (honkai: star rail)`` 自带「蓝眼」
-        先验，权重高过描述里那句裸词 ``purple eyes``，所以用户说「眼睛换成本尊的
-        紫红」时出图仍是蓝眼。本功能把那个颜色词**加重**放到提示词最前面，并把画面里
-        已有的角色标签**降权**。
-
-        **为什么不做负向**：``nai_artist`` 的 Action（``share_photo`` /
-        ``share_drawing`` / ``share_visual``）只有 ``content``（photo 另有 ``form``），
-        **没有负向参数**；它的负向词来自它自己的 ``character.negative_tags``，
-        本插件不碰别的插件配置 —— 所以「塞负向」这条路在 nai_artist 上无效。
-
-        与 1.0.36 的 ``[region_override]``（分区覆盖）**完全分开**：不同的配置节、
-        不同的解析、不同的注入位置（外观覆盖**放最前**，分区覆盖追加在最后）。
-        识别不到就**零动作**（不解析、不打日志、不注入）。
-        """
-
-        enabled: bool = Field(
-            default=False,
-            description=(
-                "实验性功能（默认关闭）：外观覆盖（换眼睛 / 换发色）。"
-                "打开后「眼睛换成本尊的紫红」「发色换成银白」这类说法会被解析成"
-                "「哪个外观 + 什么颜色」，把**加权**的颜色词放到提示词**最前面**，"
-                "并把画面里已有的角色标准标签**降权**（只改那一处，其它标签不动）。"
-                "只从**用户最近几条消息**里做纯字符串解析，不调模型；"
-                "关闭 / 识别不到 → 零动作（不解析、不打日志、不注入），"
-                "其它注入一个字都不改"
-            ),
-        )
-        eye_weight: float = Field(
-            default=1.4,
-            description=(
-                "覆盖词（眼睛 / 发色）的**正向权重** —— 注意这个权重对两个外观键都生效，"
-                "键名沿用需求里的 eye_weight。写成什么语法由 weight_syntax 决定"
-                "（默认 1.4::purple-red eyes::）。"
-                "**设为 1.0 即退化为「只把词放到最前、不加权」**；"
-                "这是权重语法万一被下游翻译模型吞掉时的降级开关"
-            ),
-        )
-        tag_weight: float = Field(
-            default=0.8,
-            description=(
-                "被覆盖时对**画面里已有的角色标准标签**降权（0.8 → 0.8::firefly "
-                "\\(honkai: star rail\\)::）。角色标签自带默认外貌（例如蓝眼）先验，"
-                "不降权就会压过我们加的加权词。**只改画面里第一处、其它标签一个字不动**；"
-                "**1.0 = 完全不降权**（这时只加权覆盖词）"
-            ),
-        )
-        apply_to: list[str] = Field(
-            default_factory=lambda: ["eyes", "hair"],
-            description=(
-                "允许覆盖的键**列表** —— **顺序就是注入顺序**（eyes 在最前面）。"
-                "可用值：eyes（眼睛 / 瞳色 / 眼眸 / 双眼 / 瞳孔）、hair（发色 / 头发 / 发型）。"
-                "没列出来的键不会被覆盖；整份都写错/留空时按默认两个键处理"
-            ),
-        )
-        weight_syntax: str = Field(
-            default="nai",
-            description=(
-                "权重语法。**默认 nai**：``1.4::purple-red eyes::`` —— 这是 nai_artist "
-                "自己的翻译提示词里唯一认可的数值写法（它的 prompt_builder 明确要求"
-                "「必须严格写成 N::tag::」，并禁止 ``1.5:gentle smile:`` 这类写法），"
-                "所以默认用它。可选：``paren`` = ``((purple-red eyes:1.4))``"
-                "（A1111/WebUI 风格括号写法，有被 nai_artist 翻译模型改写或丢弃的风险）；"
-                "``none`` = 不加权重，只把词放最前（与 eye_weight = 1.0 等价）。"
-                "写错时按 nai 处理"
             ),
         )
 
@@ -803,4 +732,3 @@ class CharPromptGuardConfig(BaseConfig):
     region_override: RegionOverrideSection = Field(
         default_factory=RegionOverrideSection
     )
-    appearance: AppearanceSection = Field(default_factory=AppearanceSection)

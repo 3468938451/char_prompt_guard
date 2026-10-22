@@ -370,7 +370,7 @@ off/warn/fix，与期望集合那套互不影响）：
   比例异常或细节崩坏）；**默认关闭，普通使用完全不受影响** —— 关着时
   ``_resolve_region_override`` 第一行就返回（不解析、不额外读上文、不调模型、不打日志）；
 - 打开后「头/头发/眼睛 用 A 的、身子/体型 用 B 的」这类说法会被解析成
-  ``{head: B, body: A}``（**分区词 + 角色名 + 归属句式**三重条件，缺一不认），
+  ``{head: 流萤, body: 爱莉希雅}``（**分区词 + 角色名 + 归属句式**三重条件，缺一不认），
   按 ``regions`` 的顺序（默认 head 在最前）拼成一段追加在**角色与皮肤/穿着之后**；
   各分区特征词来自**独立的条目列表** ``[[region_override.entries]]``
   （不是 ``[roster]``、也不是 ``[outfits]``），找不到条目 → 退回不分区 + DEBUG；
@@ -400,7 +400,6 @@ from src.app.plugin_system.base import BaseEventHandler
 from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
-from . import appearance as appearance_api
 from . import memory as memory_api
 from . import region as region_api
 from . import tag_hint
@@ -1483,31 +1482,6 @@ class MemoryContext:
 # 证据都参与对账，画面里的角色只要落在期望集合之外就是冲突。
 
 
-#: **1.0.373：多人语义词**（决定「双标签拦截」敢不敢删多余标签）。
-#:
-#: 命中任一 → 说明用户可能在要多人同框，**只告警、绝不删**（宁可留一个多余的标签，
-#: 也不能把合法的第二个角色删掉）。口径 = ``ADDITIVE_WORDS``（还有 / 一起 / 俩 / 都 /
-#: 加上 / 和她 / and / both）+ 人数与并列说法（两个 / 俩人 / 双人 / 她们 / 同框 /
-#: 并肩 / 和 / 与 / +）。
-_MULTI_HINT_WORDS: tuple[str, ...] = (
-    *ADDITIVE_WORDS,
-    "两个",
-    "俩人",
-    "双人",
-    "她们",
-    "他们",
-    "她俩",
-    "他俩",
-    "同框",
-    "并肩",
-    "和",
-    "与",
-    "＋",
-    "+",
-    "多人",
-)
-
-
 def _entry_label(entry: CharacterEntry) -> str:
     """角色在日志里的可读标签：``花火（hanabi \\(honkai: star rail\\)）``。
 
@@ -1639,19 +1613,12 @@ class UserNamingScope:
             常见词黑名单 / 角色表内的名字与别名），去重、保序
         sources: 每个表外名字**来自哪条消息**（与 ``names`` 一一对应，1.0.21 起）：
             解析角色时用它当「触发语」写回记忆库（「这身是？」比裸名字信息更多）
-        labels: 每个表外名字**由哪条句式抓到**（1.0.373）：``{"艾克斯": "句式=按X来"}``，
-            走引号模式的是 ``"引号"``、多人枚举是 ``"句式=枚举列表"``
-        latest_names: **最新一条用户消息**（``texts[0]``，即触发消息）里的表外名字
-            （1.0.373）。它决定「先 B 后 A」那条硬规则要不要生效 —— 用户最新说的话
-            里出现了角色表外的名字候选时，**禁止**拿主题粘性角色去补（宁可缺，不补错）
     """
 
     texts: list[str] = field(default_factory=list)
     scanned: int = 0
     names: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
-    labels: dict[str, str] = field(default_factory=dict)
-    latest_names: list[str] = field(default_factory=list)
 
     def names_text(self) -> str:
         """表外名字的可读列表（进日志）：``刻律德拉、卡芙卡``。"""
@@ -1931,17 +1898,6 @@ class CharacterGuardHandler(BaseEventHandler):
             roster=roster,
             texts=outfit_scope.texts,
         )
-        # 1.0.38：**实验性功能**「外观覆盖」（[appearance]，默认关闭）——
-        # 与 1.0.36 的分区覆盖**完全分开**（不同的配置节、不同的解析），也与角色
-        # 判定 / 一致性检查 / 幂等 / 归属校验 / 记忆库写回**全部解耦**：
-        # 只拿上面**已经读到的**那批用户消息做一次纯字符串解析，得到「眼睛/发色
-        # 换成了什么颜色」，注入统一放在 _finalize 的最后一步并在内容最前面写加权词。
-        # 开关关闭时本调用**立刻返回**（不解析、不额外读上文、不调模型、不打日志）。
-        appearance_override = self._resolve_appearance(
-            params=params,
-            config=config,
-            texts=outfit_scope.texts,
-        )
         # 1.0.20：「用户点名了角色表外角色」这条判断要看**用户最近说过什么**，
         # 所以先把焦点范围内的用户消息扫一遍（触发消息 + 触发前最近 N 条用户消息，
         # 只取用户消息）。consistency_check="off" 时**一次都不扫**（连上文都不读），
@@ -1954,12 +1910,7 @@ class CharacterGuardHandler(BaseEventHandler):
             params=params,
             config=config,
             roster=roster,
-            exclude=[
-                *outfit_scope.names,
-                # 1.0.38：本次外观覆盖命中的**颜色词**也豁免 —— 「发色换成银白」里的
-                # 「银白」是颜色不是角色名，不该为它多问一次模型（与皮肤名同一套做法）
-                *(appearance_override.exempt_words if appearance_override else ()),
-            ],
+            exclude=outfit_scope.names,
         )
         texts = self._detection_texts(content, spec, args)
         # 1.0.21：把用户点名的表外角色**解析**一次（复用 llm_api，结果带缓存），
@@ -2020,42 +1971,6 @@ class CharacterGuardHandler(BaseEventHandler):
                 resolved=injected,
                 outfit=outfit,
                 region=region_swap,
-                appearance=appearance_override,
-            )
-
-        # ── 1.0.373：表外点名「先 B 后 A」 ──────────────────────────────
-        # 用户**最新一条消息**里出现了"角色表外的名字候选"时，禁止用主题粘性角色去补。
-        # B（解析成功）：上面入口② 已经补入并返回；走不到这里时交给 _finalize 的
-        #   入口① 做替换，同样**不再补**粘性角色。
-        # A（解析失败 / 异常 / 关键字全被丢弃）：**什么都不补** + 一条 WARNING ——
-        #   宁可缺，绝不补错（实测事故：用户要的是角色X，插件补了上文的另一个人）。
-        blocked = self._outside_naming_sticky_block(
-            user_naming=user_naming, resolved=resolved
-        )
-        if blocked is not None:
-            is_warning, blocked_note = blocked
-            if is_warning:
-                logger.warning(blocked_note)
-            else:
-                logger.info(blocked_note)
-            return await self._finalize(
-                params=params,
-                args=args,
-                spec=spec,
-                original=raw_content,
-                final_content=content,
-                decided=[],
-                roster=roster,
-                config=config,
-                basis="判定依据=表外点名（先 B 后 A）：本次不补角色",
-                track=None,
-                memory=None,
-                naming_scope=user_naming,
-                resolved=resolved,
-                outfit=outfit,
-                region=region_swap,
-                appearance=appearance_override,
-                sticky_blocked=True,
             )
 
         # 1.0.18：判定**不确定**且描述里没有角色表内角色时，先去外部记忆库
@@ -2150,7 +2065,6 @@ class CharacterGuardHandler(BaseEventHandler):
                     resolved=resolved,
                     outfit=outfit,
                     region=region_swap,
-                    appearance=appearance_override,
                 )
             target_characters = candidates[:1]
         else:
@@ -2182,7 +2096,6 @@ class CharacterGuardHandler(BaseEventHandler):
                 resolved=resolved,
                 outfit=outfit,
                 region=region_swap,
-                appearance=appearance_override,
             )
 
         new_content = self._apply(
@@ -2210,7 +2123,6 @@ class CharacterGuardHandler(BaseEventHandler):
                 resolved=resolved,
                 outfit=outfit,
                 region=region_swap,
-                appearance=appearance_override,
             )
 
         names = ", ".join(entry.name or entry.tag or "?" for entry in target_characters)
@@ -2237,7 +2149,6 @@ class CharacterGuardHandler(BaseEventHandler):
             resolved=resolved,
             outfit=outfit,
             region=region_swap,
-            appearance=appearance_override,
         )
 
     # ── 记忆库再确认（1.0.18）─────────────────────────────────────
@@ -3702,11 +3613,6 @@ class CharacterGuardHandler(BaseEventHandler):
         ``皮肤名豁免: …``，方便核对"是不是把真的表外角色名也豁免掉了"。
         没有皮肤名（``exclude`` 为空）时行为与 1.0.22 逐字一致。
 
-        **1.0.38 追加一类豁免**：``exclude`` 里也可能带**外观覆盖命中的中文颜色词**
-        （见 :meth:`_resolve_appearance` 的 ``exempt_words``）—— 「发色换成银白」里的
-        「银白」是**颜色**不是角色名，同样不该为它多问一次模型（日志仍是上面那一行，
-        括号里会说明"或由外观覆盖认定为颜色词"）。
-
         ``consistency_check = "off"``、角色表为空时**直接返回空结果**（连上文都不读）；
         任何异常同样只记 DEBUG 并返回空结果 —— 这条判断是「多一条检查」，
         绝不允许影响判定链或拦住生图。
@@ -3751,52 +3657,31 @@ class CharacterGuardHandler(BaseEventHandler):
 
             names: list[str] = []
             sources: dict[str, str] = {}
-            labels: dict[str, str] = {}
-            latest_names: list[str] = []
             exempted: list[str] = []
-            for index, text in enumerate(texts):
-                found_labels: dict[str, str] = {}
+            for text in texts:
                 found = extract_outside_names(
                     text,
                     roster,
                     exclude=exclude or (),
                     dropped=exempted,
-                    labels=found_labels,
                 )
                 for name in found:
                     if name not in names:
                         names.append(name)
                         # 记住它来自哪句话（1.0.21：解析成功后写回记忆库时的触发语）
                         sources[name] = text
-                        labels[name] = found_labels.get(name, "")
-                        # 1.0.373：``texts[0]`` 就是最新一条用户消息（触发消息在前），
-                        # 它里面的候选决定「先 B 后 A」那条硬规则
-                        if index == 0:
-                            latest_names.append(name)
             if exempted:
                 # 去重保序：同一套皮肤可能在好几条消息里被抓到
                 unique = list(dict.fromkeys(exempted))
                 logger.debug(
                     "皮肤名豁免: "
                     + "、".join(unique)
-                    + "（已由皮肤识别认定为皮肤/时装名、或由外观覆盖认定为颜色词，"
-                    "不算表外角色名）"
+                    + "（已由皮肤识别认定为皮肤/时装名，不算表外角色名）"
                 )
             scope = UserNamingScope(
-                texts=texts,
-                scanned=scanned,
-                names=names,
-                sources=sources,
-                labels=labels,
-                latest_names=latest_names,
+                texts=texts, scanned=scanned, names=names, sources=sources
             )
             if names:
-                # 1.0.373：先说清「每条名字是被哪条句式抓到的」（用户核对全靠这几行），
-                # 再打一行汇总
-                for name in names:
-                    logger.debug(
-                        f"表外点名({labels.get(name) or '未知来源'}): {name}"
-                    )
                 logger.debug(f"表外点名扫描: {scope.label()}")
             return scope
         except Exception as e:  # noqa: BLE001 —— 多一条检查，失败即静默退回
@@ -4656,16 +4541,14 @@ class CharacterGuardHandler(BaseEventHandler):
            与既有的「已含角色」检测同一口径）。注意：**画面里那个表外角色的中文名
            不算** —— 描述里写了「刻律德拉」而没写任何标准标签时，仍然属于"没有标签"，
            正是本入口要处理的场景；
-        3. ~~用户最近说过的话里没有这个解析结果~~ —— **1.0.373 起取消这条**：
-           表外名字本来就是从用户消息里抓出来的，这条等于让入口②永远不生效
-           （实测事故：用户说「按角色X来」、画面里又没有角色标签 → 什么都没补，
-           反而让判定链补了上文粘性的另一个人）。"已经写过就不必再补" 由
-           :meth:`_resolved_presentation` 里的 ``content_contains_tag`` 兜住。
+        3. 用户最近说过的话里**没有**这个解析结果（已经写过就没必要再补）。
 
         画面里已经有角色标签时不在这里动：那种情况属于**替换**（入口①，
         见 :meth:`_apply_outside_naming_check`），两条入口不会互相打架。
         """
         if resolved is None or not resolved.resolved_tag():
+            return None
+        if user_naming is not None and character_in_texts(resolved, user_naming.texts):
             return None
         texts = self._detection_texts(content, spec, args)
         if any(character_in_texts(entry, texts) for entry in roster):
@@ -4770,91 +4653,6 @@ class CharacterGuardHandler(BaseEventHandler):
         game = entry.game.strip()
         return f"{origin}，作品《{game}》" if game else origin
 
-    @staticmethod
-    def _outside_naming_sticky_block(
-        *,
-        user_naming: UserNamingScope | None,
-        resolved: CharacterEntry | None,
-    ) -> tuple[bool, str] | None:
-        """「先 B 后 A」：最新消息里有表外名字候选时，是否**禁止**用粘性角色补（1.0.373）。
-
-        修的是这条实测事故（1.0.38 已部署）：用户说的是「要角色X那层壳上来、眼睛换成
-        本尊的紫红。摆一张紫红瞳的角色X。」—— 角色X**不在角色表**，旧句式一条都
-        抓不到；画面内容里又没有角色标签，于是判定链按**主题粘性**补了上文那个角色，
-        用户要的人**一个字都没进提示词**。
-
-        用户选定的策略是「**先 B 后 A**」：
-
-        - **B**：能解析出表外角色（``resolved`` 非空）→ 用解析出的标准标签（走既有
-          入口② / 入口①），并且**不得**再补粘性角色；
-        - **A**：解析不出来 / 出错 → **什么都不补**（宁可缺，绝不补错），只留一条
-          WARNING 建议把该角色加进 ``[roster]``。
-
-        只看**最新一条用户消息**（``latest_names``，即 ``texts[0]``）里的候选：
-        更早几条消息里的表外点名由 1.0.20 那条独立检查负责，不在这里扩大弃权范围
-        （否则"半小时前顺口提过一个表外角色"会让本次也不补，太激进）。
-
-        Returns:
-            ``None`` = 不适用（最新消息里没有表外名字候选）；
-            ``(是否 WARNING, 日志文案)`` = 适用 —— 调用方**不补任何角色**，
-            直接以「画面原样」进 :meth:`_finalize`（``sticky_blocked=True``）。
-        """
-        if user_naming is None or not user_naming.latest_names:
-            return None
-        name = user_naming.latest_names[0]
-        if resolved is not None:
-            return (
-                False,
-                (
-                    f"用户最新消息里的「{name}」不在角色表，但已解析为"
-                    f"「{resolved.name or resolved.tag or '?'}」→ 按解析结果处理，"
-                    "本次**不补**主题粘性角色（宁可缺，不补错）"
-                ),
-            )
-        return (
-            True,
-            (
-                f"用户说的「{name}」不在角色表且未能解析，本次不补角色"
-                "（宁可缺，不补错）；建议把它加入 [roster]"
-            ),
-        )
-
-    @staticmethod
-    def _recent_multi_hint(
-        texts: list[str],
-        roster: list[CharacterEntry],
-        naming_scope: UserNamingScope | None = None,
-    ) -> str:
-        """用户最近消息里的**多人语义**（1.0.373；空串 = 没有）。
-
-        「双标签拦截」要靠它决定敢不敢删：消息里只要出现 ``一起 / 两个 / 她们 /
-        同框 / 并肩 / 和 / 与 …``，或者点名了 ≥2 个角色（表内 + 表外），就说明这
-        很可能是**合法的双人图**，此时**只能告警**，绝不能把第二个角色删掉。
-
-        Returns:
-            命中的说法（``一起、两个``）或 ``点名了 2 个角色``；都没有返回 ``""``。
-        """
-        # 只看**最新一条**用户消息：``一起 / 两个 / 和`` 出现在更早的对话里并不代表
-        # 这次要多人（1.0.30 的实测场景「先画 A」→「画 B 的婚纱～」就是**换人**
-        # 而不是追加，把上文也算进来会永远判成"多人语义"）。
-        latest = next((text for text in texts if text), "")
-        if not latest:
-            return ""
-        lowered = latest.lower()
-        hits = [
-            word
-            for word in _MULTI_HINT_WORDS
-            if word and (word in latest or word.lower() in lowered)
-        ]
-        named = {
-            entry_key(entry) for entry in roster if character_in_texts(entry, [latest])
-        }
-        outside = list(getattr(naming_scope, "latest_names", []) or [])
-        total = len(named) + len(outside)
-        if total >= 2:
-            hits.append(f"点名了 {total} 个角色")
-        return "、".join(dict.fromkeys(hits))
-
     async def _apply_outside_naming_check(
         self,
         *,
@@ -4957,22 +4755,6 @@ class CharacterGuardHandler(BaseEventHandler):
             logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suggestion}")
             return content
 
-        # 1.0.38：**多角色画面只补不替换** —— 与 _apply_consistency_check 同一个
-        # 守卫（`及任何 fix 分支`）：画面里已有 ≥2 个角色表内角色、且用户自己点了
-        # ≥2 个表外名字时，画面里任何角色标签都不许被替换或删除。期望那一侧在这里
-        # 就是**用户点名的表外角色**（没有 roster 条目可补，所以只写日志、不补标签）。
-        guarded = self._multi_character_guard(
-            content=content,
-            spec=spec,
-            texts=texts,
-            roster=roster,
-            expected_names=outside,
-            decision_multi=len(naming_scope.names) >= 2,
-            expected=None,
-        )
-        if guarded is not None:
-            return guarded
-
         # fix ①：1.0.21 起优先**替换**（解析成功时）。
         # 为什么替换比删除好：用户要的就是「这个角色的提示词进去」—— 画面里那个过期的
         # 旧标签删掉却不补正确标签，用户侧看到的是「角色没进去」（实测反馈）。
@@ -5052,10 +4834,8 @@ class CharacterGuardHandler(BaseEventHandler):
         resolved: CharacterEntry | None = None,
         outfit: ResolvedOutfit | None = None,
         region: region_api.RegionSwap | None = None,
-        appearance: appearance_api.AppearanceOverride | None = None,
-        sticky_blocked: bool = False,
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """统一的收尾：跑二次一致性检测 → 追加皮肤 → 追加分区覆盖 → 前置外观覆盖 → 回写 args。
+        """统一的收尾：跑二次一致性检测 → 追加皮肤 → 追加分区覆盖 → 回写 args。
 
         ``track``（本次主题跟踪的完整结果）与 ``memory``（1.0.19 描述点名时的
         **对账用**记忆库查询结果）都只是给一致性检测提供「期望集合」的证据，
@@ -5099,16 +4879,6 @@ class CharacterGuardHandler(BaseEventHandler):
         负向词只写进目标动作**自己**的负向参数（:attr:`TargetSpec.negative_arg`），
         没有负向参数时只打一条 DEBUG。
 
-        **1.0.38**：``appearance`` 是本次解析出的**外观覆盖**（实验性功能，默认关闭，
-        见 :meth:`_resolve_appearance` 与 :mod:`appearance`），由
-        :meth:`_apply_appearance` 在**最后一步**调用 —— 注入顺序是
-        角色 → 皮肤/穿着 → 分区覆盖 → 外观覆盖，与 1.0.36 的 ``[region_override]``
-        **完全分开**（不同的配置节、不同的解析、不同的注入位置）。它同样**不参与**
-        角色判定、两条一致性检查、幂等与归属校验：颜色词不是角色表里的字符串，
-        ``fix`` 替换 / 删除碰不到它。它写进内容的是**最前面**的加权词
-        （需求原话「外观覆盖放最前」），并在 ``tag_weight < 1.0`` 时把画面里
-        **第一处**角色标准标签降权（只改这一处，其它标签一个字不动）。
-
         .. note::
            1.0.21 修正（实测回归）：解析结果**不再并进第 1 条的判定集合**。
            并进去时 ``fix`` 模式的对账会抢在入口①之前做替换，日志依据被写成
@@ -5128,13 +4898,6 @@ class CharacterGuardHandler(BaseEventHandler):
             basis=basis,
             track=track,
             memory=memory,
-            # 1.0.373：``sticky_blocked`` = 本次「先 B 后 A」弃权了 —— 不能用粘性
-            # 角色去替换 / 删除画面里的标签（只在日志里说明）
-            allow_sticky=not sticky_blocked,
-            recent_texts=list(naming_scope.texts) if naming_scope else [],
-            naming_scope=naming_scope,
-            # 注入**前**的画面：双标签拦截靠它判断"本来就多"，而不是被本次注入带偏
-            initial_content=original,
         )
         checked = await self._apply_outside_naming_check(
             content=checked,
@@ -5157,108 +4920,10 @@ class CharacterGuardHandler(BaseEventHandler):
             args=args,
             region=region,
         )
-        # 1.0.38：外观覆盖排在**最后一步**（角色 → 皮肤/穿着 → 分区覆盖 → 外观覆盖），
-        # 但它写进内容的是**最前面**的加权词 —— 需求原话就是「外观覆盖放最前」。
-        checked = self._apply_appearance(
-            content=checked,
-            spec=spec,
-            appearance=appearance,
-            roster=roster,
-        )
         if checked != original:
             args[spec.prompt_arg] = checked
             params["args"] = args
         return EventDecision.SUCCESS, params
-
-    def _multi_character_guard(
-        self,
-        *,
-        content: str,
-        spec: TargetSpec,
-        texts: list[str],
-        roster: list[CharacterEntry],
-        expected_names: str,
-        decision_multi: bool,
-        expected: ExpectationSet | None = None,
-    ) -> str | None:
-        """「画面里已有 ≥2 个角色表内角色」时**不做任何替换 / 删除**（1.0.38）。
-
-        修的是这条实测事故：用户要「花火 + 流萤」两人，``fix`` 却把画面里那个
-        **合法的第二个角色标签**当成冲突替换掉了 —— 日志
-
-            一致性检查=冲突已修正（fix）：把画面里的「花火」替换为「流萤」
-
-        结果是画面只剩一个角色标签、两套特征混写，两个人被揉成一个。根因是
-        「期望集合恰好 1 人 + 冲突角色恰好 1 个」这个"可唯一定位"判据在**多角色
-        画面**里也成立：期望集合只认出了其中一个角色，画面里另一个合法角色就
-        成了"多余的那一个"。
-
-        **两个条件同时成立才拦**（``decision_multi`` 是这道守卫的关键）：
-
-        1. 画面里（``texts``）已出现 **≥2 个角色表内角色**；
-        2. 本次**判定本身就认为画面里该有 ≥2 个角色**（``decision_multi``）——
-           判定集合 ≥2 人，或用户自己点了 ≥2 个表外名字。
-
-        为什么必须有第 2 条（1.0.38 定稿时实测出来的）：**"1 人判定 + 双人画面"**
-        有另一种合法情形 —— 主模型在描述里写错了角色标签（把流萤的标签写进了要画
-        爱莉希雅的画面），此时 ``fix`` 把它替换成正确的角色**正是**要的行为
-        （用例 C108 锁着：判定=爱莉希雅、画面里只有流萤那个错标签 → 必须替换）。
-        这两种情形在"画面里有几个角色"上完全一样，能区分的只有**判定自己**：
-        判定只点名 1 个人时，多出来的那个是错的；判定要 ≥2 个人时，多出来的是
-        队友，一个都不能少。少了第 2 条，C108 这种「写错标签」就再也修不了。
-
-        拦下之后：
-
-        - 记一条 ``一致性检查=多角色画面，不做替换（画面：…；期望：…）``
-          —— ``expected_names`` 由调用方给（期望集合的角色名，或用户点名的表外角色）；
-        - 期望集合里**有人缺失**（``expected`` 给了且画面里找不到）→ **补上**那个
-          角色的标准标签（**只补不删**）；一个都不缺 → 只 WARN，内容一段不动。
-
-        不在多人画面里（<2 个）时返回 ``None``，调用方照旧走原来的替换 / 删除。
-
-        Returns:
-            ``None`` = 不适用（照旧走原逻辑）；否则是**最终**内容（已含补充标签）。
-        """
-        if not decision_multi:
-            # 「1 人判定 + 多角色画面」：这是**另一种**合法情形（主模型把角色标签
-            # 写错了，例如要画爱莉希雅却写了流萤的标签），照旧走下面的替换 / 删除。
-            # 留一条 DEBUG 让用户能区分「守卫为什么没拦」（用例 C127 钉着它）。
-            picture = [entry for entry in roster if character_in_texts(entry, texts)]
-            if len(picture) >= 2:
-                logger.debug(
-                    "一致性检查=多角色画面但判定只点名 1 人，照旧按替换处理"
-                    f"（画面：{_entry_names(picture)}；期望：{expected_names}）"
-                )
-            return None
-        present = [entry for entry in roster if character_in_texts(entry, texts)]
-        if len(present) < 2:
-            return None
-        logger.warning(
-            "一致性检查=多角色画面，不做替换"
-            f"（画面：{_entry_names(present)}；期望：{expected_names}）"
-        )
-        if not expected:
-            return content
-        present_keys = {entry_key(entry) for entry in present}
-        missing = [
-            entry
-            for entry in expected.entries
-            if entry_key(entry) not in present_keys
-        ]
-        if not missing:
-            return content
-        tags = [
-            entry.resolved_tag()
-            for entry in missing
-            if entry.resolved_tag()
-            and not content_contains_tag(content, entry.resolved_tag())
-        ]
-        if not tags:
-            return content
-        logger.info(
-            f"一致性检查=多角色画面补充：{_entry_names(missing)} → {', '.join(tags)}"
-        )
-        return self._complete(spec, content, tags)
 
     def _apply_consistency_check(
         self,
@@ -5272,10 +4937,6 @@ class CharacterGuardHandler(BaseEventHandler):
         basis: str,
         track: SubjectTrack | None = None,
         memory: memory_api.MemoryLookup | None = None,
-        allow_sticky: bool = True,
-        recent_texts: list[str] | None = None,
-        naming_scope: UserNamingScope | None = None,
-        initial_content: str | None = None,
     ) -> str:
         """二次一致性检测：对账「最终提示词里的角色表内角色」vs「**期望集合**」。
 
@@ -5321,20 +4982,6 @@ class CharacterGuardHandler(BaseEventHandler):
             return content
 
         texts = self._detection_texts(content, spec, args)
-        # 1.0.373：画面里**实际**出现了几个角色表内角色（双标签拦截要用）
-        picture = [entry for entry in roster if character_in_texts(entry, texts)]
-        # …但"本来就多"要看**注入前**：本次刚补进去的判定角色不能算成多余的那一个
-        # （否则「画面只有 1 个错标签 → 替换成判定角色」这条 1.0.19 的既有修法
-        # 会退化成"删掉错标签"、判定角色的标准标签反而进不去，用例 C108 就是这么红的）
-        picture_before = (
-            [
-                entry
-                for entry in roster
-                if character_in_texts(entry, [initial_content])
-            ]
-            if initial_content
-            else list(picture)
-        )
         expected_keys = expected.keys()
         extras = [
             entry
@@ -5357,78 +5004,7 @@ class CharacterGuardHandler(BaseEventHandler):
 
         if mode != "fix":
             logger.warning(f"一致性检查=冲突（warn 不改内容）：{detail}{suffix}")
-            # 1.0.373：warn 模式对「画面里 ≥2 个角色标签、判定只要 1 个」只报不改
-            if len(expected.entries) == 1 and len(picture_before) >= 2:
-                logger.warning(
-                    f"发现 {len(picture_before)} 个角色标签但判定只有 1 个"
-                    f"（warn 只报不改）：画面={_entry_names(picture_before)}，"
-                    f"期望={expected.names()}{suffix}"
-                )
             return content
-
-        # 1.0.38：**多角色画面只补不替换** —— 拦在所有 fix 动作之前
-        guarded = self._multi_character_guard(
-            content=content,
-            spec=spec,
-            texts=texts,
-            roster=roster,
-            expected_names=expected.names(),
-            decision_multi=len(decided) >= 2 or len(expected.entries) >= 2,
-            expected=expected,
-        )
-        if guarded is not None:
-            return guarded
-
-        # 1.0.373：**本次弃权（先 B 后 A）时不要用粘性角色去替换 / 删除**。
-        # 用户最新消息里点名了角色表外的角色、而那个角色没能解析出来 —— 此时
-        # 任何"按主题粘性换人"的动作都是在赌另一个角色，宁可什么都不做。
-        if not allow_sticky:
-            logger.warning(
-                "一致性检查=冲突但本次不用主题粘性角色替换"
-                f"（用户最新消息里点名了角色表外的角色、且没能解析）：{detail}{suffix}"
-            )
-            return content
-
-        # ── 1.0.373：④ 双角色标签拦截 ──────────────────────────────────
-        # 实测事故的另一半：画面里同时挂着两个角色标准标签（nait_artist 自己加了一个
-        # 错的），判定只要 1 个。旧逻辑是"把多余的**替换**成判定角色"，可判定角色
-        # 本来就在画面里 → 结果多出一个**一模一样**的标签。
-        # 现在：判定角色已在画面里时**删除多余**，而不是替换。
-        # **三条闸门同时成立才删**（另一半是"只告警"），防误删合法双人图：
-        #   ① 判定本身只要 1 人（``len(expected.entries) == 1`` 且 ``len(decided) < 2``）；
-        #   ② 画面里角色标签 ≥2 个；
-        #   ③ 用户最近消息里**没有多人语义**，且只点名了 1 个角色。
-        # 任一不成立 → 只 WARN（多角色守卫 / 旧替换路径照旧），绝不删。
-        if len(expected.entries) == 1 and len(picture_before) >= 2:
-            multi_hint = self._recent_multi_hint(
-                recent_texts or [], roster, naming_scope
-            )
-            if multi_hint:
-                logger.warning(
-                    f"发现 {len(picture_before)} 个角色标签但判定只有 1 个，"
-                    f"且消息里有多人语义（{multi_hint}） → 不删（避免误删合法角色）；"
-                    f"画面={_entry_names(picture_before)}，期望={expected.names()}"
-                    f"{suffix}"
-                )
-                return content
-            right = expected.entries[0]
-            if character_in_texts(right, texts):
-                cleaned = content
-                hits_total = 0
-                removed_names: list[str] = []
-                for entry in list(extras):
-                    cleaned, hits = delete_character_reference(cleaned, entry)
-                    if hits:
-                        hits_total += hits
-                        removed_names.append(entry.name or entry.tag or "?")
-                if hits_total > 0:
-                    logger.warning(
-                        f"一致性检查=冲突已修正（fix）：发现 {len(picture_before)} 个角色标签，"
-                        f"保留判定角色「{right.name or right.tag or '?'}」，"
-                        f"删除多余：「{'、'.join(removed_names)}」"
-                        f"（删除 {hits_total} 处）{suffix}"
-                    )
-                    return cleaned
 
         if len(expected.entries) != 1 or len(extras) != 1:
             logger.warning(
@@ -5944,7 +5520,7 @@ class CharacterGuardHandler(BaseEventHandler):
         3. 在 ``texts``（**触发消息在前、其后由新到旧**，就是本次生图已经读到的
            那批用户消息）里找**第一条**能解析出分区归属的消息 ——
            :func:`region.parse_region_overrides` 的**三重条件**（分区词 + 角色名 +
-           归属句式）缺一不认，所以「B的头饰很好看」「头疼」「画B」都不会命中；
+           归属句式）缺一不认，所以「流萤的头饰很好看」「头疼」「画流萤」都不会命中；
         4. :func:`region.build_region_swap` 按 ``regions`` 的顺序（默认
            head → body → outfit → pose → background）拼正向段，并算负向词：
            ``negative_swap`` = 被换掉的角色在**同一分区**的原特征，
@@ -6018,7 +5594,7 @@ class CharacterGuardHandler(BaseEventHandler):
         """把分区覆盖**追加**在角色与皮肤/穿着之后（1.0.36，实验性功能）。
 
         - ``natural``（nai_artist）：另起一行追加
-          ``（分区覆盖：头=B：silver hair, …；身子=A：…）`` ——
+          ``（分区覆盖：头=流萤：silver hair, …；身子=爱莉希雅：…）`` ——
           **分区顺序就是 regions 的顺序，head 在最前**；
         - ``tags``（image_generator_plugin-neo）：把各分区特征词按同一顺序追加进
           同一个提示词参数串末尾（``, silver hair, …, slender, …``）；
@@ -6107,163 +5683,3 @@ class CharacterGuardHandler(BaseEventHandler):
         logger.info(
             f"已写入分区覆盖负向词（{spec.action} / {arg_name}）: {joined}"
         )
-
-    # ── 外观覆盖（1.0.38，**实验性功能**，默认关闭）─────────────────────────
-    #
-    # 需求原话：「脸是薇塔的，眼睛换成本尊的紫红」→ 提示词里确实有 purple eyes，
-    # 但出图仍是蓝眼。原因是角色标签 ``firefly (honkai: star rail)`` 自带「蓝眼」
-    # 先验，权重高过描述里那句裸词；而 nai_artist **没有负向参数**
-    # （``share_photo`` / ``share_drawing`` / ``share_visual`` 都只有 ``content``），
-    # 它的负向词在它自己的 ``character.negative_tags`` 里，本插件不碰别的插件配置
-    # —— 所以「塞负向」这条路在 nai_artist 上**无效**。
-    #
-    # 本功能因此只做两件事：
-    #   ① 把颜色词**加权**放到提示词**最前面**（``1.4::purple-red eyes::``，语法见
-    #      :func:`appearance.format_weight`）；
-    #   ② ``tag_weight < 1.0`` 时把画面里**第一处**角色标准标签**降权**
-    #      （``0.8::firefly \(honkai: star rail\)::``）——「只改这一处，其它标签不动」。
-    #
-    # 与 1.0.36 的 ``[region_override]`` **完全分开**（需求硬约束）：不同的配置节
-    # （``[appearance]`` vs ``[region_override]``）、不同的解析、不同的注入位置。
-    # 与 1.0.22 皮肤 / 1.0.28 穿着同一套分层：**识别与拼装在** :mod:`appearance`
-    # （纯字符串，不调模型、不读上文、不写记忆库），**注入在 _finalize 的最后一步**
-    # （角色 → 皮肤/穿着 → 分区覆盖 → 外观覆盖），**开关关闭时零动作**
-    # （不解析、不额外读上文、不调模型、不打日志）。
-    #
-    # 三条解耦保证：
-    #   ① 判定链 / 一致性检查 / 幂等 / 归属校验 / 记忆库写回：一个字都不碰；
-    #   ② 注入顺序虽然排在最后，但写进内容的加权词在**最前面**（需求原话
-    #      「外观覆盖放最前」）；
-    #   ③ 降权只作用于**角色标准标签**那一个字面，特征词与描述原文不动。
-
-    def _resolve_appearance(
-        self,
-        *,
-        params: dict[str, Any],
-        config: CharPromptGuardConfig,
-        texts: list[str] | None = None,
-    ) -> appearance_api.AppearanceOverride | None:
-        """解析本次的**外观覆盖**（实验性功能，默认关闭）；不需要/不可用时返回 ``None``。
-
-        流程：
-
-        1. ``appearance.enabled = false``（默认）→ **立刻返回**：不读配置、不解析
-           字符串、不额外读上文、不调模型、**一条日志都不打**（零动作）；
-        2. 归一 ``apply_to`` / ``eye_weight`` / ``tag_weight`` / ``weight_syntax``
-           （非法值一律退回默认，绝不因为一项写错就整条失效）；
-        3. 在 ``texts``（**触发消息在前、其后由新到旧**，就是本次生图已经读到的那批
-           用户消息）里找**第一条**能解析出外观归属的消息 ——
-           :func:`appearance.parse_appearance_overrides` 的**三重条件**
-           （外观词 + 更换动词 + 颜色词，紧邻出现）缺一不认，所以「眼睛很好看」
-           「我想看看你的眼睛」「瞳色是蓝的」都**不会**命中；
-        4. :func:`appearance.build_appearance_override` 按 ``apply_to`` 的顺序
-           （默认 eyes → hair）拼加权词；
-        5. 识别不到 → 静默返回 ``None``（**零动作**，其它注入一个字都不改）。
-
-        ``texts`` 为空时只拿**触发消息**（:meth:`_trigger_text`，不读库）兜底，
-        且与 1.0.30 闸门③ 同一个正文口径（:func:`character.strip_quoted_blocks`）。
-        任何异常只记 DEBUG 并返回 ``None`` —— 这是"多一层外观"，绝不拦住生图。
-        """
-        section = getattr(config, "appearance", None)
-        if section is None or not bool(getattr(section, "enabled", False)):
-            # 默认关闭 → 零动作（连配置都不解析、日志都不打）
-            return None
-        try:
-            apply_to = appearance_api.parse_apply_to(
-                getattr(section, "apply_to", None)
-            )
-            weight = appearance_api.parse_weight(
-                getattr(section, "eye_weight", None),
-                appearance_api.DEFAULT_OVERRIDE_WEIGHT,
-            )
-            tag_weight = appearance_api.parse_weight(
-                getattr(section, "tag_weight", None),
-                appearance_api.DEFAULT_TAG_WEIGHT,
-            )
-            syntax = appearance_api.parse_weight_syntax(
-                getattr(section, "weight_syntax", None)
-            )
-            focus = [text for text in (texts or []) if text]
-            if not focus:
-                trigger_text = strip_quoted_blocks(self._trigger_text(params))
-                if trigger_text:
-                    focus = [trigger_text]
-            if not focus:
-                return None
-            assignments: dict[str, str] = {}
-            source = ""
-            for text in focus:
-                found = appearance_api.parse_appearance_overrides(text, apply_to)
-                if found:
-                    assignments = found
-                    source = text
-                    break
-            if not assignments:
-                return None
-            override = appearance_api.build_appearance_override(
-                assignments,
-                apply_to=apply_to,
-                weight=weight,
-                tag_weight=tag_weight,
-                weight_syntax=syntax,
-                source=source,
-                # 命中的中文颜色词（「银白」这类）要能豁免表外点名链路：
-                # 它是颜色、不是角色名，不该为它多问一次模型（与 1.0.23 皮肤名同一套做法）
-                exempt_words=appearance_api.find_appearance_colors(source, apply_to),
-            )
-            if not override.ok:
-                return None
-            # 把"到底换了哪儿、权重多少、要不要降权角色标签"一次写清楚：
-            # 实验性功能，用户核对效果全靠这一行
-            logger.info(override.log_line())
-            return override
-        except Exception as e:  # noqa: BLE001 —— 多一层外观，失败即静默退回
-            logger.debug(f"外观覆盖解析失败，本次跳过（{type(e).__name__}: {e}）")
-            return None
-
-    def _apply_appearance(
-        self,
-        *,
-        content: str,
-        spec: TargetSpec,
-        appearance: appearance_api.AppearanceOverride | None,
-        roster: list[CharacterEntry] | None = None,
-    ) -> str:
-        """把外观覆盖的**加权词放到最前面**（1.0.38，实验性功能）。
-
-        - ``natural``（nai_artist）与 ``tags``（image_generator_plugin-neo）走**同一条**
-          路径：加权词一律放**最前**（``1.4::purple-red eyes::, <原文>``）——
-          需求原话是「外观覆盖放最前」，与分区覆盖（追加在最后）刚好相反；
-        - ``tag_weight < 1.0`` 且语法不是 ``none`` 时，先调
-          :func:`appearance.downweight_character_tag` 把画面里**第一处**角色标准标签
-          改写成降权写法（**只改这一处**，其它标签一个字不动）；
-        - **幂等**：内容里已经带着这次的加权词时不重复追加（多图轮的第 2、3 张）；
-        - ``appearance`` 为 ``None`` / 空结果时**原样返回**，不留任何痕迹。
-        """
-        if appearance is None or not appearance.ok:
-            return content
-        if appearance.is_applied(content):
-            logger.debug("外观覆盖的加权词已在提示词里，不重复追加")
-            return content
-        updated = content
-        rewritten = ""
-        if appearance.downweights:
-            updated, rewritten = appearance_api.downweight_character_tag(
-                updated,
-                roster,
-                weight=appearance.tag_weight,
-                weight_syntax=appearance.weight_syntax,
-            )
-        prefix = appearance.prefix_text()
-        if not prefix:
-            return content
-        stripped = updated.strip()
-        merged = f"{prefix}, {stripped}" if stripped else prefix
-        logger.info(
-            f"已追加外观覆盖（{spec.action} / {spec.append_mode}）: "
-            f"{appearance.summary()} → {prefix}"
-        )
-        if rewritten:
-            # 降权到底改成了什么，用户要能一眼核对（含被改的那个标签原文）
-            logger.info(f"外观覆盖：角色标签已降权 → {rewritten}")
-        return merged
